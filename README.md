@@ -136,7 +136,23 @@ frame so the effect appears to do nothing at all. Working in frames removes the
 dependency instead of guarding it. Motion blur benefits too: the shutter is
 simply a fraction of `1.0`, with no conversion involved.
 
-#### Set Start to Playhead
+#### The origin only has to be consistent, not correct
+
+Resolve reports no usable clip start — every route describes the *available
+media*, so the answer moves with the unused head handle. Chasing a "correct"
+start is the wrong problem.
+
+What matters is that the **capture** and the **render** use the same mapping.
+`Set Start to Playhead` stores `playhead − origin`; the renderer compares
+`renderTime − origin` against it. Whatever error is in `origin` appears on both
+sides and cancels, so the entrance begins exactly on the frame where the
+playhead was parked — however the clip is trimmed. Re-click after trimming the
+head, because the origin will have moved.
+
+`Set End to Playhead` does the same for the exit, measured back from the clip
+end.
+
+#### The measurements behind that
 
 **Resolve does not tell a plugin where a trimmed clip visually starts.** Every
 route reports the *available media* instead, so the answer shifts by the length

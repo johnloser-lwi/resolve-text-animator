@@ -175,8 +175,44 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   void render(const OFX::RenderArguments& args) override;
 
+  // The frame that counts as clip time 0. Used by both render and the capture
+  // buttons -- and it is essential that it is the SAME function for both.
+  //
+  // Resolve reports no usable clip start (every route describes the available
+  // media, so it moves with the head handle), and that turns out not to matter:
+  // if a button captures the playhead through this same mapping, whatever error
+  // is in the origin cancels out against the identical error at render time.
+  // The animation then begins exactly where the playhead was parked, however
+  // the clip is trimmed. This is how MultiTransform sidesteps the same gap.
+  double originAt(double time) {
+    if (_manualOrigin->getValueAtTime(time)) return _originFrame->getValueAtTime(time);
+    double start = 0.0, length = 0.0;
+    if (rta::getClipRange(this, start, length)) return start;
+    return 0.0;
+  }
+
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
-    if (name != "setStartToPlayhead") return;
+    if (name == "setStartToPlayhead") {
+      // Store the playhead in the same clip-relative units render compares
+      // against, so the entrance begins on exactly this frame.
+      rta::beginEdit(this, "Set Start to Playhead");
+      _startTime->setValue(args.time - originAt(args.time));
+      rta::endEdit(this);
+      return;
+    }
+
+    if (name == "setOutEndToPlayhead") {
+      // The exit is measured back from the clip end, so store the distance from
+      // the playhead to that end.
+      double b1 = 0.0, b2 = 0.0;
+      if (!rta::getClipBounds(this, b1, b2)) return;
+      rta::beginEdit(this, "Set Out End to Playhead");
+      _outOffset->setValue(b2 - args.time);
+      rta::endEdit(this);
+      return;
+    }
+
+    if (name != "setStartToClipStart") return;
 
     // Capture the earliest frame the host has actually asked us to render.
     //
@@ -453,13 +489,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // timeLineGetBounds t1 is the start minus the head handle. Measured on a clip
   // visibly running 1000..1149: t1 came back 967 and duration 184. Only the
   // playhead knows, so the button captures it.
-  double origin = 0.0;
-  if (_manualOrigin->getValueAtTime(args.time)) {
-    origin = _originFrame->getValueAtTime(args.time);
-  } else {
-    double autoStart = 0.0, autoLen = 0.0;
-    if (rta::getClipRange(this, autoStart, autoLen)) origin = autoStart;
-  }
+  const double origin = originAt(args.time);
   const double frames = args.time - origin;
 
   {
@@ -781,13 +811,23 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
   }
   {
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToPlayhead");
-    p->setLabels("Set Start to Clip Start", "Set Start", "Set Start to Clip Start");
+    p->setLabels("Set Start to Playhead", "Set Start", "Set Start to Playhead");
     p->setHint(
-        "Scrub across the clip once, then click. Resolve does not tell a plugin "
-        "where a trimmed clip visually starts -- every route reports the "
-        "available media, so the answer shifts by the length of the head "
-        "handle. This captures the earliest frame Resolve actually rendered, "
-        "which is the clip's first frame. Re-click after re-trimming the head.");
+        "Park the playhead where the animation should begin -- normally the "
+        "clip's first frame -- and click. Resolve does not report where a "
+        "trimmed clip visually starts, so this captures the playhead in the "
+        "same units the renderer uses; the two cancel out and the entrance "
+        "begins exactly here however the clip is trimmed. Re-click after "
+        "trimming the head.");
+    addParam(page, p);
+  }
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToClipStart");
+    p->setLabels("Set Start to Clip Start", "Clip Start", "Set Start to Clip Start");
+    p->setHint(
+        "Alternative to the above that needs no playhead: scrub across the clip "
+        "once, then click. Captures the earliest frame Resolve actually "
+        "rendered, which is the clip's first frame.");
     addParam(page, p);
   }
   {
@@ -915,6 +955,13 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setRange(-100000.0, 100000.0);
       p->setDisplayRange(0.0, 120.0);
       p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setOutEndToPlayhead");
+      p->setLabels("Set End to Playhead", "Set End", "Set Out End to Playhead");
+      p->setHint("Park the playhead where the exit should finish and click.");
       p->setParent(*g);
       addParam(page, p);
     }
