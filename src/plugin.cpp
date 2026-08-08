@@ -177,15 +177,29 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
     if (name != "setStartToPlayhead") return;
-    // Resolve exposes no way to ask where a trimmed clip visually starts --
-    // every route reports the available media instead, so the answer moves by
-    // the length of the head handle. Capturing the playhead is the one exact
-    // source available, and it is why this button exists at all.
+
+    // Capture the earliest frame the host has actually asked us to render.
     //
+    // Not args.time: Resolve passes 0 for a parameter change rather than the
+    // playhead position, so writing that just pinned the anchor to zero. And
+    // not anything the host reports about the clip either -- every one of those
+    // describes the available media, so it moves by the length of the head
+    // handle (measured t1=993 on a clip whose first rendered frame was 1020).
+    //
+    // The render times themselves are the one honest signal: the host only ever
+    // asks for frames inside the clip, so the lowest one seen is the clip's
+    // first frame. Captured once into a parameter rather than tracked live, so
+    // the value is stable and already-cached frames stay valid.
+    double captured = args.time;
+    {
+      std::lock_guard<std::mutex> lock(_seenMutex);
+      if (_seenEarliest < 1e299) captured = _seenEarliest;
+    }
+
     // Bracketed because the plugin is setting its own parameters; without it
     // Fusion is never told the edit happened and keeps serving cached frames.
-    rta::beginEdit(this, "Set Start to Playhead");
-    _originFrame->setValue(args.time);
+    rta::beginEdit(this, "Set Start to Clip Start");
+    _originFrame->setValue(captured);
     _manualOrigin->setValue(true);
     rta::endEdit(this);
   }
@@ -226,9 +240,14 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   AnalysisCache _cache;
 
+  // Lowest render time seen since the clip's reported bounds last changed --
+  // i.e. the clip's first frame, which is the only place it can be learned.
+  // Reset on a bounds change so re-trimming re-learns it.
+  std::mutex _seenMutex;
+  double _seenT1 = 1e300, _seenT2 = 1e300, _seenEarliest = 1e300;
+
   // Carried between the two halves of the diagnostic block only.
   double _probeRaw[2] = {0.0, 0.0};
-  double _probeEarliest = 0.0;
   bool _probeRawOk = false;
 };
 
@@ -456,23 +475,20 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       rawOk = false;
     }
 
-    static std::mutex m;
-    static double lastT1 = 1e300, lastT2 = 1e300, earliest = 1e300;
     {
-      std::lock_guard<std::mutex> lk(m);
-      if (rawT1 != lastT1 || rawT2 != lastT2) {
-        lastT1 = rawT1;
-        lastT2 = rawT2;
-        earliest = args.time;
-      } else if (args.time < earliest) {
-        earliest = args.time;
+      std::lock_guard<std::mutex> lk(_seenMutex);
+      if (rawT1 != _seenT1 || rawT2 != _seenT2) {
+        _seenT1 = rawT1;
+        _seenT2 = rawT2;
+        _seenEarliest = args.time;  // bounds changed: start learning again
+      } else if (args.time < _seenEarliest) {
+        _seenEarliest = args.time;
       }
     }
 
     _probeRaw[0] = rawT1;
     _probeRaw[1] = rawT2;
     _probeRawOk = rawOk;
-    _probeEarliest = earliest;
   }
 
   // The exit is anchored to the clip's END, so it needs the clip's length.
@@ -500,7 +516,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
                   _probeRaw[0], _probeRaw[1], _probeRawOk ? "" : "(THREW)",
                   rta::safeEffectDuration(this),
                   _manualOrigin->getValueAtTime(args.time) ? "manual" : "auto", origin, clipLength,
-                  _probeEarliest, args.time, frames);
+                  _seenEarliest, args.time, frames);
     rta::probeOnChange("cliptime", buf);
   }
 
@@ -765,13 +781,13 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
   }
   {
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToPlayhead");
-    p->setLabels("Set Start to Playhead", "Set Start", "Set Start to Playhead");
+    p->setLabels("Set Start to Clip Start", "Set Start", "Set Start to Clip Start");
     p->setHint(
-        "Park the playhead on the clip's FIRST frame and click. Resolve does "
-        "not tell a plugin where a trimmed clip visually starts -- every route "
-        "reports the available media, so the answer shifts by the length of the "
-        "head handle. This captures the real frame. Re-click after re-trimming "
-        "the head.");
+        "Scrub across the clip once, then click. Resolve does not tell a plugin "
+        "where a trimmed clip visually starts -- every route reports the "
+        "available media, so the answer shifts by the length of the head "
+        "handle. This captures the earliest frame Resolve actually rendered, "
+        "which is the clip's first frame. Re-click after re-trimming the head.");
     addParam(page, p);
   }
   {
