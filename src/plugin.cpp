@@ -187,23 +187,21 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   double originAt(double time) {
     if (_manualOrigin->getValueAtTime(time)) return _originFrame->getValueAtTime(time);
 
-    // Auto: the lowest frame the host has actually asked us to render.
+    // Auto: t1, straight from the host. A pure function of the clip's reported
+    // bounds -- no state, no learning, no history.
     //
-    // The host only ever renders frames inside the clip, so the running minimum
-    // IS the clip's first frame -- measured exactly right on every clip tested
-    // (1162, 1020, 1000, 0 and -112), including ones whose reported bounds were
-    // off by the whole head handle.
+    // A learned origin was tried and abandoned. Deriving it from which frames
+    // had rendered meant it changed as you scrubbed, and clip time stopped
+    // being a steady function of the timeline. Every variant produced a
+    // different flavour of the same artifact: pinned at 0 so nothing ever
+    // progressed, jumping forward so earlier frames went dead, then freezing
+    // mid-reveal. An animation clock must not depend on render history.
     //
-    // It also makes the failure mode impossible by construction: clip time is
-    // args.time minus a running minimum of args.time, so it can never be
-    // negative, and an entrance can never sit in the "not started yet" state
-    // that draws nothing. Every bound the host reports failed that guarantee,
-    // because all of them describe the available media rather than the cut.
-    {
-      std::lock_guard<std::mutex> lock(_seenMutex);
-      if (_seenEarliest < 1e299) return _seenEarliest;
-    }
-
+    // t1 is not the clip's visible start -- it includes the head handle, and
+    // Resolve reports no value that excludes it. So the entrance may begin
+    // before the clip becomes visible, which Start (frames) offsets. That is a
+    // constant offset the user sets once, and it stays put, which the learned
+    // version never did.
     double start = 0.0, length = 0.0;
     if (rta::getClipRange(this, start, length)) return start;
     return 0.0;
@@ -233,8 +231,19 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // The origin is only discarded when it falls outside the media the clip is
     // cut from, which is the one thing that cannot be true of a real first
     // frame. That covers the clip genuinely moving, without reacting to noise.
+    // Recovery falls back to t1, NEVER to the frame being rendered.
+    //
+    // Setting it to `time` was the bug behind the dead frames: it moves the
+    // origin FORWARD to whatever is on screen, so clip time snaps back to 0 and
+    // the reveal restarts from nothing every time this fires. During playback
+    // that reads as a stretch of frames where the animation simply never
+    // progresses.
+    //
+    // t1 is safe because it is the start of the media the clip is cut from, so
+    // it is always at or before any frame the host will ask for. Recovery can
+    // therefore never place the origin ahead of a rendered frame.
     if (haveBounds && rawT2 > rawT1 && (_seenEarliest < rawT1 || _seenEarliest > rawT2))
-      _seenEarliest = time;
+      _seenEarliest = rawT1;
 
     if (time < _seenEarliest) _seenEarliest = time;
     _seenT1 = rawT1;
