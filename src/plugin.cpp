@@ -16,6 +16,7 @@
 #include "cuda_compositor.h"
 #include "diagnostics.h"
 #include "interact/overlay.h"
+#include "probe.h"
 #include "segmentation.h"
 
 #define kPluginName "Text Animator"
@@ -402,6 +403,20 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // getFrameRange() is likewise avoided: Resolve returns a 1000-minute sentinel
   // from it rather than the clip's extent. See clip_time.h.
   const double frames = rta::toClipTime(this, args.time);
+
+  {
+    // Record how the host is describing this clip. Quiet unless it changes, so
+    // it costs a string compare per frame once things are steady -- and it is
+    // the only way to tell "the host moved the clip start" apart from "the host
+    // is reporting bounds that include the handles".
+    double pStart = 0.0, pLen = 0.0;
+    const bool pOk = rta::getClipRange(this, pStart, pLen);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "bounds=%s start=%.1f len=%.1f | args.time=%.1f -> clipFrame=%.1f",
+                  pOk ? "ok" : "UNUSABLE", pStart, pLen, args.time, frames);
+    rta::probeOnChange("cliptime", buf);
+  }
 
   // The exit is anchored to the clip's END, so it needs the clip's length. When
   // the host will not report one the override stands in; without either, the

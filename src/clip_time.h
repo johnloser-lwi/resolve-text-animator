@@ -51,6 +51,25 @@ inline bool validateClipRange(double t1, double t2, double& outStart, double& ou
 // The clip's extent in timeline frames. False if the host reports nothing
 // usable, in which case the caller should treat render times as already
 // clip-relative.
+//
+// The reported extent includes the clip's HEAD HANDLE, so once a clip's head is
+// dragged back the start can run before the beginning of the timeline and comes
+// back negative. Resolve never renders those frames -- render times are clamped
+// at zero -- so taking the reported start literally shifts every animation
+// later by the whole length of the handle, and an entrance looks already
+// half-finished on the clip's first visible frame.
+//
+// Measured on Resolve Studio 21, dragging one clip's head progressively back:
+//
+//   start=18   len=187   rendered args.time 18..205     start + len = 205
+//   start=43   len=254   rendered args.time 43..195     start + len = 297
+//   start=-66  len=363   rendered args.time  0..53      start + len = 297
+//   start=-79  len=376   rendered args.time  0..297     start + len = 297
+//
+// The end (start + len) is stable and the start is not, which is what gives the
+// game away: only the end is anchored to the clip. The first frame that will
+// actually be rendered is therefore max(0, start), and the usable length is
+// measured from there.
 inline bool getClipRange(OFX::ImageEffect* effect, double& outStart, double& outLength) {
   if (!effect) return false;
   double t1 = 0.0, t2 = 0.0;
@@ -59,7 +78,14 @@ inline bool getClipRange(OFX::ImageEffect* effect, double& outStart, double& out
   } catch (...) {
     return false;
   }
-  return validateClipRange(t1, t2, outStart, outLength);
+
+  double start = 0.0, length = 0.0;
+  if (!validateClipRange(t1, t2, start, length)) return false;
+
+  const double end = start + length;
+  outStart = start < 0.0 ? 0.0 : start;
+  outLength = end - outStart;
+  return outLength > 0.0;
 }
 
 // Convert a render time to clip-relative frames, where 0 is the clip's first
