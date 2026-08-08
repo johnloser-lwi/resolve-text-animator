@@ -154,14 +154,22 @@ running frames 1000→1149:
 Drag the head back by one frame and t1 jumped 83 frames, because that is how
 much unused media sat behind it. Only the end is anchored to the clip.
 
-So the start is captured rather than derived: park the playhead on the clip's
-first frame and press **Set Start to Playhead**. That frame becomes animation
-frame 0. Re-press it after re-trimming the head. Untick **Use Manual Start** to
-fall back to the host's reported start, which is exact only on clips with no
-head handle.
+**t1 is nevertheless used unclamped, and that matters.** It is not the visible
+start, but it is always at or before the earliest frame the host will ask for,
+so clip time is never negative and the animation always plays. Clamping it to
+zero — an earlier attempt here — breaks precisely that: Resolve really does
+render **negative timeline frames** once a clip begins before the start of the
+timeline (measured `args.time` down to −112 against `raw=[-463, 0]`), and a
+clamped origin turns those into negative clip frames, where an entrance has not
+started yet and draws nothing at all.
 
-The exit needs the clip *end*, which `timeLineGetBounds` does report reliably,
-so it needs no such button.
+For an exact start, capture it instead of deriving it: park the playhead on the
+clip's first frame and press **Set Start to Playhead**. That frame becomes
+animation frame 0; re-press after re-trimming the head. Untick **Use Manual
+Start** to go back to the automatic origin.
+
+The exit needs no anchor either way: `origin + length == t2`, so it lands on the
+same absolute frame whatever the origin is.
 
 ### Why distances are ratios
 

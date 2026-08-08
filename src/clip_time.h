@@ -70,9 +70,16 @@ inline bool validateClipRange(double t1, double t2, double& outStart, double& ou
 // game away: only the end is anchored to the clip. The first frame that will
 // actually be rendered is therefore max(0, start), and the usable length is
 // measured from there.
-// The effect's own duration, or 0 if the host does not publish one. Guarded for
-// the same reason the frame rate was: a missing property throws, and thrown out
-// of render that becomes kOfxStatErrMissingHostFeature and fails every frame.
+// The effect's own duration, or 0 if the host does not publish one.
+//
+// Not used for timing: Resolve returns the available-media span, not the
+// visible clip length (measured 184 on a clip visibly 150 frames long), so it
+// cannot recover the trimmed start. Kept for the probe log, where seeing it is
+// what ruled it out.
+//
+// Guarded for the same reason the frame rate was: a missing property throws,
+// and thrown out of render that becomes kOfxStatErrMissingHostFeature and fails
+// every single frame.
 inline double safeEffectDuration(OFX::ImageEffect* effect) {
   if (!effect) return 0.0;
   try {
@@ -113,31 +120,24 @@ inline bool getClipRange(OFX::ImageEffect* effect, double& outStart, double& out
     return false;
   }
 
-  double lo = 0.0, span = 0.0;
-  if (!validateClipRange(t1, t2, lo, span)) return false;
-
-  // Only the END is trustworthy. t1 is the earliest the clip *could* reach --
-  // it includes the unused head handle -- so it moves whenever the available
-  // media changes and is not where rendering begins. Measured on Resolve 21:
+  // t1 is used as-is, and deliberately NOT clamped to zero.
   //
-  //   raw=[1000,1149]  first frame rendered 1000   (no head handle)
-  //   raw=[ 917,1149]  first frame rendered  999   (82 frames of handle behind it)
-  //   raw=[-218, 297]  first frame rendered    0   (handle runs past the timeline start)
+  // It is the earliest the clip could reach -- it includes the unused head
+  // handle -- so it is not the visible start, and no API reports that (see the
+  // manual anchor). But it has the one property that matters for robustness:
+  // t1 is always at or before the earliest frame the host will ask for, so the
+  // clip-relative time is never negative and the animation always plays.
   //
-  // The end is 1149 in both of the first two despite t1 moving 83 frames.
-  const double end = lo + span;
-
-  // The visible length gives back the start the handle hid. Sanity-checked
-  // rather than trusted: the true start must sit inside the available media and
-  // at or after the start of the timeline, so a nonsense duration is rejected
-  // instead of moving the animation somewhere worse.
-  const double floorStart = lo < 0.0 ? 0.0 : lo;
-  const double duration = safeEffectDuration(effect);
-  const double derived = end - duration;
-
-  outStart = (duration > 0.0 && derived >= floorStart - 0.5 && derived < end) ? derived
-                                                                             : floorStart;
-  outLength = end - outStart;
+  // Clamping it to zero breaks exactly that. Resolve really does render
+  // negative timeline frames once a clip is dragged so it begins before the
+  // start of the timeline -- measured args.time down to -112 against
+  // raw=[-463, 0] -- and a clamped origin turns those into negative clip
+  // frames, where an entrance has not started yet and so draws nothing at all.
+  //
+  // The exit is unaffected either way: origin + length == t2, so it lands on
+  // the same absolute frame whatever the origin is.
+  outStart = t1;
+  outLength = t2 - t1;
   return outLength > 0.0;
 }
 
