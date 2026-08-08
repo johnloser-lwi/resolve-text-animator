@@ -70,6 +70,40 @@ inline bool validateClipRange(double t1, double t2, double& outStart, double& ou
 // game away: only the end is anchored to the clip. The first frame that will
 // actually be rendered is therefore max(0, start), and the usable length is
 // measured from there.
+// The effect's own duration, or 0 if the host does not publish one. Guarded for
+// the same reason the frame rate was: a missing property throws, and thrown out
+// of render that becomes kOfxStatErrMissingHostFeature and fails every frame.
+inline double safeEffectDuration(OFX::ImageEffect* effect) {
+  if (!effect) return 0.0;
+  try {
+    const double d = effect->getEffectDuration();
+    return d > 0.0 ? d : 0.0;
+  } catch (...) {
+    return 0.0;
+  }
+}
+
+// The raw, validated bounds exactly as the host reports them.
+//
+// t1 is NOT the clip's visible start: it includes the unused head handle, so it
+// moves whenever the available media changes. t2 is the only end of this range
+// that stayed put across trims in testing. Callers wanting an animation origin
+// want the manual anchor instead; this is here for the clip END.
+inline bool getClipBounds(OFX::ImageEffect* effect, double& t1, double& t2) {
+  if (!effect) return false;
+  double a = 0.0, b = 0.0;
+  try {
+    effect->timeLineGetBounds(a, b);
+  } catch (...) {
+    return false;
+  }
+  double lo = 0.0, span = 0.0;
+  if (!validateClipRange(a, b, lo, span)) return false;
+  t1 = a;
+  t2 = b;
+  return true;
+}
+
 inline bool getClipRange(OFX::ImageEffect* effect, double& outStart, double& outLength) {
   if (!effect) return false;
   double t1 = 0.0, t2 = 0.0;
@@ -79,11 +113,30 @@ inline bool getClipRange(OFX::ImageEffect* effect, double& outStart, double& out
     return false;
   }
 
-  double start = 0.0, length = 0.0;
-  if (!validateClipRange(t1, t2, start, length)) return false;
+  double lo = 0.0, span = 0.0;
+  if (!validateClipRange(t1, t2, lo, span)) return false;
 
-  const double end = start + length;
-  outStart = start < 0.0 ? 0.0 : start;
+  // Only the END is trustworthy. t1 is the earliest the clip *could* reach --
+  // it includes the unused head handle -- so it moves whenever the available
+  // media changes and is not where rendering begins. Measured on Resolve 21:
+  //
+  //   raw=[1000,1149]  first frame rendered 1000   (no head handle)
+  //   raw=[ 917,1149]  first frame rendered  999   (82 frames of handle behind it)
+  //   raw=[-218, 297]  first frame rendered    0   (handle runs past the timeline start)
+  //
+  // The end is 1149 in both of the first two despite t1 moving 83 frames.
+  const double end = lo + span;
+
+  // The visible length gives back the start the handle hid. Sanity-checked
+  // rather than trusted: the true start must sit inside the available media and
+  // at or after the start of the timeline, so a nonsense duration is rejected
+  // instead of moving the animation somewhere worse.
+  const double floorStart = lo < 0.0 ? 0.0 : lo;
+  const double duration = safeEffectDuration(effect);
+  const double derived = end - duration;
+
+  outStart = (duration > 0.0 && derived >= floorStart - 0.5 && derived < end) ? derived
+                                                                             : floorStart;
   outLength = end - outStart;
   return outLength > 0.0;
 }

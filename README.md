@@ -136,13 +136,32 @@ frame so the effect appears to do nothing at all. Working in frames removes the
 dependency instead of guarding it. Motion blur benefits too: the shutter is
 simply a fraction of `1.0`, with no conversion involved.
 
-Getting that origin took measuring, because most of the obvious routes are dead
-ends in Resolve. `getFrameRange()` returns a **sentinel of exactly 1000 minutes**
-rather than the clip's extent, `getUnmappedFrameRange` and `timeLineGetTime` are
-not populated at all, and only `timeLineGetBounds` reports the real clip. Since
-that call cannot be trusted blindly, `clip_time.h` validates the answer and
-falls back to treating render times as already clip-relative when the host
-reports nothing usable.
+#### Set Start to Playhead
+
+**Resolve does not tell a plugin where a trimmed clip visually starts.** Every
+route reports the *available media* instead, so the answer shifts by the length
+of the unused head handle. Measured on Resolve Studio 21, on a clip visibly
+running frames 1000→1149:
+
+| Source | Reported | Correct? |
+|---|---|---|
+| `getFrameRange()` | 1000-minute sentinel | no |
+| `getUnmappedFrameRange` | `[0, 0]` | no |
+| `getEffectDuration()` | `184` (available span, not the 150 visible) | no |
+| `timeLineGetBounds` t1 | `967` (start **minus** head handle) | no |
+| `timeLineGetBounds` t2 | `1149` — held still across trims | **the end only** |
+
+Drag the head back by one frame and t1 jumped 83 frames, because that is how
+much unused media sat behind it. Only the end is anchored to the clip.
+
+So the start is captured rather than derived: park the playhead on the clip's
+first frame and press **Set Start to Playhead**. That frame becomes animation
+frame 0. Re-press it after re-trimming the head. Untick **Use Manual Start** to
+fall back to the host's reported start, which is exact only on clips with no
+head handle.
+
+The exit needs the clip *end*, which `timeLineGetBounds` does report reliably,
+so it needs no such button.
 
 ### Why distances are ratios
 

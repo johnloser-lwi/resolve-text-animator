@@ -13,6 +13,7 @@
 #include "animator.h"
 #include "clip_time.h"
 #include "compositor.h"
+#include "edit_block.h"
 #include "cuda_compositor.h"
 #include "diagnostics.h"
 #include "interact/overlay.h"
@@ -144,6 +145,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _linkOut = fetchBooleanParam("linkOut");
     _mirrorOut = fetchBooleanParam("mirrorOut");
     _clipLengthOverride = fetchDoubleParam("clipLengthOverride");
+    _manualOrigin = fetchBooleanParam("manualOrigin");
+    _originFrame = fetchDoubleParam("originFrame");
 
     _outGroupMode = fetchChoiceParam("outGroupMode");
     _outAnimation = fetchChoiceParam("outAnimation");
@@ -172,6 +175,21 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   void render(const OFX::RenderArguments& args) override;
 
+  void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
+    if (name != "setStartToPlayhead") return;
+    // Resolve exposes no way to ask where a trimmed clip visually starts --
+    // every route reports the available media instead, so the answer moves by
+    // the length of the head handle. Capturing the playhead is the one exact
+    // source available, and it is why this button exists at all.
+    //
+    // Bracketed because the plugin is setting its own parameters; without it
+    // Fusion is never told the edit happened and keeps serving cached frames.
+    rta::beginEdit(this, "Set Start to Playhead");
+    _originFrame->setValue(args.time);
+    _manualOrigin->setValue(true);
+    rta::endEdit(this);
+  }
+
   void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
     // Declare that the output changes over time even though no parameter is
     // animated.
@@ -199,13 +217,19 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   // Exit stage.
   OFX::BooleanParam *_enableIn, *_enableOut, *_linkOut, *_mirrorOut;
-  OFX::DoubleParam *_outOffset, *_clipLengthOverride;
+  OFX::DoubleParam *_outOffset, *_clipLengthOverride, *_originFrame;
+  OFX::BooleanParam* _manualOrigin;
   OFX::ChoiceParam *_outGroupMode, *_outAnimation, *_outEasing, *_outOrder, *_outLineOrder;
   OFX::IntParam* _outRandomSeed;
   OFX::DoubleParam *_outDuration, *_outStagger, *_outSlideDistance, *_outSlideAngle;
   OFX::DoubleParam *_outStartScale, *_outStartRotation, *_outStartBlur;
 
   AnalysisCache _cache;
+
+  // Carried between the two halves of the diagnostic block only.
+  double _probeRaw[2] = {0.0, 0.0};
+  double _probeEarliest = 0.0;
+  bool _probeRawOk = false;
 };
 
 void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
@@ -402,31 +426,82 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // Fusion does not publish, and which threw out of render when asked for.
   // getFrameRange() is likewise avoided: Resolve returns a 1000-minute sentinel
   // from it rather than the clip's extent. See clip_time.h.
-  const double frames = rta::toClipTime(this, args.time);
+  // Where animation frame 0 sits on the host's timeline.
+  //
+  // Preferred source is the manual anchor, because Resolve reports no usable
+  // clip start: getFrameRange is a 1000-minute sentinel, getUnmappedFrameRange
+  // is empty, getEffectDuration returns the available-media span, and
+  // timeLineGetBounds t1 is the start minus the head handle. Measured on a clip
+  // visibly running 1000..1149: t1 came back 967 and duration 184. Only the
+  // playhead knows, so the button captures it.
+  double origin = 0.0;
+  if (_manualOrigin->getValueAtTime(args.time)) {
+    origin = _originFrame->getValueAtTime(args.time);
+  } else {
+    double autoStart = 0.0, autoLen = 0.0;
+    if (rta::getClipRange(this, autoStart, autoLen)) origin = autoStart;
+  }
+  const double frames = args.time - origin;
 
   {
-    // Record how the host is describing this clip. Quiet unless it changes, so
-    // it costs a string compare per frame once things are steady -- and it is
-    // the only way to tell "the host moved the clip start" apart from "the host
-    // is reporting bounds that include the handles".
-    double pStart = 0.0, pLen = 0.0;
-    const bool pOk = rta::getClipRange(this, pStart, pLen);
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "bounds=%s start=%.1f len=%.1f | args.time=%.1f -> clipFrame=%.1f",
-                  pOk ? "ok" : "UNUSABLE", pStart, pLen, args.time, frames);
-    rta::probeOnChange("cliptime", buf);
+    // Log the RAW bounds, not the clamped ones, or the clamp hides the very
+    // thing being diagnosed. `earliest` is the lowest render time seen since
+    // the bounds last changed: that, not anything the host reports, is the
+    // clip's true first frame, and it is what the origin has to match.
+    double rawT1 = 0.0, rawT2 = 0.0;
+    bool rawOk = true;
+    try {
+      timeLineGetBounds(rawT1, rawT2);
+    } catch (...) {
+      rawOk = false;
+    }
+
+    static std::mutex m;
+    static double lastT1 = 1e300, lastT2 = 1e300, earliest = 1e300;
+    {
+      std::lock_guard<std::mutex> lk(m);
+      if (rawT1 != lastT1 || rawT2 != lastT2) {
+        lastT1 = rawT1;
+        lastT2 = rawT2;
+        earliest = args.time;
+      } else if (args.time < earliest) {
+        earliest = args.time;
+      }
+    }
+
+    _probeRaw[0] = rawT1;
+    _probeRaw[1] = rawT2;
+    _probeRawOk = rawOk;
+    _probeEarliest = earliest;
   }
 
-  // The exit is anchored to the clip's END, so it needs the clip's length. When
-  // the host will not report one the override stands in; without either, the
-  // exit is skipped rather than guessed at.
-  double clipStart = 0.0, clipLength = 0.0;
-  bool haveLength = rta::getClipRange(this, clipStart, clipLength);
+  // The exit is anchored to the clip's END, so it needs the clip's length.
+  // Length is measured from the anchor to that end: t2 is the one bound that
+  // held still across trims. The override wins when the host reports nothing
+  // usable; without either, the exit is skipped rather than guessed at.
+  double clipLength = 0.0;
+  bool haveLength = false;
+  double b1 = 0.0, b2 = 0.0;
+  if (rta::getClipBounds(this, b1, b2) && b2 > origin) {
+    clipLength = b2 - origin;
+    haveLength = true;
+  }
   const double lengthOverride = _clipLengthOverride->getValueAtTime(args.time);
   if (lengthOverride > 0.0) {
     clipLength = lengthOverride;
     haveLength = true;
+  }
+
+  {
+    char buf[380];
+    std::snprintf(buf, sizeof(buf),
+                  "raw=[%.1f,%.1f]%s dur=%.1f anchor=%s origin=%.1f clipLen=%.1f "
+                  "earliestRendered=%.1f | args.time=%.1f -> clipFrame=%.1f",
+                  _probeRaw[0], _probeRaw[1], _probeRawOk ? "" : "(THREW)",
+                  rta::safeEffectDuration(this),
+                  _manualOrigin->getValueAtTime(args.time) ? "manual" : "auto", origin, clipLength,
+                  _probeEarliest, args.time, frames);
+    rta::probeOnChange("cliptime", buf);
   }
 
   // Pick the stage driving this frame. A frame is only ever in one of them,
@@ -687,6 +762,36 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDefault(defs[i]);
       addParam(page, p);
     }
+  }
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToPlayhead");
+    p->setLabels("Set Start to Playhead", "Set Start", "Set Start to Playhead");
+    p->setHint(
+        "Park the playhead on the clip's FIRST frame and click. Resolve does "
+        "not tell a plugin where a trimmed clip visually starts -- every route "
+        "reports the available media, so the answer shifts by the length of the "
+        "head handle. This captures the real frame. Re-click after re-trimming "
+        "the head.");
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("manualOrigin");
+    p->setLabels("Use Manual Start", "Manual Start", "Use Manual Start Anchor");
+    p->setHint(
+        "Ticked automatically by the button above. Untick to fall back to the "
+        "host's reported clip start, which is exact only on clips with no head "
+        "handle.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("originFrame");
+    p->setLabels("Start Anchor (frame)", "Anchor", "Start Anchor Frame");
+    p->setHint("The captured timeline frame that counts as frame 0. Editable and copyable.");
+    p->setRange(-1000000.0, 1000000.0);
+    p->setDisplayRange(0.0, 10000.0);
+    p->setDefault(0.0);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startTime");
