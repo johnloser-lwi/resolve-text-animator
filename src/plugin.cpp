@@ -115,6 +115,19 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   void render(const OFX::RenderArguments& args) override;
 
+  void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
+    // Declare that the output changes over time even though no parameter is
+    // animated.
+    //
+    // The animation is internal: driven by the render time, not by host
+    // keyframes. Without this a host is entirely within its rights to render
+    // one frame and reuse it for the whole clip, because as far as it can tell
+    // nothing about the effect varies. Fusion does exactly that -- playback
+    // shows a frozen image while the controls still update it live -- whereas
+    // Resolve's Edit page happens to re-render regardless.
+    prefs.setOutputFrameVarying(true);
+  }
+
  private:
   OFX::Clip* _dstClip = nullptr;
   OFX::Clip* _srcClip = nullptr;
