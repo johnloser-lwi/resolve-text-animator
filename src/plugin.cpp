@@ -52,12 +52,31 @@ int choiceAt(OFX::ChoiceParam* p, double t, int lo, int hi) {
 // parameters are constants the animator interprets against the render time, so
 // every parameter affects every frame.
 //
-// Deliberately NOT set here, for now. Adding it coincided with project loading
-// breaking outright, and while that was never isolated, re-breaking a project
-// is worse than a stale frame. isIdentity below covers the per-frame-verdict
-// half of the same problem without that risk.
+// Every parameter here declares that it invalidates the whole cache.
+//
+// Nothing in this plugin is ever keyframed: the parameters are constants the
+// animator interprets against the render time, so *every* parameter affects
+// *every* frame. The OFX default, eCacheInvalidateValueChange, only invalidates
+// the range a parameter's own keyframe covers, which gives a caching host no
+// reason to discard anything -- so it keeps replaying frames rendered before
+// the edit. Resolve tolerates that; Fusion does not, and Fusion is right.
+//
+// This was removed once after project loading broke, but that was never
+// isolated -- it was eliminated by assumption while bisecting four changes at
+// once, and MultiTransform ships it without trouble. If loading breaks again,
+// this is the first suspect and the next step is narrowing it to the handful of
+// parameters that genuinely need it.
 template <class T>
 void addParam(OFX::PageParamDescriptor* page, T* p) {
+  p->setCacheInvalidation(OFX::eCacheInvalidateValueAll);
+  page->addChild(*p);
+}
+
+// For parameters that change nothing about the rendered image -- the overlay
+// toggle, the status line. Purging every cached frame because someone opened
+// the curve editor would be a stall for no reason.
+template <class T>
+void addParamUI(OFX::PageParamDescriptor* page, T* p) {
   page->addChild(*p);
 }
 
@@ -890,7 +909,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "lowering Start (frames) until the first word appears on the clip's "
         "first frame.");
     p->setDefault("");
-    addParam(page, p);
+    addParamUI(page, p);  // status only: never worth purging the cache for
   }
   {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableIn");
@@ -972,7 +991,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "Draws the easing curve over the viewer. Set the Viewer's on-screen-control "
         "dropdown to \"Open FX Overlay\" to see it, then drag the two handles.");
     p->setDefault(false);
-    addParam(page, p);
+    addParamUI(page, p);
   }
 
   // The bezier control points. They are driven by dragging the on-screen
@@ -1150,7 +1169,9 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setLabels("Set End to Playhead", "Set End", "Set Out End to Playhead");
       p->setHint("Park the playhead where the exit should finish and click.");
       p->setParent(*g);
-      addParam(page, p);
+      // A push button holds no value, so it has no cache invalidation to set --
+      // the parameter it writes carries that instead.
+      addParamUI(page, p);
     }
     {
       OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkOut");
