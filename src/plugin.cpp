@@ -318,12 +318,15 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     } catch (...) {
       ok = false;
     }
+    // Short. Resolve truncates a parameter label to roughly the left half of
+    // the row -- the rest of the width goes to the value field -- so a sentence
+    // here just renders as "(!) Source ...usion comp.". The explanation lives
+    // in the tooltip, which has room.
     try {
-      if (ok && t1 < 0.0)
-        _hostWarning->setLabel("(!) Source offset detected - reveal may start late. "
-                               "Offset it with Start (frames), or apply inside the Fusion comp.");
-      else
-        _hostWarning->setLabel("Timing OK");
+      _hostWarning->setLabel(ok && t1 < 0.0 ? "(!) Source offset" : "Timing OK");
+      // The field itself is meaningless; greying it out stops it reading as
+      // something to type into.
+      _hostWarning->setEnabled(false);
     } catch (...) {
     }
   }
@@ -879,9 +882,13 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setStringType(OFX::eStringTypeLabel);
     p->setLabels("Timing OK", "Timing", "Timing");
     p->setHint(
-        "Warns when the host reports a source offset for this clip, which makes "
-        "the reveal start later than the clip's first frame. Fusion clips with a "
-        "trimmed head do this; stills and PNGs do not.");
+        "(!) Source offset means this clip reaches back before its source start, "
+        "so Resolve's render time follows the source rather than the trimmed "
+        "clip and the reveal begins later than the clip's first frame.\n\n"
+        "Fusion clips with a trimmed head do this; stills and PNGs do not.\n\n"
+        "Fix it either by applying the effect inside the Fusion comp, or by "
+        "lowering Start (frames) until the first word appears on the clip's "
+        "first frame.");
     p->setDefault("");
     addParam(page, p);
   }
