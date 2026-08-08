@@ -185,27 +185,20 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // The animation then begins exactly where the playhead was parked, however
   // the clip is trimmed. This is how MultiTransform sidesteps the same gap.
   double originAt(double time) {
-    if (_manualOrigin->getValueAtTime(time)) return _originFrame->getValueAtTime(time);
-
-    // Auto: t1, straight from the host. A pure function of the clip's reported
-    // bounds -- no state, no learning, no history.
+    // Always the parameter. Never the host.
     //
-    // A learned origin was tried and abandoned. Deriving it from which frames
-    // had rendered meant it changed as you scrubbed, and clip time stopped
-    // being a steady function of the timeline. Every variant produced a
-    // different flavour of the same artifact: pinned at 0 so nothing ever
-    // progressed, jumping forward so earlier frames went dead, then freezing
-    // mid-reveal. An animation clock must not depend on render history.
+    // timeLineGetBounds does not return a stable answer: on one clip it gave
+    // eleven different values for t1 -- -10, -9, -8 ... 0 -- sliding across
+    // exactly the range the clip's head had been extended by, while t2 stayed
+    // put at 119. Anything derived from it inherits that jitter, so the clock
+    // moved under the animation and the reveal froze, jumped or restarted
+    // depending on which value happened to come back.
     //
-    // t1 is not the clip's visible start -- it includes the head handle, and
-    // Resolve reports no value that excludes it. So the entrance may begin
-    // before the clip becomes visible, which Start (frames) offsets. That is a
-    // constant offset the user sets once, and it stays put, which the learned
-    // version never did.
-    double start = 0.0, length = 0.0;
-    if (rta::getClipRange(this, start, length)) return start;
-    return 0.0;
+    // clipFrame = args.time - anchor. Both sides are exact, neither is guessed,
+    // and the result is the same every time the same frame is rendered.
+    return _originFrame->getValueAtTime(time);
   }
+
 
   // Feed a render time into the running minimum. Must happen before originAt()
   // is consulted for that same frame, or the clip's first frame would be
@@ -254,8 +247,10 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     if (name == "setStartToPlayhead") {
       // Store the playhead in the same clip-relative units render compares
       // against, so the entrance begins on exactly this frame.
+      // Anchor straight to the playhead, in absolute timeline frames.
       rta::beginEdit(this, "Set Start to Playhead");
-      _startTime->setValue(args.time - originAt(args.time));
+      _originFrame->setValue(args.time);
+      _startTime->setValue(0.0);
       rta::endEdit(this);
       return;
     }
@@ -273,29 +268,18 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
     if (name != "setStartToClipStart") return;
 
-    // Capture the earliest frame the host has actually asked us to render.
-    //
-    // Not args.time: Resolve passes 0 for a parameter change rather than the
-    // playhead position, so writing that just pinned the anchor to zero. And
-    // not anything the host reports about the clip either -- every one of those
-    // describes the available media, so it moves by the length of the head
-    // handle (measured t1=993 on a clip whose first rendered frame was 1020).
-    //
-    // The render times themselves are the one honest signal: the host only ever
-    // asks for frames inside the clip, so the lowest one seen is the clip's
-    // first frame. Captured once into a parameter rather than tracked live, so
-    // the value is stable and already-cached frames stay valid.
+    // Anchor to the lowest frame the host has actually asked us to render.
+    // The host only renders frames inside the clip, so that IS the clip's first
+    // frame -- and unlike timeLineGetBounds it does not jitter. Captured once
+    // into the parameter, so it is fixed from then on.
     double captured = args.time;
     {
       std::lock_guard<std::mutex> lock(_seenMutex);
       if (_seenEarliest < 1e299) captured = _seenEarliest;
     }
-
-    // Bracketed because the plugin is setting its own parameters; without it
-    // Fusion is never told the edit happened and keeps serving cached frames.
     rta::beginEdit(this, "Set Start to Clip Start");
     _originFrame->setValue(captured);
-    _manualOrigin->setValue(true);
+    _startTime->setValue(0.0);
     rta::endEdit(this);
   }
 
