@@ -257,7 +257,25 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // The origin is only discarded when it falls outside the media the clip is
     // cut from, which is the one thing that cannot be true of a real first
     // frame. That covers the clip genuinely moving, without reacting to noise.
-    // Monotonically decreasing, with no recovery path at all.
+    // Re-learn whenever the clip's TRIM changes, keyed on t2.
+    //
+    // Resolve's render time follows the clip's SOURCE position, not its
+    // timeline position -- the same caveat Gyroflow hit, where a subclip with a
+    // non-zero start pulled data from the start of the source instead. Trimming
+    // the head therefore moves args.time for the clip's first frame, so the
+    // anchor has to move with it.
+    //
+    // A minimum that only ever falls cannot: it follows the clip when the head
+    // is extended and then can never follow it back, leaving the animation
+    // offset by the trim amount for good.
+    //
+    // t2 is the key because it is the one bound that holds still -- measured
+    // constant at 119 while t1 returned eleven different values on the same
+    // clip -- and it changes when the clip is genuinely re-trimmed. t1 is never
+    // used for anything.
+    if (haveBounds && rawT2 != _seenT2) _seenEarliest = time;
+
+    // Monotonically decreasing within one trim state.
     //
     // Every previous version reset this when the host's bounds looked wrong,
     // which moved the anchor FORWARD onto the frame being rendered -- clip time

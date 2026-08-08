@@ -120,6 +120,43 @@ than an unrelated one.
 Because the exit needs to know where the clip ends, it is skipped when the host
 reports no usable clip length. **Clip Length Override** covers that case.
 
+### Fusion clips shift the animation; still images do not
+
+**Confirmed by comparison:** applied to a **PNG** on the timeline the reveal
+starts exactly on the clip's first frame. Applied to a **Fusion clip** (Text+,
+Fusion Title, Fusion Composition) and then head-trimmed, it starts somewhere
+else — usually at the clip's *original* start, leaving the extended frames
+looking dead.
+
+The cause is in the host, not the animation. In Resolve an OFX plugin's render
+time follows the clip's **source** position, not its timeline position — the
+same caveat [Gyroflow hit](https://github.com/gyroflow/gyroflow-plugins/issues/25),
+where a subclip with a non-zero start pulled data from the start of the source.
+Their fix reads `GetClipProperty('Start')`, `GetLeftOffset()` and
+`GetSourceStartFrame()`, all of which are Resolve's **scripting** API and
+unreachable from OFX.
+
+A Fusion clip makes it worse, because what the plugin sees is the *composition's*
+own fixed range rather than the trimmed clip. Measured on one: `t2` sat constant
+at **119** — a 0..119 range, i.e. 120 frames, Resolve's default Fusion clip
+length — while `t1` returned **eleven different values** between −10 and 0,
+tracking the head handle inside that comp. Trimming the head changes which part
+of the comp is shown without moving the comp's own frame 0, so no bound the host
+reports identifies the clip's first *visible* frame.
+
+Two ways to live with it:
+
+- **Apply the effect inside the Fusion comp** rather than to the Fusion clip on
+  the Edit page. There the time base is the comp's own, with no Edit-page trim
+  indirection in between. This is the recommended route for Fusion clips.
+- **Use `Start (frames)` as a manual offset.** Decrease it if the reveal starts
+  late (dead frames at the head), increase it if it is already partway in on the
+  first frame. Nothing moves underneath it, so the value stays correct.
+
+The frames are never skipped, which is worth knowing when diagnosing this: they
+render, and they evaluate to "before the animation starts" — opacity 0, fully
+offset. That is why the symptom reads as dead frames rather than wrong ones.
+
 ### Timing is in frames, measured from the clip start
 
 **Start** is measured from the clip's own first frame, so `0` means "when the
