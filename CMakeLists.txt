@@ -80,6 +80,22 @@ if(CMAKE_CUDA_COMPILER)
     CUDA_RUNTIME_LIBRARY Static
   )
   message(STATUS "CUDA enabled (archs: ${CMAKE_CUDA_ARCHITECTURES})")
+
+  # CPU-vs-CUDA parity harness. The CPU compositor is the reference segtest
+  # exercises; in Resolve every frame goes through the CUDA one instead.
+  add_executable(cudatest tools/cudatest.cpp src/cuda_compositor.cu)
+  target_link_libraries(cudatest PRIVATE rta_core)
+  # cudatest.cpp is host code that includes cuda_runtime.h, so it needs the
+  # toolkit headers that .cu files get for free.
+  target_include_directories(cudatest PRIVATE external/stb
+                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_compile_definitions(cudatest PRIVATE RTA_WITH_CUDA=1 _CRT_SECURE_NO_WARNINGS)
+  set_target_properties(cudatest PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_RUNTIME_LIBRARY Static)
+  if(MSVC)
+    set_property(TARGET cudatest PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
 else()
   target_compile_definitions(TextAnimator PRIVATE RTA_WITH_CUDA=0)
   message(STATUS "CUDA toolkit not found - building CPU-only")

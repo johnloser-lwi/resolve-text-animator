@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -64,13 +65,16 @@ inline void probeLog(const std::string& line) {
 // Logs only when `value` differs from the last value seen for `key`, so a
 // per-frame call costs a string compare once the state is steady.
 inline void probeOnChange(const char* key, const std::string& value) {
+  // Per key. A single shared "last value" meant two alternating keys each saw
+  // the other's value and both logged every time, which is noise dressed up as
+  // change.
   static std::mutex m;
-  static std::string lastKey, lastValue;
+  static std::map<std::string, std::string> last;
   {
     std::lock_guard<std::mutex> lock(m);
-    if (lastKey == key && lastValue == value) return;
-    lastKey = key;
-    lastValue = value;
+    auto it = last.find(key);
+    if (it != last.end() && it->second == value) return;
+    last[key] = value;
   }
   probeLog(std::string(key) + ": " + value);
 }
