@@ -76,6 +76,7 @@ independently of whether the timing is right. If words are mis-split, adjust
 
 | | |
 |---|---|
+| **In Animation / Out Animation** | enable each stage independently; both off leaves the text static |
 | **Animate By** | Character / Word / Line |
 | **Animation** | Fade, or Slide + Fade |
 | **Order** | Forward, Reverse, Center Out, Random |
@@ -86,7 +87,38 @@ independently of whether the timing is right. If words are mis-split, adjust
 | **Slide Distance / Angle** | how far a unit travels, in the chosen units; 90° rises from below |
 | **Start Scale / Start Rotation / Start Blur** | the unit's scale, rotation (degrees, about its own centre) and defocus radius at the beginning of its animation, all unwinding to normal as it settles |
 | **Motion Blur** | Motion Blur on/off, Shutter Angle (180° = normal cine shutter), Samples |
+| **Out Animation** (group) | End Offset (frames before the clip end at which it finishes), Link to In, Mirror, Clip Length Override, plus a full independent set used when unlinked |
 | **Detection** | Alpha Threshold, Min Blob Area, Word Gap, Bridge Radius, Show Detection |
+
+### In and out animations
+
+**In Animation** and **Out Animation** toggle independently. With both off the
+text simply sits there, unanimated.
+
+The exit is anchored to the **end** of the clip, not the start: `End Offset = 30`
+means the text is fully gone 30 frames before the clip ends. Anchoring it to the
+end is the point — it stays where you put it when the clip is trimmed or its
+length changes.
+
+**Link to In** (default on) makes the exit reuse the entrance's settings, and
+**Mirror** decides how:
+
+| Mirror | Behaviour |
+|---|---|
+| On (default) | The text **retreats the way it came** — an entrance rising from below sinks back down. |
+| Off | The text **continues** in its direction of travel and carries on upward. |
+
+Untick **Link to In** and the exit gets its own full set of controls, including
+its own grouping — words in, characters out, if you like. The two stages are
+segmented separately and a frame is only ever driven by one of them, which is
+what makes differing group modes possible at all.
+
+The exit is the entrance run backwards — eased at `1 - raw` rather than
+`1 - eased(raw)` — so a Cubic Out entrance leaves on the mirrored profile rather
+than an unrelated one.
+
+Because the exit needs to know where the clip ends, it is skipped when the host
+reports no usable clip length. **Clip Length Override** covers that case.
 
 ### Timing is in frames, measured from the clip start
 

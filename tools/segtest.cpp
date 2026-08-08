@@ -27,11 +27,11 @@ namespace {
 // cropped to the text plus its travel distance. Verifies the animator and
 // compositor without a host in the loop.
 std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentation& seg,
-                               const rta::AnimParams& anim, int count, double atFraction,
-                               int& outW, int& outH) {
+                               const rta::AnimParams& anim, rta::Stage stage, int count,
+                               double atFraction, int& outW, int& outH) {
   rta::RectI area;
   for (const auto& g : seg.groups) area.unionWith(g.bbox);
-  area.grow(int(anim.slideDistance) + 16);
+  area.grow(int(anim.in.slideDistance) + 16);
   area.x1 = std::max(0, area.x1);
   area.y1 = std::max(0, area.y1);
   area.x2 = std::min(src.width, area.x2);
@@ -45,9 +45,13 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
   std::vector<float> frame(size_t(src.width) * src.height * 4, 0.0f);
   rta::ImageView fv{frame.data(), src.width, src.height, std::ptrdiff_t(src.width) * 4};
 
-  const std::vector<int> rank = rta::revealOrder(seg.groups, seg.lineCount, anim);
-  const double total = rta::totalDuration(seg.groups.size(), anim);
+  // The exit is rendered on its own timeline starting at 0, which is all that
+  // is needed to see it; in the plugin it is anchored to the clip's end.
+  const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
+  const double stageStart = stage == rta::Stage::Out ? 0.0 : anim.startTime;
+  const double total = stageStart + rta::stageSpan(seg.groups.size(), s);
 
+  const std::vector<int> rank = rta::revealOrder(seg.groups, seg.lineCount, s);
   const int taps = rta::tapCount(anim);
   for (int i = 0; i < count; ++i) {
     const double t = atFraction >= 0.0
@@ -55,7 +59,7 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
                          : total * double(i) / double(std::max(1, count - 1));
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
-      rta::transformTaps(rank[g], t, anim, &xf[g * size_t(taps)]);
+      rta::transformTaps(stage, rank[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
     rta::compositeGroups(fv, src, seg, xf, taps, rta::RectI{0, 0, src.width, src.height});
 
     for (int y = 0; y < th; ++y) {
@@ -86,6 +90,8 @@ int main(int argc, char** argv) {
   rta::AnimParams anim;
   int strip = 0;
   double atFraction = -1.0;
+  rta::Stage stage = rta::Stage::In;
+  bool mirror = true;
   for (int i = 3; i < argc; ++i) {
     const char* a = argv[i];
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : "0"; };
@@ -105,23 +111,23 @@ int main(int argc, char** argv) {
     } else if (!std::strcmp(a, "--strip")) {
       strip = std::atoi(next());
     } else if (!std::strcmp(a, "--stagger")) {
-      anim.stagger = std::atof(next());
+      anim.in.stagger = std::atof(next());
     } else if (!std::strcmp(a, "--dur")) {
-      anim.duration = std::atof(next());
+      anim.in.duration = std::atof(next());
     } else if (!std::strcmp(a, "--slide")) {
-      anim.slideDistance = std::atof(next());
+      anim.in.slideDistance = std::atof(next());
     } else if (!std::strcmp(a, "--angle")) {
-      anim.slideAngle = std::atof(next());
+      anim.in.slideAngle = std::atof(next());
     } else if (!std::strcmp(a, "--easing")) {
-      anim.easing = rta::Easing(std::atoi(next()));
+      anim.in.easing = rta::Easing(std::atoi(next()));
     } else if (!std::strcmp(a, "--order")) {
-      anim.order = rta::Order(std::atoi(next()));
+      anim.in.order = rta::Order(std::atoi(next()));
     } else if (!std::strcmp(a, "--lineorder")) {
-      anim.lineOrder = rta::LineOrder(std::atoi(next()));
+      anim.in.lineOrder = rta::LineOrder(std::atoi(next()));
     } else if (!std::strcmp(a, "--rotate")) {
-      anim.startRotation = std::atof(next());
+      anim.in.startRotation = std::atof(next());
     } else if (!std::strcmp(a, "--blur")) {
-      anim.startBlur = std::atof(next());
+      anim.in.startBlur = std::atof(next());
     } else if (!std::strcmp(a, "--mblur")) {
       anim.motionBlur = std::atoi(next()) != 0;
     } else if (!std::strcmp(a, "--shutter")) {
@@ -130,9 +136,13 @@ int main(int argc, char** argv) {
       anim.blurSamples = std::atoi(next());
     } else if (!std::strcmp(a, "--bez")) {
       // x1,y1,x2,y2 -- same control points the on-screen curve editor writes.
-      std::sscanf(next(), "%f,%f,%f,%f", &anim.bezier.x1, &anim.bezier.y1, &anim.bezier.x2,
-                  &anim.bezier.y2);
-      anim.easing = rta::Easing::Custom;
+      std::sscanf(next(), "%f,%f,%f,%f", &anim.in.bezier.x1, &anim.in.bezier.y1, &anim.in.bezier.x2,
+                  &anim.in.bezier.y2);
+      anim.in.easing = rta::Easing::Custom;
+    } else if (!std::strcmp(a, "--stage")) {
+      stage = !std::strcmp(next(), "out") ? rta::Stage::Out : rta::Stage::In;
+    } else if (!std::strcmp(a, "--nomirror")) {
+      mirror = false;
     } else if (!std::strcmp(a, "--at")) {
       // Render a single frame at this fraction of the total duration, instead
       // of a strip -- for landing exactly on an overshoot.
@@ -177,11 +187,16 @@ int main(int argc, char** argv) {
   std::vector<float> strippedBuf;
   const float* result = buf.data();
 
+  // Linked-and-mirrored is the plugin's default, so the harness matches it.
+  anim.out = rta::mirrorStage(anim.in, mirror);
+
   if (strip > 1) {
-    strippedBuf = renderStrip(view, seg, anim, strip, atFraction, ow, oh);
+    strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, ow, oh);
     result = strippedBuf.data();
-    std::printf("strip: %d samples over %.1f frames\n", strip,
-                rta::totalDuration(seg.groups.size(), anim));
+    const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
+    std::printf("strip: %d samples of the %s stage over %.1f frames\n", strip,
+                stage == rta::Stage::Out ? "OUT" : "IN",
+                rta::stageSpan(seg.groups.size(), s));
   } else {
     rta::drawDiagnostics(view, seg, 2);
   }

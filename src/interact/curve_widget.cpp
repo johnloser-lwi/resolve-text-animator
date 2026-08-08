@@ -36,16 +36,16 @@ void CurveWidget::fitRange(const OverlayContext& c) {
   // clipped to the panel edge tells you nothing about its shape.
   double lo = kYMinDefault, hi = kYMaxDefault;
   for (int i = 0; i <= kCurveSegments; ++i) {
-    const double y = applyEasing(float(i) / kCurveSegments, c.anim.easing, c.anim.bezier);
+    const double y = applyEasing(float(i) / kCurveSegments, c.anim.in.easing, c.anim.in.bezier);
     lo = std::min(lo, y);
     hi = std::max(hi, y);
   }
 
   // Include the handles themselves: they are draggable, so they must stay
   // reachable even when they sit outside the curve's own extent.
-  if (c.anim.easing == Easing::Custom) {
-    lo = std::min({lo, double(c.anim.bezier.y1), double(c.anim.bezier.y2)});
-    hi = std::max({hi, double(c.anim.bezier.y1), double(c.anim.bezier.y2)});
+  if (c.anim.in.easing == Easing::Custom) {
+    lo = std::min({lo, double(c.anim.in.bezier.y1), double(c.anim.in.bezier.y2)});
+    hi = std::max({hi, double(c.anim.in.bezier.y1), double(c.anim.in.bezier.y2)});
   }
 
   const double margin = 0.12 * std::max(1.0, hi - lo);
@@ -89,11 +89,11 @@ OfxPointD CurveWidget::panelToUnit(const OfxPointD& p) const {
 void CurveWidget::draw(const OverlayContext& c) {
   Panel(c, _rect);
 
-  const BezierEasing& b = c.anim.bezier;
-  const bool custom = c.anim.easing == Easing::Custom;
+  const BezierEasing& b = c.anim.in.bezier;
+  const bool custom = c.anim.in.easing == Easing::Custom;
 
   SetColour(c, colours::kTextDim);
-  Text(c, easingName(c.anim.easing), _rect.x1 + c.sx(kPadPx), _rect.y2 - c.sy(5.0),
+  Text(c, easingName(c.anim.in.easing), _rect.x1 + c.sx(kPadPx), _rect.y2 - c.sy(5.0),
        kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
 
   // Reference frame: 0 and 1 bound the useful range, so anything drawn outside
@@ -119,7 +119,7 @@ void CurveWidget::draw(const OverlayContext& c) {
   OfxPointD pts[kCurveSegments + 1];
   for (int i = 0; i <= kCurveSegments; ++i) {
     const double u = double(i) / kCurveSegments;
-    pts[i] = unitToPanel(u, applyEasing(float(u), c.anim.easing, b));
+    pts[i] = unitToPanel(u, applyEasing(float(u), c.anim.in.easing, b));
   }
   SetColour(c, colours::kAccent);
   SetLineWidth(c, 2.0f);
@@ -144,7 +144,7 @@ void CurveWidget::draw(const OverlayContext& c) {
   // Playhead: where the current frame sits on the curve.
   if (c.hasProgress) {
     const double raw = clampd(c.progress, 0.0, 1.0);
-    const OfxPointD ph = unitToPanel(raw, applyEasing(float(raw), c.anim.easing, b));
+    const OfxPointD ph = unitToPanel(raw, applyEasing(float(raw), c.anim.in.easing, b));
     SetColour(c, colours::kPlayhead);
     Ellipse(c, ph.x, ph.y, c.sx(4.0), c.sy(4.0));
   }
@@ -184,9 +184,9 @@ bool CurveWidget::penDown(const OverlayContext& c, const OfxPointD& p) {
   if (!Contains(_rect, p)) return false;
   // Swallow clicks anywhere in the panel so a miss near a handle does not fall
   // through and start some other drag underneath.
-  if (c.anim.easing != Easing::Custom) return true;
+  if (c.anim.in.easing != Easing::Custom) return true;
 
-  const BezierEasing& b = c.anim.bezier;
+  const BezierEasing& b = c.anim.in.bezier;
   const OfxPointD p1 = unitToPanel(b.x1, b.y1);
   const OfxPointD p2 = unitToPanel(b.x2, b.y2);
 

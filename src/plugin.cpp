@@ -35,6 +35,20 @@ int choiceAt(OFX::ChoiceParam* p, double t, int lo, int hi) {
   return std::clamp(v, lo, hi);
 }
 
+// Single funnel for adding parameters to the page.
+//
+// Deliberately plain. It is tempting to set eCacheInvalidateValueAll here --
+// nothing in this plugin is keyframed, so every parameter really does affect
+// every frame, and without it a caching host can replay stale frames after an
+// edit. That was tried and it broke project loading outright: restoring a
+// project sets every parameter on every clip, and each set then triggered a
+// full cache purge. If it is ever wanted again it belongs on the handful of
+// parameters that genuinely need it, not on all of them.
+template <class T>
+void addParam(OFX::PageParamDescriptor* page, T* p) {
+  page->addChild(*p);
+}
+
 // OFX images are bottom-up: y=0 is the bottom row. The core code is top-down
 // (line 0 is the top line, +y slides downward). Converting here, at the single
 // boundary, is what keeps "animate the first line first" and "90 degrees rises
@@ -67,15 +81,36 @@ struct AnalysisCache {
   std::mutex mutex;
   uint64_t hash = 0;
   int width = 0, height = 0;
-  rta::DetectParams params;
-  std::shared_ptr<const rta::Segmentation> seg;
+  rta::DetectParams base;  // detection settings other than the grouping mode
+
+  // One segmentation per grouping mode, because the entrance and the exit may
+  // group differently -- words in, characters out. At most two are ever filled.
+  std::shared_ptr<const rta::Segmentation> byMode[3];
+
+  void invalidate() {
+    for (auto& s : byMode) s.reset();
 #if RTA_WITH_CUDA
-  // Device copy of the same segmentation, uploaded whenever `seg` is replaced.
+    devSegMode = -1;
+    devSegValid = false;
+#endif
+  }
+
+#if RTA_WITH_CUDA
+  // Device copy of whichever segmentation the current frame actually uses.
   rta::CudaSegmentation devSeg;
   rta::CudaScratch scratch;
+  int devSegMode = -1;
   bool devSegValid = false;
 #endif
 };
+
+// Detection settings compare equal ignoring the grouping mode, which is what
+// decides whether the cached label image can be reused across modes.
+bool sameBase(const rta::DetectParams& a, const rta::DetectParams& b) {
+  rta::DetectParams x = a, y = b;
+  x.mode = y.mode = rta::GroupMode::Word;
+  return x == y;
+}
 
 class TextAnimatorPlugin : public OFX::ImageEffect {
  public:
@@ -101,6 +136,27 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _shutterAngle = fetchDoubleParam("shutterAngle");
     _blurSamples = fetchIntParam("blurSamples");
     _distanceUnits = fetchChoiceParam("distanceUnits");
+
+    _enableIn = fetchBooleanParam("enableIn");
+    _enableOut = fetchBooleanParam("enableOut");
+    _outOffset = fetchDoubleParam("outOffset");
+    _linkOut = fetchBooleanParam("linkOut");
+    _mirrorOut = fetchBooleanParam("mirrorOut");
+    _clipLengthOverride = fetchDoubleParam("clipLengthOverride");
+
+    _outGroupMode = fetchChoiceParam("outGroupMode");
+    _outAnimation = fetchChoiceParam("outAnimation");
+    _outEasing = fetchChoiceParam("outEasing");
+    _outOrder = fetchChoiceParam("outOrder");
+    _outLineOrder = fetchChoiceParam("outLineOrder");
+    _outRandomSeed = fetchIntParam("outRandomSeed");
+    _outDuration = fetchDoubleParam("outDuration");
+    _outStagger = fetchDoubleParam("outStagger");
+    _outSlideDistance = fetchDoubleParam("outSlideDistance");
+    _outSlideAngle = fetchDoubleParam("outSlideAngle");
+    _outStartScale = fetchDoubleParam("outStartScale");
+    _outStartRotation = fetchDoubleParam("outStartRotation");
+    _outStartBlur = fetchDoubleParam("outStartBlur");
     _easeX1 = fetchDoubleParam("easeX1");
     _easeY1 = fetchDoubleParam("easeY1");
     _easeX2 = fetchDoubleParam("easeX2");
@@ -139,6 +195,14 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur;
+
+  // Exit stage.
+  OFX::BooleanParam *_enableIn, *_enableOut, *_linkOut, *_mirrorOut;
+  OFX::DoubleParam *_outOffset, *_clipLengthOverride;
+  OFX::ChoiceParam *_outGroupMode, *_outAnimation, *_outEasing, *_outOrder, *_outLineOrder;
+  OFX::IntParam* _outRandomSeed;
+  OFX::DoubleParam *_outDuration, *_outStagger, *_outSlideDistance, *_outSlideAngle;
+  OFX::DoubleParam *_outStartScale, *_outStartRotation, *_outStartBlur;
 
   AnalysisCache _cache;
 };
@@ -211,31 +275,62 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
   rta::AnimParams anim;
-  anim.animation = rta::Animation(choiceAt(_animation, args.time, 0, 1));
-  anim.easing = rta::Easing(choiceAt(_easing, args.time, 0, 4));
-  anim.bezier.x1 = float(_easeX1->getValueAtTime(args.time));
-  anim.bezier.y1 = float(_easeY1->getValueAtTime(args.time));
-  anim.bezier.x2 = float(_easeX2->getValueAtTime(args.time));
-  anim.bezier.y2 = float(_easeY2->getValueAtTime(args.time));
-  anim.order = rta::Order(choiceAt(_order, args.time, 0, 3));
-  anim.lineOrder = rta::LineOrder(choiceAt(_lineOrder, args.time, 0, 1));
-  anim.randomSeed = _randomSeed->getValueAtTime(args.time);
+  anim.enableIn = _enableIn->getValueAtTime(args.time);
+  anim.enableOut = _enableOut->getValueAtTime(args.time);
   anim.startTime = _startTime->getValueAtTime(args.time);
-  anim.duration = _duration->getValueAtTime(args.time);
-  anim.stagger = _stagger->getValueAtTime(args.time);
-  anim.slideAngle = _slideAngle->getValueAtTime(args.time);
-  anim.startScale = _startScale->getValueAtTime(args.time);
-  // Slide distance is authored in full-resolution pixels, so scale it to keep
-  // the motion identical at proxy, 1080p and 4K.
-  anim.startRotation = _startRotation->getValueAtTime(args.time);
-  // Slide distance and blur are lengths, so they are converted below once the
-  // segmentation is known -- "% of text height" needs the measured glyphs.
-  const double rawSlide = _slideDistance->getValueAtTime(args.time);
-  const double rawBlur = _startBlur->getValueAtTime(args.time);
-  const int distanceUnits = choiceAt(_distanceUnits, args.time, 0, 2);
+  anim.outOffset = _outOffset->getValueAtTime(args.time);
   anim.motionBlur = _motionBlur->getValueAtTime(args.time);
   anim.shutterAngle = _shutterAngle->getValueAtTime(args.time);
   anim.blurSamples = _blurSamples->getValueAtTime(args.time);
+
+  rta::StageSettings& in = anim.in;
+  in.animation = rta::Animation(choiceAt(_animation, args.time, 0, 1));
+  in.easing = rta::Easing(choiceAt(_easing, args.time, 0, 4));
+  in.bezier.x1 = float(_easeX1->getValueAtTime(args.time));
+  in.bezier.y1 = float(_easeY1->getValueAtTime(args.time));
+  in.bezier.x2 = float(_easeX2->getValueAtTime(args.time));
+  in.bezier.y2 = float(_easeY2->getValueAtTime(args.time));
+  in.order = rta::Order(choiceAt(_order, args.time, 0, 3));
+  in.lineOrder = rta::LineOrder(choiceAt(_lineOrder, args.time, 0, 1));
+  in.randomSeed = _randomSeed->getValueAtTime(args.time);
+  in.duration = _duration->getValueAtTime(args.time);
+  in.stagger = _stagger->getValueAtTime(args.time);
+  in.slideAngle = _slideAngle->getValueAtTime(args.time);
+  in.startScale = _startScale->getValueAtTime(args.time);
+  in.startRotation = _startRotation->getValueAtTime(args.time);
+
+  // Slide distance and blur are lengths, so they are converted below once the
+  // segmentation is known -- "% of text height" needs the measured glyphs.
+  const int distanceUnits = choiceAt(_distanceUnits, args.time, 0, 2);
+  const double rawSlideIn = _slideDistance->getValueAtTime(args.time);
+  const double rawBlurIn = _startBlur->getValueAtTime(args.time);
+
+  // The exit either copies the entrance -- optionally mirrored -- or stands on
+  // its own set of controls.
+  const bool linkOut = _linkOut->getValueAtTime(args.time);
+  const bool mirrorOut = _mirrorOut->getValueAtTime(args.time);
+  rta::GroupMode outMode = det.mode;
+  double rawSlideOut = rawSlideIn, rawBlurOut = rawBlurIn;
+
+  if (linkOut) {
+    anim.out = rta::mirrorStage(in, mirrorOut);
+  } else {
+    rta::StageSettings& o = anim.out;
+    outMode = rta::GroupMode(choiceAt(_outGroupMode, args.time, 0, 2));
+    o.animation = rta::Animation(choiceAt(_outAnimation, args.time, 0, 1));
+    o.easing = rta::Easing(choiceAt(_outEasing, args.time, 0, 4));
+    o.bezier = in.bezier;  // the curve editor shapes a single custom curve
+    o.order = rta::Order(choiceAt(_outOrder, args.time, 0, 3));
+    o.lineOrder = rta::LineOrder(choiceAt(_outLineOrder, args.time, 0, 1));
+    o.randomSeed = _outRandomSeed->getValueAtTime(args.time);
+    o.duration = _outDuration->getValueAtTime(args.time);
+    o.stagger = _outStagger->getValueAtTime(args.time);
+    o.slideAngle = _outSlideAngle->getValueAtTime(args.time);
+    o.startScale = _outStartScale->getValueAtTime(args.time);
+    o.startRotation = _outStartRotation->getValueAtTime(args.time);
+    rawSlideOut = _outSlideDistance->getValueAtTime(args.time);
+    rawBlurOut = _outStartBlur->getValueAtTime(args.time);
+  }
 
   // --------------------------------------------------------------- analysis
   uint64_t hash = 0;
@@ -252,39 +347,50 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     hash = rta::hashAlpha(srcView, det.alphaThreshold);
   }
 
-  std::shared_ptr<const rta::Segmentation> seg;
+  std::shared_ptr<const rta::Segmentation> segIn, segOut;
   {
     std::lock_guard<std::mutex> lock(_cache.mutex);
-    const bool hit = _cache.seg && _cache.hash == hash && _cache.width == srcView.width &&
-                     _cache.height == srcView.height && _cache.params == det;
-    if (!hit) {
+    if (_cache.hash != hash || _cache.width != srcView.width ||
+        _cache.height != srcView.height || !sameBase(_cache.base, det)) {
+      _cache.invalidate();
+      _cache.hash = hash;
+      _cache.width = srcView.width;
+      _cache.height = srcView.height;
+      _cache.base = det;
+    }
+
+    const bool needIn = !_cache.byMode[int(det.mode)];
+    const bool needOut = anim.enableOut && !_cache.byMode[int(outMode)];
+
+    if (needIn || needOut) {
+      // One readback serves both modes. This is the only full-frame transfer in
+      // the plugin, and it happens per title change rather than per frame.
+      std::vector<float> host;
+      rta::ImageView hostView = srcView;
 #if RTA_WITH_CUDA
       if (useCuda) {
-        // The only full-frame readback in the whole plugin, and it happens once
-        // per title change rather than once per frame.
-        std::vector<float> host;
         if (!rta::cudaDownload(host, srcView.data, srcView.rowStride, srcView.width,
                                srcView.height))
           return;
         const std::ptrdiff_t absStride =
             srcView.rowStride < 0 ? -srcView.rowStride : srcView.rowStride;
-        rta::ImageView hostView{host.data() + absStride * (srcView.height - 1), srcView.width,
-                                srcView.height, -absStride};
-        _cache.seg = std::make_shared<const rta::Segmentation>(rta::segment(hostView, det));
-        _cache.devSegValid = _cache.devSeg.upload(*_cache.seg);
-      } else
-#endif
-      {
-        _cache.seg = std::make_shared<const rta::Segmentation>(rta::segment(srcView, det));
+        hostView = rta::ImageView{host.data() + absStride * (srcView.height - 1), srcView.width,
+                                  srcView.height, -absStride};
       }
-      _cache.hash = hash;
-      _cache.width = srcView.width;
-      _cache.height = srcView.height;
-      _cache.params = det;
+#endif
+      auto build = [&](rta::GroupMode m) {
+        rta::DetectParams d = det;
+        d.mode = m;
+        _cache.byMode[int(m)] = std::make_shared<const rta::Segmentation>(segment(hostView, d));
+      };
+      if (needIn) build(det.mode);
+      if (needOut) build(outMode);
     }
-    seg = _cache.seg;
+
+    segIn = _cache.byMode[int(det.mode)];
+    if (anim.enableOut) segOut = _cache.byMode[int(outMode)];
   }
-  if (seg->empty()) return;
+  if (!segIn || segIn->empty()) return;
 
   // ---------------------------------------------------------------- animate
   // Clip-relative frames. Trimming the clip's head re-anchors the animation to
@@ -297,6 +403,41 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // from it rather than the clip's extent. See clip_time.h.
   const double frames = rta::toClipTime(this, args.time);
 
+  // The exit is anchored to the clip's END, so it needs the clip's length. When
+  // the host will not report one the override stands in; without either, the
+  // exit is skipped rather than guessed at.
+  double clipStart = 0.0, clipLength = 0.0;
+  bool haveLength = rta::getClipRange(this, clipStart, clipLength);
+  const double lengthOverride = _clipLengthOverride->getValueAtTime(args.time);
+  if (lengthOverride > 0.0) {
+    clipLength = lengthOverride;
+    haveLength = true;
+  }
+
+  // Pick the stage driving this frame. A frame is only ever in one of them,
+  // which is what lets the two stages group the text differently.
+  rta::Stage stage = rta::Stage::Settled;
+  const rta::Segmentation* useSeg = segIn.get();
+  const rta::StageSettings* useSet = &anim.in;
+  rta::GroupMode useMode = det.mode;
+  double stageStart = anim.startTime;
+  double rawSlide = rawSlideIn, rawBlur = rawBlurIn;
+
+  if (anim.enableOut && haveLength && segOut && !segOut->empty()) {
+    const double outStart =
+        clipLength - anim.outOffset - rta::stageSpan(segOut->groups.size(), anim.out);
+    if (frames >= outStart) {
+      stage = rta::Stage::Out;
+      useSeg = segOut.get();
+      useSet = &anim.out;
+      useMode = outMode;
+      stageStart = outStart;
+      rawSlide = rawSlideOut;
+      rawBlur = rawBlurOut;
+    }
+  }
+  if (stage != rta::Stage::Out) stage = anim.enableIn ? rta::Stage::In : rta::Stage::Settled;
+
   // Lengths are authored as a ratio so the motion looks identical at 1080p and
   // 4K. renderScale only tracks proxy scale, not timeline resolution, so it
   // cannot do this on its own: at a 4K timeline it is still 1.0 while the frame
@@ -308,21 +449,38 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     // % of text height: also independent of font size. Median group height is
     // a robust stand-in -- a mean would be dragged around by one tall word.
     std::vector<int> heights;
-    heights.reserve(seg->groups.size());
-    for (const auto& g : seg->groups) heights.push_back(g.bbox.height());
+    heights.reserve(useSeg->groups.size());
+    for (const auto& g : useSeg->groups) heights.push_back(g.bbox.height());
     if (!heights.empty()) {
       std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
       lengthScale = std::max(1, heights[heights.size() / 2]) / 100.0;
     }
   }
-  anim.slideDistance = rawSlide * lengthScale;
-  anim.startBlur = rawBlur * lengthScale;
+  rta::StageSettings active = *useSet;
+  active.slideDistance = rawSlide * lengthScale;
+  active.startBlur = rawBlur * lengthScale;
+  // tapCount looks at both stages, so keep them in step with the scaling.
+  anim.in.startBlur = rawBlurIn * lengthScale;
+  anim.out.startBlur = rawBlurOut * lengthScale;
 
-  const std::vector<int> rank = rta::revealOrder(seg->groups, seg->lineCount, anim);
+  const std::vector<int> rank = rta::revealOrder(useSeg->groups, useSeg->lineCount, active);
   const int taps = rta::tapCount(anim);
-  std::vector<rta::GroupTransform> transforms(seg->groups.size() * size_t(taps));
-  for (size_t i = 0; i < seg->groups.size(); ++i)
-    rta::transformTaps(rank[i], frames, anim, &transforms[i * size_t(taps)]);
+  std::vector<rta::GroupTransform> transforms(useSeg->groups.size() * size_t(taps));
+  for (size_t i = 0; i < useSeg->groups.size(); ++i)
+    rta::transformTaps(stage, rank[i], frames, stageStart, anim, active,
+                       &transforms[i * size_t(taps)]);
+
+#if RTA_WITH_CUDA
+  if (useCuda) {
+    // Keep the device stencil in step with whichever segmentation this frame
+    // uses; the two stages may group differently.
+    std::lock_guard<std::mutex> lock(_cache.mutex);
+    if (_cache.devSegMode != int(useMode)) {
+      _cache.devSegValid = _cache.devSeg.upload(*useSeg);
+      _cache.devSegMode = _cache.devSegValid ? int(useMode) : -1;
+    }
+  }
+#endif
 
   const rta::RectI window = toLocal(args.renderWindow, common);
   const bool diagnostics = _showDiagnostics->getValueAtTime(args.time);
@@ -332,19 +490,19 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     std::lock_guard<std::mutex> lock(_cache.mutex);
     if (!_cache.devSegValid) return;
     if (!rta::cudaCompositeGroups(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
-                                  dstView.width, dstView.height, _cache.devSeg, seg->groups,
+                                  dstView.width, dstView.height, _cache.devSeg, useSeg->groups,
                                   transforms, taps, window, _cache.scratch, args.pCudaStream))
       return;
     if (diagnostics) {
       rta::cudaDrawDiagnostics(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
-                               dstView.width, dstView.height, seg->groups, window, 2,
+                               dstView.width, dstView.height, useSeg->groups, window, 2,
                                args.pCudaStream);
     }
     return;
   }
 #endif
 
-  rta::compositeGroups(dstView, srcView, *seg, transforms, taps, window);
+  rta::compositeGroups(dstView, srcView, *useSeg, transforms, taps, window);
 
   if (diagnostics) {
     // Draw the detected boxes over the *source* layout, not the animated one,
@@ -357,7 +515,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
         for (int c = 0; c < 4; ++c) d[i + c] = std::max(d[i + c], s[i + c] * 0.25f);
       }
     }
-    rta::drawDiagnostics(dstView, *seg, 2);
+    rta::drawDiagnostics(dstView, *useSeg, 2);
   }
 }
 
@@ -412,6 +570,21 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
   OFX::PageParamDescriptor* page = desc.definePageParam("Controls");
 
   {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableIn");
+    p->setLabels("In Animation", "In", "Enable In Animation");
+    p->setHint("Animate the text on. With both In and Out off the text simply sits there.");
+    p->setDefault(true);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableOut");
+    p->setLabels("Out Animation", "Out", "Enable Out Animation");
+    p->setHint("Animate the text off, anchored to the end of the clip.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+
+  {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("groupMode");
     p->setLabels("Animate By", "Animate By", "Animate By");
     p->setHint("What counts as one animated unit, detected from pixel gaps.");
@@ -419,7 +592,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Word");
     p->appendOption("Line");
     p->setDefault(1);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("animation");
@@ -427,7 +600,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Fade");
     p->appendOption("Slide + Fade");
     p->setDefault(1);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("order");
@@ -437,7 +610,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Center Out");
     p->appendOption("Random");
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineOrder");
@@ -448,7 +621,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Top to Bottom");
     p->appendOption("Bottom to Top");
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::IntParamDescriptor* p = desc.defineIntParam("randomSeed");
@@ -456,7 +629,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0, 9999);
     p->setDisplayRange(0, 100);
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("easing");
@@ -467,7 +640,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Back Out");
     p->appendOption("Custom (curve editor)");
     p->setDefault(2);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showCurveEditor");
@@ -476,7 +649,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "Draws the easing curve over the viewer. Set the Viewer's on-screen-control "
         "dropdown to \"Open FX Overlay\" to see it, then drag the two handles.");
     p->setDefault(false);
-    page->addChild(*p);
+    addParam(page, p);
   }
 
   // The bezier control points. They are driven by dragging the on-screen
@@ -497,7 +670,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         p->setRange(-10.0, 10.0);
       p->setDisplayRange(i % 2 == 0 ? 0.0 : -1.0, i % 2 == 0 ? 1.0 : 2.0);
       p->setDefault(defs[i]);
-      page->addChild(*p);
+      addParam(page, p);
     }
   }
   {
@@ -507,7 +680,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-100000.0, 100000.0);
     p->setDisplayRange(0.0, 120.0);
     p->setDefault(0.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("duration");
@@ -516,7 +689,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.01, 100000.0);
     p->setDisplayRange(1.0, 60.0);
     p->setDefault(12.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("stagger");
@@ -527,7 +700,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.0, 100000.0);
     p->setDisplayRange(0.0, 15.0);
     p->setDefault(2.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("distanceUnits");
@@ -540,7 +713,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("% of Text Height");
     p->appendOption("Pixels");
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("slideDistance");
@@ -549,7 +722,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-10000.0, 10000.0);
     p->setDisplayRange(0.0, 30.0);
     p->setDefault(4.0);  // ~40px at 1080p, the old pixel default
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("slideAngle");
@@ -558,7 +731,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-360.0, 360.0);
     p->setDisplayRange(0.0, 360.0);
     p->setDefault(90.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startScale");
@@ -566,7 +739,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.01, 10.0);
     p->setDisplayRange(0.2, 2.0);
     p->setDefault(1.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
 
   {
@@ -576,7 +749,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-3600.0, 3600.0);
     p->setDisplayRange(-180.0, 180.0);
     p->setDefault(0.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startBlur");
@@ -587,7 +760,188 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.0, 500.0);
     p->setDisplayRange(0.0, 5.0);
     p->setDefault(0.0);
-    page->addChild(*p);
+    addParam(page, p);
+  }
+
+  // ------------------------------------------------------------ out stage
+  {
+    OFX::GroupParamDescriptor* g = desc.defineGroupParam("outStage");
+    g->setLabels("Out Animation", "Out Animation", "Out Animation");
+    g->setOpen(false);
+
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outOffset");
+      p->setLabels("End Offset (frames)", "End Offset", "Out End Offset");
+      p->setHint(
+          "Frames before the END of the clip at which the out animation "
+          "finishes. 30 means it is fully gone 30 frames before the clip ends. "
+          "Anchored to the end, so it stays put when the clip is trimmed.");
+      p->setRange(-100000.0, 100000.0);
+      p->setDisplayRange(0.0, 120.0);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkOut");
+      p->setLabels("Link to In", "Link", "Link Out to In");
+      p->setHint("Reuse the In settings for the Out animation. Untick for an independent set.");
+      p->setDefault(true);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("mirrorOut");
+      p->setLabels("Mirror", "Mirror", "Mirror Out");
+      p->setHint(
+          "Linked only. On, the text retreats the way it came: an entrance "
+          "rising from below sinks back down. Off, it continues in the "
+          "direction of travel and carries on upward.");
+      p->setDefault(true);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("clipLengthOverride");
+      p->setLabels("Clip Length Override", "Clip Length", "Clip Length Override");
+      p->setHint(
+          "0 = ask the host. Set this only if the host does not report a clip "
+          "length, in which case the Out animation has no end to anchor to and "
+          "is skipped.");
+      p->setRange(0.0, 1000000.0);
+      p->setDisplayRange(0.0, 600.0);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+
+    // Used only when Link is off.
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outGroupMode");
+      p->setLabels("Out Animate By", "Out By", "Out Animate By");
+      p->setHint("Unlinked only. The Out stage may group differently from the In stage.");
+      p->appendOption("Character");
+      p->appendOption("Word");
+      p->appendOption("Line");
+      p->setDefault(1);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outAnimation");
+      p->setLabels("Out Animation Type", "Out Type", "Out Animation Type");
+      p->appendOption("Fade");
+      p->appendOption("Slide + Fade");
+      p->setDefault(1);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outEasing");
+      p->setLabels("Out Easing", "Out Easing", "Out Easing");
+      p->appendOption("Linear");
+      p->appendOption("Smoothstep");
+      p->appendOption("Cubic Out");
+      p->appendOption("Back Out");
+      p->appendOption("Custom (curve editor)");
+      p->setDefault(2);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outOrder");
+      p->setLabels("Out Order", "Out Order", "Out Order");
+      p->appendOption("Forward");
+      p->appendOption("Reverse");
+      p->appendOption("Center Out");
+      p->appendOption("Random");
+      p->setDefault(0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outLineOrder");
+      p->setLabels("Out Line Order", "Out Lines", "Out Line Order");
+      p->appendOption("Top to Bottom");
+      p->appendOption("Bottom to Top");
+      p->setDefault(0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::IntParamDescriptor* p = desc.defineIntParam("outRandomSeed");
+      p->setLabels("Out Random Seed", "Out Seed", "Out Random Seed");
+      p->setRange(0, 9999);
+      p->setDisplayRange(0, 100);
+      p->setDefault(0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outDuration");
+      p->setLabels("Out Duration (frames)", "Out Duration", "Out Duration");
+      p->setRange(0.01, 100000.0);
+      p->setDisplayRange(1.0, 60.0);
+      p->setDefault(12.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStagger");
+      p->setLabels("Out Stagger (frames)", "Out Stagger", "Out Stagger");
+      p->setRange(0.0, 100000.0);
+      p->setDisplayRange(0.0, 15.0);
+      p->setDefault(2.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outSlideDistance");
+      p->setLabels("Out Slide Distance", "Out Distance", "Out Slide Distance");
+      p->setHint("In the same Distance Units as the In stage.");
+      p->setRange(-10000.0, 10000.0);
+      p->setDisplayRange(0.0, 30.0);
+      p->setDefault(4.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outSlideAngle");
+      p->setLabels("Out Slide Angle", "Out Angle", "Out Slide Angle");
+      p->setHint("Direction the unit departs towards. 90 sinks downward.");
+      p->setRange(-360.0, 360.0);
+      p->setDisplayRange(0.0, 360.0);
+      p->setDefault(90.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartScale");
+      p->setLabels("Out End Scale", "Out Scale", "Out End Scale");
+      p->setRange(0.01, 10.0);
+      p->setDisplayRange(0.2, 2.0);
+      p->setDefault(1.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartRotation");
+      p->setLabels("Out End Rotation", "Out Rotation", "Out End Rotation");
+      p->setRange(-3600.0, 3600.0);
+      p->setDisplayRange(-180.0, 180.0);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartBlur");
+      p->setLabels("Out End Blur", "Out Blur", "Out End Blur");
+      p->setRange(0.0, 500.0);
+      p->setDisplayRange(0.0, 5.0);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
   }
 
   {
@@ -603,7 +957,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
           "movement, scaling and rotation all blur.");
       p->setDefault(false);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("shutterAngle");
@@ -613,7 +967,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0.0, 360.0);
       p->setDefault(180.0);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::IntParamDescriptor* p = desc.defineIntParam("blurSamples");
@@ -623,7 +977,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(2, 32);
       p->setDefault(8);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
   }
 
@@ -640,7 +994,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0.0, 1.0);
       p->setDefault(0.15);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::IntParamDescriptor* p = desc.defineIntParam("minBlobArea");
@@ -650,7 +1004,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(1, 64);
       p->setDefault(4);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("wordGapSensitivity");
@@ -660,7 +1014,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0.3, 3.0);
       p->setDefault(1.0);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
@@ -670,7 +1024,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0, 6);
       p->setDefault(0);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showDiagnostics");
@@ -678,7 +1032,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setHint("Draws a coloured box around each detected unit over the static text.");
       p->setDefault(false);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
   }
 }

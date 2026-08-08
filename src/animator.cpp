@@ -80,7 +80,7 @@ float applyEasing(float t, Easing e, const BezierEasing& b) {
 }
 
 std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
-                             const AnimParams& p) {
+                             const StageSettings& p) {
   const size_t n = groups.size();
   std::vector<int> rank(n);
   if (n == 0) return rank;
@@ -130,27 +130,21 @@ std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
   return rank;
 }
 
-GroupTransform transformFor(int revealRank, double time, const AnimParams& p) {
+namespace {
+
+// The settled pose: on screen, in place, fully opaque.
+GroupTransform settledPose() {
   GroupTransform t;
-
-  const double dur = std::max(1e-6, p.duration);
-  const double t0 = p.startTime + double(revealRank) * p.stagger;
-  const float raw = float((time - t0) / dur);
-
-  if (raw <= 0.0f) {
-    // Not yet started: fully hidden, so nothing is drawn before startTime.
-    t.visible = false;
-    return t;
-  }
   t.visible = true;
+  t.opacity = 1.0f;
+  t.scale = 1.0f;
+  return t;
+}
 
-  if (raw >= 1.0f) {
-    t.opacity = 1.0f;
-    t.scale = 1.0f;
-    return t;
-  }
-
-  const float e = applyEasing(raw, p.easing, p.bezier);
+// The pose at eased value `e`, where 1 is settled and 0 is fully away.
+GroupTransform poseAt(float e, const StageSettings& p) {
+  GroupTransform t;
+  t.visible = true;
   t.opacity = std::min(1.0f, std::max(0.0f, e));
   t.scale = float(p.startScale + (1.0 - p.startScale) * e);
   if (std::fabs(t.scale) < 1e-4f) t.scale = 1e-4f;
@@ -172,18 +166,67 @@ GroupTransform transformFor(int revealRank, double time, const AnimParams& p) {
   return t;
 }
 
+}  // namespace
+
+double stageSpan(size_t groupCount, const StageSettings& s) {
+  if (groupCount == 0) return 0.0;
+  return double(groupCount - 1) * s.stagger + s.duration;
+}
+
+StageSettings mirrorStage(const StageSettings& in, bool mirror) {
+  StageSettings out = in;
+  if (mirror) return out;  // retreat the way it came: same angle and rotation
+
+  // Continue through: keep travelling in the direction of the entrance, which
+  // is the opposite side of the group, and keep turning the same way.
+  out.slideAngle = in.slideAngle + 180.0;
+  out.startRotation = -in.startRotation;
+  return out;
+}
+
+GroupTransform transformFor(Stage stage, int revealRank, double frames, double stageStart,
+                            const StageSettings& s) {
+  if (stage == Stage::Settled) return settledPose();
+
+  const double dur = std::max(1e-6, s.duration);
+  const double t0 = stageStart + double(revealRank) * s.stagger;
+  const float raw = float((frames - t0) / dur);
+
+  if (stage == Stage::In) {
+    if (raw <= 0.0f) {
+      GroupTransform t;  // not yet started: nothing drawn before the entrance
+      t.visible = false;
+      return t;
+    }
+    if (raw >= 1.0f) return settledPose();
+    return poseAt(applyEasing(raw, s.easing, s.bezier), s);
+  }
+
+  // Exit. Before its window the group is still settled; after it, gone.
+  if (raw <= 0.0f) return settledPose();
+  if (raw >= 1.0f) {
+    GroupTransform t;
+    t.visible = false;
+    return t;
+  }
+  // Eased at (1 - raw) rather than (1 - eased(raw)): the exit is the entrance
+  // run backwards, so a Cubic Out entrance leaves on the mirrored profile.
+  return poseAt(applyEasing(1.0f - raw, s.easing, s.bezier), s);
+}
+
 int tapCount(const AnimParams& p) {
   // Defocus alone still needs multiple taps; only a fully sharp, non-blurred
   // render can get away with one.
-  const bool needsTaps = p.motionBlur || p.startBlur > 0.0;
+  const bool needsTaps = p.motionBlur || p.in.startBlur > 0.0 || p.out.startBlur > 0.0;
   if (!needsTaps) return 1;
   return std::min(64, std::max(2, p.blurSamples));
 }
 
-void transformTaps(int revealRank, double time, const AnimParams& p, GroupTransform* out) {
+void transformTaps(Stage stage, int revealRank, double frames, double stageStart,
+                   const AnimParams& p, const StageSettings& s, GroupTransform* out) {
   const int n = tapCount(p);
   if (n == 1) {
-    out[0] = transformFor(revealRank, time, p);
+    out[0] = transformFor(stage, revealRank, frames, stageStart, s);
     return;
   }
 
@@ -193,7 +236,7 @@ void transformTaps(int revealRank, double time, const AnimParams& p, GroupTransf
   const double span = p.motionBlur ? (p.shutterAngle / 360.0) : 0.0;
   for (int k = 0; k < n; ++k) {
     const double f = (double(k) / double(n - 1)) - 0.5;
-    out[k] = transformFor(revealRank, time + span * f, p);
+    out[k] = transformFor(stage, revealRank, frames + span * f, stageStart, s);
   }
 }
 
@@ -209,7 +252,7 @@ void discOffset(int tap, int taps, float* dx, float* dy) {
 
 double totalDuration(size_t groupCount, const AnimParams& p) {
   if (groupCount == 0) return 0.0;
-  return p.startTime + double(groupCount - 1) * p.stagger + p.duration;
+  return p.startTime + stageSpan(groupCount, p.in);
 }
 
 }  // namespace rta

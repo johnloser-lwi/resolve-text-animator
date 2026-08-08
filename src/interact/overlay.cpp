@@ -122,19 +122,19 @@ class CurveInteract : public OFX::OverlayInteract {
       if (out.pixelScale.y <= 0.0) out.pixelScale.y = 1.0;
 
       AnimParams& a = out.anim;
-      a.easing = Easing(std::clamp(getChoice(_effect, "easing"), 0, 4));
-      a.bezier.x1 = float(getD(_effect, "easeX1", time));
-      a.bezier.y1 = float(getD(_effect, "easeY1", time));
-      a.bezier.x2 = float(getD(_effect, "easeX2", time));
-      a.bezier.y2 = float(getD(_effect, "easeY2", time));
+      a.in.easing = Easing(std::clamp(getChoice(_effect, "easing"), 0, 4));
+      a.in.bezier.x1 = float(getD(_effect, "easeX1", time));
+      a.in.bezier.y1 = float(getD(_effect, "easeY1", time));
+      a.in.bezier.x2 = float(getD(_effect, "easeX2", time));
+      a.in.bezier.y2 = float(getD(_effect, "easeY2", time));
       a.startTime = getD(_effect, "startTime", time);
-      a.duration = getD(_effect, "duration", time);
+      a.in.duration = getD(_effect, "duration", time);
 
       // Playhead tracks the first group's progress -- that is the curve the
       // handles are shaping. Same clip-relative frame origin as the renderer,
       // or the dot would drift away from what is actually on screen.
       const double frames = toClipTime(_effect, time);
-      out.progress = (frames - a.startTime) / std::max(1e-6, a.duration);
+      out.progress = (frames - a.startTime) / std::max(1e-6, a.in.duration);
       out.hasProgress = out.progress >= 0.0 && out.progress <= 1.0;
       return true;
     } catch (...) {
