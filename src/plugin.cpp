@@ -214,18 +214,31 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // measured against an origin that does not yet include it.
   void observeRenderTime(double time) {
     double rawT1 = 0.0, rawT2 = 0.0;
+    bool haveBounds = true;
     try {
       timeLineGetBounds(rawT1, rawT2);
     } catch (...) {
+      haveBounds = false;
     }
+
     std::lock_guard<std::mutex> lock(_seenMutex);
-    if (rawT1 != _seenT1 || rawT2 != _seenT2) {
-      _seenT1 = rawT1;
-      _seenT2 = rawT2;
-      _seenEarliest = time;  // the cut changed: learn it again
-    } else if (time < _seenEarliest) {
+
+    // Deliberately NOT reset whenever the reported bounds change. Those values
+    // jitter constantly while a clip is dragged -- dozens of distinct values in
+    // a single session -- and resetting on each one pinned the origin to the
+    // frame being rendered, making clip time permanently 0. Frame 0 of an
+    // entrance is zero opacity, so the text simply sat invisible until the
+    // bounds happened to settle.
+    //
+    // The origin is only discarded when it falls outside the media the clip is
+    // cut from, which is the one thing that cannot be true of a real first
+    // frame. That covers the clip genuinely moving, without reacting to noise.
+    if (haveBounds && rawT2 > rawT1 && (_seenEarliest < rawT1 || _seenEarliest > rawT2))
       _seenEarliest = time;
-    }
+
+    if (time < _seenEarliest) _seenEarliest = time;
+    _seenT1 = rawT1;
+    _seenT2 = rawT2;
   }
 
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
