@@ -274,8 +274,10 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   if (seg->empty()) return;
 
   // ---------------------------------------------------------------- animate
-  double fps = _srcClip->getFrameRate();
-  if (!(fps > 0.0)) fps = 25.0;
+  // Guarded: Fusion does not publish kOfxImageEffectPropFrameRate on clips, and
+  // the Support library throws when a property is missing -- out of render that
+  // becomes kOfxStatErrMissingHostFeature and the effect fails every frame.
+  const double fps = rta::safeFrameRate(_srcClip, _dstClip);
   // Clip-relative, so trimming the clip's head re-anchors the animation to the
   // new first frame instead of stranding it at a fixed timeline position.
   // getFrameRange() is deliberately not used here: Resolve returns a 1000-minute

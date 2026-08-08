@@ -25,6 +25,10 @@ class CurveWidget {
 
   bool dragging() const { return _drag != kNone; }
 
+  // Drop a drag whose mouse-up never arrived, closing any edit block it left
+  // open. Safe to call when nothing is in progress.
+  void abandon(const OverlayContext& c);
+
  private:
   enum Drag { kNone, kDragP1, kDragP2 };
 
@@ -40,6 +44,7 @@ class CurveWidget {
   OfxRectD _plot{0, 0, 0, 0};  // plotting area inside it
   double _yMin = 0.0, _yMax = 1.0;
   Drag _drag = kNone;
+  bool _editing = false;  // an edit block is open for the current drag
 };
 
 }  // namespace rta
