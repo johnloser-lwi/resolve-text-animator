@@ -196,6 +196,23 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     //
     // clipFrame = args.time - anchor. Both sides are exact, neither is guessed,
     // and the result is the same every time the same frame is rendered.
+    if (_manualOrigin->getValueAtTime(time)) return _originFrame->getValueAtTime(time);
+
+    // Auto: the lowest frame the host has ever asked for, which is the clip's
+    // FIRST frame. Extending a clip's head makes Resolve number those frames
+    // negatively -- extend by 10 and the first frame is -10, not 0 -- so an
+    // anchor of 0 sits at the clip's *original* start and the entrance waits
+    // exactly the length of the extension before beginning.
+    //
+    // This only ever decreases. That is the difference from the version that
+    // misbehaved earlier: it used to be reset when the host's bounds looked
+    // odd, which moved the anchor forward onto the frame being rendered and
+    // made the reveal freeze or restart. A value that only falls cannot do
+    // that, and clip time stays a steady function of the timeline.
+    {
+      std::lock_guard<std::mutex> lock(_seenMutex);
+      if (_seenEarliest < 1e299) return _seenEarliest;
+    }
     return _originFrame->getValueAtTime(time);
   }
 
@@ -224,20 +241,16 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // The origin is only discarded when it falls outside the media the clip is
     // cut from, which is the one thing that cannot be true of a real first
     // frame. That covers the clip genuinely moving, without reacting to noise.
-    // Recovery falls back to t1, NEVER to the frame being rendered.
+    // Monotonically decreasing, with no recovery path at all.
     //
-    // Setting it to `time` was the bug behind the dead frames: it moves the
-    // origin FORWARD to whatever is on screen, so clip time snaps back to 0 and
-    // the reveal restarts from nothing every time this fires. During playback
-    // that reads as a stretch of frames where the animation simply never
-    // progresses.
+    // Every previous version reset this when the host's bounds looked wrong,
+    // which moved the anchor FORWARD onto the frame being rendered -- clip time
+    // then snapped back and the reveal froze or restarted. The host's bounds
+    // are not trustworthy anyway: measured eleven different values for t1 on
+    // one clip, sliding across exactly the range its head had been extended by.
     //
-    // t1 is safe because it is the start of the media the clip is cut from, so
-    // it is always at or before any frame the host will ask for. Recovery can
-    // therefore never place the origin ahead of a rendered frame.
-    if (haveBounds && rawT2 > rawT1 && (_seenEarliest < rawT1 || _seenEarliest > rawT2))
-      _seenEarliest = rawT1;
-
+    // A value that can only fall cannot move the animation backwards, and the
+    // lowest frame the host ever asks for is the clip's first frame.
     if (time < _seenEarliest) _seenEarliest = time;
     _seenT1 = rawT1;
     _seenT2 = rawT2;
