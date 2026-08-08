@@ -190,7 +190,17 @@ GroupTransform transformFor(Stage stage, int revealRank, double frames, double s
 
   const double dur = std::max(1e-6, s.duration);
   const double t0 = stageStart + double(revealRank) * s.stagger;
-  const float raw = float((frames - t0) / dur);
+
+  // The +1 makes t0 the first ANIMATING frame rather than a dead one.
+  //
+  // Without it, raw is exactly 0 on the group's own start frame, which reads as
+  // "not started yet" and draws nothing -- so the clip's first frame is blank
+  // and the reveal only appears to begin on the second. It also stretched a
+  // duration of N across N+1 frames.
+  //
+  // With it, a 12-frame duration occupies frames t0 .. t0+11: the first shows
+  // the opening step of the fade, and the last lands exactly on settled.
+  const float raw = float((frames - t0 + 1.0) / dur);
 
   if (stage == Stage::In) {
     if (raw <= 0.0f) {

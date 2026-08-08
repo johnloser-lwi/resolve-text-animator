@@ -714,6 +714,24 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   }
 #endif
 
+  {
+    // What the animator actually produced for the first group. If the composite
+    // draws nothing while the diagnostics overlay still appears, this is the
+    // only place left that can explain it.
+    const rta::GroupTransform& g0 = transforms[0];
+    int visibleCount = 0;
+    for (size_t i = 0; i < useSeg->groups.size(); ++i)
+      if (transforms[i * size_t(taps)].visible) ++visibleCount;
+    const double t0 = stageStart + double(rank.empty() ? 0 : rank[0]) * useSet->stagger;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "clipFrame=%.1f g0: rank=%d t0=%.1f raw=%.3f vis=%d op=%.3f | visibleGroups=%d/%zu",
+                  frames, rank.empty() ? -1 : rank[0], t0,
+                  (frames - t0) / std::max(1e-6, useSet->duration), g0.visible ? 1 : 0, g0.opacity,
+                  visibleCount, useSeg->groups.size());
+    rta::probeOnChange("g0", buf);
+  }
+
   const rta::RectI window = toLocal(args.renderWindow, common);
   const bool diagnostics = _showDiagnostics->getValueAtTime(args.time);
 
