@@ -184,36 +184,26 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // is in the origin cancels out against the identical error at render time.
   // The animation then begins exactly where the playhead was parked, however
   // the clip is trimmed. This is how MultiTransform sidesteps the same gap.
-  double originAt(double time) {
-    // Always the parameter. Never the host.
+  double originAt(double) {
+    // The clip BOUNDARY is frame 0, and here it already is.
     //
-    // timeLineGetBounds does not return a stable answer: on one clip it gave
-    // eleven different values for t1 -- -10, -9, -8 ... 0 -- sliding across
-    // exactly the range the clip's head had been extended by, while t2 stayed
-    // put at 119. Anything derived from it inherits that jitter, so the clock
-    // moved under the animation and the reveal froze, jumped or restarted
-    // depending on which value happened to come back.
+    // MultiTransform subtracts t1 from the render time because its host hands
+    // out absolute timeline frames (~108000), so the subtraction is what maps
+    // the boundary to zero. Measured here, Resolve hands this plugin
+    // clip-relative time already: args.time never goes below 0 and never
+    // negative, whatever the Inspector labels the frame. The boundary is
+    // therefore already 0 and the correct offset is none.
     //
-    // clipFrame = args.time - anchor. Both sides are exact, neither is guessed,
-    // and the result is the same every time the same frame is rendered.
-    if (_manualOrigin->getValueAtTime(time)) return _originFrame->getValueAtTime(time);
-
-    // Auto: the lowest frame the host has ever asked for, which is the clip's
-    // FIRST frame. Extending a clip's head makes Resolve number those frames
-    // negatively -- extend by 10 and the first frame is -10, not 0 -- so an
-    // anchor of 0 sits at the clip's *original* start and the entrance waits
-    // exactly the length of the extension before beginning.
+    // Subtracting anything -- t1, an anchor parameter, a learned value -- moves
+    // the animation off the clip's first frame by exactly that amount. t1 was
+    // the worst of them: eleven different values on one clip, sliding across
+    // the range its head had been extended by.
     //
-    // This only ever decreases. That is the difference from the version that
-    // misbehaved earlier: it used to be reset when the host's bounds looked
-    // odd, which moved the anchor forward onto the frame being rendered and
-    // made the reveal freeze or restart. A value that only falls cannot do
-    // that, and clip time stays a steady function of the timeline.
-    {
-      std::lock_guard<std::mutex> lock(_seenMutex);
-      if (_seenEarliest < 1e299) return _seenEarliest;
-    }
-    return _originFrame->getValueAtTime(time);
+    // The running minimum is kept only as a safety net for a host that does
+    // hand out absolute frames, where it collapses to the clip's first frame
+    // anyway. It can only fall, so it can never push the animation later.
+    std::lock_guard<std::mutex> lock(_seenMutex);
+    return _seenEarliest < 1e299 ? _seenEarliest : 0.0;
   }
 
 
@@ -256,44 +246,12 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _seenT2 = rawT2;
   }
 
-  void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
-    if (name == "setStartToPlayhead") {
-      // Store the playhead in the same clip-relative units render compares
-      // against, so the entrance begins on exactly this frame.
-      // Anchor straight to the playhead, in absolute timeline frames.
-      rta::beginEdit(this, "Set Start to Playhead");
-      _originFrame->setValue(args.time);
-      _startTime->setValue(0.0);
-      rta::endEdit(this);
-      return;
-    }
-
-    if (name == "setOutEndToPlayhead") {
-      // The exit is measured back from the clip end, so store the distance from
-      // the playhead to that end.
-      double b1 = 0.0, b2 = 0.0;
-      if (!rta::getClipBounds(this, b1, b2)) return;
-      rta::beginEdit(this, "Set Out End to Playhead");
-      _outOffset->setValue(b2 - args.time);
-      rta::endEdit(this);
-      return;
-    }
-
-    if (name != "setStartToClipStart") return;
-
-    // Anchor to the lowest frame the host has actually asked us to render.
-    // The host only renders frames inside the clip, so that IS the clip's first
-    // frame -- and unlike timeLineGetBounds it does not jitter. Captured once
-    // into the parameter, so it is fixed from then on.
-    double captured = args.time;
-    {
-      std::lock_guard<std::mutex> lock(_seenMutex);
-      if (_seenEarliest < 1e299) captured = _seenEarliest;
-    }
-    rta::beginEdit(this, "Set Start to Clip Start");
-    _originFrame->setValue(captured);
-    _startTime->setValue(0.0);
-    rta::endEdit(this);
+  void changedParam(const OFX::InstanceChangedArgs&, const std::string&) override {
+    // Nothing to capture. The clip boundary is already frame 0, so there is no
+    // anchor to set -- and the buttons that used to write one are what pinned a
+    // -10 into the clip and shifted every animation by the length of the head
+    // extension. The controls are gone from the UI; the parameters remain
+    // defined so existing projects still load, and are ignored.
   }
 
   void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
@@ -946,7 +904,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "same units the renderer uses; the two cancel out and the entrance "
         "begins exactly here however the clip is trimmed. Re-click after "
         "trimming the head.");
-    addParam(page, p);
+    // hidden: see originAt -- the boundary is already frame 0
   }
   {
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToClipStart");
@@ -955,7 +913,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "Alternative to the above that needs no playhead: scrub across the clip "
         "once, then click. Captures the earliest frame Resolve actually "
         "rendered, which is the clip's first frame.");
-    addParam(page, p);
+    // hidden: see originAt -- the boundary is already frame 0
   }
   {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("manualOrigin");
@@ -965,7 +923,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "host's reported clip start, which is exact only on clips with no head "
         "handle.");
     p->setDefault(false);
-    addParam(page, p);
+    // hidden: see originAt -- the boundary is already frame 0
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("originFrame");
@@ -974,7 +932,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-1000000.0, 1000000.0);
     p->setDisplayRange(0.0, 10000.0);
     p->setDefault(0.0);
-    addParam(page, p);
+    // hidden: see originAt -- the boundary is already frame 0
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startTime");
