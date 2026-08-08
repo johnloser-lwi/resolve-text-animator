@@ -7,6 +7,7 @@
 #include "ofxDrawSuite.h"
 #include "ofxsInteract.h"
 
+#include "clip_time.h"
 #include "curve_widget.h"
 #include "draw_utils.h"
 
@@ -120,12 +121,11 @@ class CurveInteract : public OFX::OverlayInteract {
       a.duration = getD(_effect, "duration", time);
 
       // Playhead tracks the first group's progress -- that is the curve the
-      // handles are shaping. Clip-relative, so it means the same thing after
-      // the clip is moved along the timeline.
+      // handles are shaping. Uses the same clip-relative origin as the renderer,
+      // or the dot would drift away from what is actually on screen.
       double fps = src->getFrameRate();
       if (!(fps > 0.0)) fps = 25.0;
-      const OfxRangeD range = src->getFrameRange();
-      const double seconds = (time - range.min) / fps;
+      const double seconds = toClipTime(_effect, time) / fps;
       out.progress = (seconds - a.startTime) / std::max(1e-6, a.duration);
       out.hasProgress = out.progress >= 0.0 && out.progress <= 1.0;
       return true;

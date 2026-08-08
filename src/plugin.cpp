@@ -11,6 +11,7 @@
 #include "ofxsMultiThread.h"
 
 #include "animator.h"
+#include "clip_time.h"
 #include "compositor.h"
 #include "cuda_compositor.h"
 #include "diagnostics.h"
@@ -275,8 +276,11 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // ---------------------------------------------------------------- animate
   double fps = _srcClip->getFrameRate();
   if (!(fps > 0.0)) fps = 25.0;
-  const OfxRangeD range = _srcClip->getFrameRange();
-  const double seconds = (args.time - range.min) / fps;
+  // Clip-relative, so trimming the clip's head re-anchors the animation to the
+  // new first frame instead of stranding it at a fixed timeline position.
+  // getFrameRange() is deliberately not used here: Resolve returns a 1000-minute
+  // sentinel from it rather than the clip's extent. See clip_time.h.
+  const double seconds = rta::toClipTime(this, args.time) / fps;
   anim.frameDuration = 1.0 / fps;  // shutter interval is a fraction of a frame
 
   // Lengths are authored as a ratio so the motion looks identical at 1080p and

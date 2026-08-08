@@ -81,12 +81,27 @@ independently of whether the timing is right. If words are mis-split, adjust
 | **Order** | Forward, Reverse, Center Out, Random |
 | **Line Order** | Top to Bottom / Bottom to Top. Flips which line goes first while words still read left-to-right within each line — which `Order > Reverse` cannot express, since it reverses those too. |
 | **Easing** | Linear, Smoothstep, Cubic Out, Back Out, Custom (see curve editor below) |
-| **Start / Duration / Stagger** | seconds; stagger is the delay between consecutive units |
+| **Start / Duration / Stagger** | seconds; Start is measured from the clip's first frame, stagger is the delay between consecutive units |
 | **Distance Units** | what Slide Distance and Start Blur are measured against: % of Frame Height (default), % of Text Height, or Pixels |
 | **Slide Distance / Angle** | how far a unit travels, in the chosen units; 90° rises from below |
 | **Start Scale / Start Rotation / Start Blur** | the unit's scale, rotation (degrees, about its own centre) and defocus radius at the beginning of its animation, all unwinding to normal as it settles |
 | **Motion Blur** | Motion Blur on/off, Shutter Angle (180° = normal cine shutter), Samples |
 | **Detection** | Alpha Threshold, Min Blob Area, Word Gap, Bridge Radius, Show Detection |
+
+### Timing is clip-relative
+
+**Start** is measured from the clip's own first frame, so `0` means "when the
+clip starts", not timeline frame zero. Move or trim the clip and the animation
+travels with it — trimming the head re-anchors the reveal to the new first frame
+rather than stranding it at a fixed timeline position.
+
+Getting that origin took measuring, because most of the obvious routes are dead
+ends in Resolve. `getFrameRange()` returns a **sentinel of exactly 1000 minutes**
+rather than the clip's extent, `getUnmappedFrameRange` and `timeLineGetTime` are
+not populated at all, and only `timeLineGetBounds` reports the real clip. Since
+that call cannot be trusted blindly, `clip_time.h` validates the answer and
+falls back to treating render times as already clip-relative when the host
+reports nothing usable.
 
 ### Why distances are ratios
 
