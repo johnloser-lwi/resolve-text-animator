@@ -287,16 +287,15 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   if (seg->empty()) return;
 
   // ---------------------------------------------------------------- animate
-  // Guarded: Fusion does not publish kOfxImageEffectPropFrameRate on clips, and
-  // the Support library throws when a property is missing -- out of render that
-  // becomes kOfxStatErrMissingHostFeature and the effect fails every frame.
-  const double fps = rta::safeFrameRate(_srcClip, _dstClip);
-  // Clip-relative, so trimming the clip's head re-anchors the animation to the
-  // new first frame instead of stranding it at a fixed timeline position.
-  // getFrameRange() is deliberately not used here: Resolve returns a 1000-minute
-  // sentinel from it rather than the clip's extent. See clip_time.h.
-  const double seconds = rta::toClipTime(this, args.time) / fps;
-  anim.frameDuration = 1.0 / fps;  // shutter interval is a fraction of a frame
+  // Clip-relative frames. Trimming the clip's head re-anchors the animation to
+  // the new first frame instead of stranding it at a fixed timeline position.
+  //
+  // No frame rate is involved: timing is authored in frames, which is why this
+  // never has to ask the host for kOfxImageEffectPropFrameRate -- a property
+  // Fusion does not publish, and which threw out of render when asked for.
+  // getFrameRange() is likewise avoided: Resolve returns a 1000-minute sentinel
+  // from it rather than the clip's extent. See clip_time.h.
+  const double frames = rta::toClipTime(this, args.time);
 
   // Lengths are authored as a ratio so the motion looks identical at 1080p and
   // 4K. renderScale only tracks proxy scale, not timeline resolution, so it
@@ -323,7 +322,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   const int taps = rta::tapCount(anim);
   std::vector<rta::GroupTransform> transforms(seg->groups.size() * size_t(taps));
   for (size_t i = 0; i < seg->groups.size(); ++i)
-    rta::transformTaps(rank[i], seconds, anim, &transforms[i * size_t(taps)]);
+    rta::transformTaps(rank[i], frames, anim, &transforms[i * size_t(taps)]);
 
   const rta::RectI window = toLocal(args.renderWindow, common);
   const bool diagnostics = _showDiagnostics->getValueAtTime(args.time);
@@ -503,29 +502,31 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startTime");
-    p->setLabels("Start (s)", "Start", "Start Time");
-    p->setHint("Seconds from the start of the clip before the first unit appears.");
-    p->setRange(0.0, 1000.0);
-    p->setDisplayRange(0.0, 5.0);
+    p->setLabels("Start (frames)", "Start", "Start Time");
+    p->setHint("Frames from the clip's first frame before the first unit appears.");
+    p->setRange(-100000.0, 100000.0);
+    p->setDisplayRange(0.0, 120.0);
     p->setDefault(0.0);
     page->addChild(*p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("duration");
-    p->setLabels("Duration (s)", "Duration", "Duration");
-    p->setHint("How long a single unit takes to animate in.");
-    p->setRange(0.001, 100.0);
-    p->setDisplayRange(0.05, 2.0);
-    p->setDefault(0.5);
+    p->setLabels("Duration (frames)", "Duration", "Duration");
+    p->setHint("How many frames a single unit takes to animate in.");
+    p->setRange(0.01, 100000.0);
+    p->setDisplayRange(1.0, 60.0);
+    p->setDefault(12.0);
     page->addChild(*p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("stagger");
-    p->setLabels("Stagger (s)", "Stagger", "Stagger");
-    p->setHint("Delay between one unit starting and the next.");
-    p->setRange(0.0, 100.0);
-    p->setDisplayRange(0.0, 0.5);
-    p->setDefault(0.06);
+    p->setLabels("Stagger (frames)", "Stagger", "Stagger");
+    p->setHint(
+        "Frames between one unit starting and the next. Fractional values are "
+        "allowed and are often what reads best.");
+    p->setRange(0.0, 100000.0);
+    p->setDisplayRange(0.0, 15.0);
+    p->setDefault(2.0);
     page->addChild(*p);
   }
   {

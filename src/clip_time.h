@@ -22,31 +22,17 @@
 
 namespace rta {
 
-// The clip's frame rate, or a fallback.
+// There is deliberately no frame-rate helper here.
 //
-// Fusion's OFX host does not expose kOfxImageEffectPropFrameRate on clips, and
-// the Support library *throws* PropertyUnknownToHost when a property is
-// missing. Thrown out of the render action that becomes
-// kOfxStatErrMissingHostFeature, so the effect fails on every single frame and
-// appears to do nothing at all. Resolve's Edit page does expose the property,
-// which is why an unguarded read works there and only breaks in Fusion.
+// All timing is authored in frames, so nothing ever needs to ask the host for
+// kOfxImageEffectPropFrameRate. That matters: Fusion does not publish it on
+// clips, and the Support library *throws* when a property is missing. Thrown
+// out of the render action it becomes kOfxStatErrMissingHostFeature, failing
+// every single frame -- the effect simply appears to do nothing. Resolve's Edit
+// page does publish it, which is why an unguarded read worked there for a long
+// time and only fell over once the plugin was used in Fusion.
 //
-// MultiTransform sidesteps this entirely by working in frames and never asking
-// for a rate. This plugin's timing is authored in seconds, so it needs the
-// number -- but never at the cost of the render.
-inline double safeFrameRate(OFX::Clip* preferred, OFX::Clip* fallbackClip,
-                            double fallback = 25.0) {
-  for (OFX::Clip* c : {preferred, fallbackClip}) {
-    if (!c) continue;
-    try {
-      const double f = c->getFrameRate();
-      if (f > 0.0) return f;
-    } catch (...) {
-      // Host does not publish it on this clip; try the next.
-    }
-  }
-  return fallback;
-}
+// Working in frames removes the dependency rather than guarding it.
 
 // Decide whether a reported [t1, t2] is a real clip extent.
 inline bool validateClipRange(double t1, double t2, double& outStart, double& outLength) {

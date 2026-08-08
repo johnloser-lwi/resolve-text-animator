@@ -28,9 +28,15 @@ struct AnimParams {
   Order order = Order::Forward;
   LineOrder lineOrder = LineOrder::TopToBottom;
   int randomSeed = 0;
-  double startTime = 0.0;   // seconds from the start of the clip
-  double duration = 0.5;    // seconds, per group
-  double stagger = 0.06;    // seconds between consecutive groups
+  // All timing is in FRAMES, measured from the clip's first frame.
+  //
+  // Frames rather than seconds because compositing is authored in frames, and
+  // because it removes the need to ask the host for a frame rate at all --
+  // Fusion does not publish one on its clips, and asking for it there threw out
+  // of the render action and failed every frame.
+  double startTime = 0.0;   // frames before the first group appears
+  double duration = 12.0;   // frames, per group
+  double stagger = 2.0;     // frames between consecutive groups
   double slideDistance = 40.0;  // pixels at analysis resolution
   double slideAngle = 90.0;     // degrees; 90 == rises from below
   double startScale = 1.0;
@@ -40,7 +46,6 @@ struct AnimParams {
   bool motionBlur = false;
   double shutterAngle = 180.0;  // degrees of a frame the shutter is open
   int blurSamples = 8;          // taps for motion blur and defocus alike
-  double frameDuration = 1.0 / 25.0;  // seconds per frame, set from the clip
 };
 
 struct GroupTransform {

@@ -81,19 +81,28 @@ independently of whether the timing is right. If words are mis-split, adjust
 | **Order** | Forward, Reverse, Center Out, Random |
 | **Line Order** | Top to Bottom / Bottom to Top. Flips which line goes first while words still read left-to-right within each line — which `Order > Reverse` cannot express, since it reverses those too. |
 | **Easing** | Linear, Smoothstep, Cubic Out, Back Out, Custom (see curve editor below) |
-| **Start / Duration / Stagger** | seconds; Start is measured from the clip's first frame, stagger is the delay between consecutive units |
+| **Start / Duration / Stagger** | **frames**; Start is measured from the clip's first frame, Stagger is the delay between consecutive units (fractional values allowed) |
 | **Distance Units** | what Slide Distance and Start Blur are measured against: % of Frame Height (default), % of Text Height, or Pixels |
 | **Slide Distance / Angle** | how far a unit travels, in the chosen units; 90° rises from below |
 | **Start Scale / Start Rotation / Start Blur** | the unit's scale, rotation (degrees, about its own centre) and defocus radius at the beginning of its animation, all unwinding to normal as it settles |
 | **Motion Blur** | Motion Blur on/off, Shutter Angle (180° = normal cine shutter), Samples |
 | **Detection** | Alpha Threshold, Min Blob Area, Word Gap, Bridge Radius, Show Detection |
 
-### Timing is clip-relative
+### Timing is in frames, measured from the clip start
 
 **Start** is measured from the clip's own first frame, so `0` means "when the
 clip starts", not timeline frame zero. Move or trim the clip and the animation
 travels with it — trimming the head re-anchors the reveal to the new first frame
 rather than stranding it at a fixed timeline position.
+
+Timing is authored in **frames** rather than seconds. That suits compositing,
+and it has a second benefit that matters more: nothing ever has to ask the host
+for a frame rate. Fusion does not publish `kOfxImageEffectPropFrameRate` on its
+clips, and the Support library *throws* when a property is missing — thrown out
+of the render action that becomes `kOfxStatErrMissingHostFeature`, failing every
+frame so the effect appears to do nothing at all. Working in frames removes the
+dependency instead of guarding it. Motion blur benefits too: the shutter is
+simply a fraction of `1.0`, with no conversion involved.
 
 Getting that origin took measuring, because most of the obvious routes are dead
 ends in Resolve. `getFrameRange()` returns a **sentinel of exactly 1000 minutes**

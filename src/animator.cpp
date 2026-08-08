@@ -187,8 +187,10 @@ void transformTaps(int revealRank, double time, const AnimParams& p, GroupTransf
     return;
   }
 
-  // Spread the taps across the open shutter, centred on the frame time.
-  const double span = p.motionBlur ? p.frameDuration * (p.shutterAngle / 360.0) : 0.0;
+  // Spread the taps across the open shutter, centred on the frame time. Time is
+  // in frames, so one frame is 1.0 and the shutter is simply its fraction --
+  // no frame rate needed.
+  const double span = p.motionBlur ? (p.shutterAngle / 360.0) : 0.0;
   for (int k = 0; k < n; ++k) {
     const double f = (double(k) / double(n - 1)) - 0.5;
     out[k] = transformFor(revealRank, time + span * f, p);

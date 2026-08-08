@@ -72,8 +72,13 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
-                 "usage: segtest <in.png> <out.png> [--mode char|word|line] "
-                 "[--gap N] [--alpha N] [--bridge N] [--minarea N]\n");
+                 "usage: segtest <in.png> <out.png> [--mode char|word|line]\n"
+                 "  detection: --gap N --alpha N --bridge N --minarea N\n"
+                 "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
+                 "             --angle DEG --easing 0-4 --order 0-3 --lineorder 0|1\n"
+                 "             --rotate DEG --blur PX --mblur 0|1 --shutter DEG --samples N\n"
+                 "             --bez x1,y1,x2,y2\n"
+                 "  (--stagger and --dur are in FRAMES, matching the plugin)\n");
     return 2;
   }
 
@@ -132,8 +137,6 @@ int main(int argc, char** argv) {
       // Render a single frame at this fraction of the total duration, instead
       // of a strip -- for landing exactly on an overshoot.
       atFraction = std::atof(next());
-    } else if (!std::strcmp(a, "--fps")) {
-      anim.frameDuration = 1.0 / std::max(1.0, std::atof(next()));
     } else {
       std::fprintf(stderr, "unknown option: %s\n", a);
       return 2;
@@ -177,7 +180,7 @@ int main(int argc, char** argv) {
   if (strip > 1) {
     strippedBuf = renderStrip(view, seg, anim, strip, atFraction, ow, oh);
     result = strippedBuf.data();
-    std::printf("strip: %d frames over %.2fs\n", strip,
+    std::printf("strip: %d samples over %.1f frames\n", strip,
                 rta::totalDuration(seg.groups.size(), anim));
   } else {
     rta::drawDiagnostics(view, seg, 2);
