@@ -1,0 +1,4 @@
+build/
+build_log.txt
+external/openfx/
+*.user

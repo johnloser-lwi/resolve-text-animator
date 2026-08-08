@@ -1,0 +1,441 @@
+#include "cuda_compositor.h"
+
+#if RTA_WITH_CUDA
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+
+#include "transform_geom.h"
+
+namespace rta {
+namespace {
+
+#define RTA_CUDA_OK(expr)                       \
+  do {                                          \
+    const cudaError_t _e = (expr);              \
+    if (_e != cudaSuccess) return false;        \
+  } while (0)
+
+inline cudaStream_t asStream(void* s) { return static_cast<cudaStream_t>(s); }
+
+// Same palette as the CPU diagnostics overlay.
+__constant__ float kPalette[8][3] = {
+    {1.0f, 0.20f, 0.25f}, {0.20f, 0.85f, 1.0f}, {1.0f, 0.85f, 0.15f},
+    {0.35f, 1.0f, 0.35f}, {1.0f, 0.45f, 1.0f},  {0.55f, 0.55f, 1.0f},
+    {1.0f, 0.60f, 0.20f}, {0.20f, 1.0f, 0.75f},
+};
+
+__global__ void clearKernel(float* dst, std::ptrdiff_t stride, int x0, int y0, int w, int h) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float* p = dst + stride * (y0 + y) + std::ptrdiff_t(x0 + x) * 4;
+  p[0] = p[1] = p[2] = p[3] = 0.0f;
+}
+
+// Device mirror of GroupTransform, POD so it uploads with one memcpy.
+struct DevTap {
+  float offsetX, offsetY, scale, rotation, blur, opacity;
+  int visible;
+};
+
+__device__ inline void discOffsetDev(int tap, int taps, float* dx, float* dy) {
+  const float golden = 2.39996322972865332f;
+  const float a = float(tap) * golden;
+  const float r = sqrtf((float(tap) + 0.5f) / float(max(1, taps)));
+  *dx = r * __cosf(a);
+  *dy = r * __sinf(a);
+}
+
+// Label-masked bilinear fetch. Masking before filtering is what keeps
+// antialiased glyph edges intact and stops a moving word dragging in a
+// fragment of its neighbour.
+__device__ inline void sampleMaskedDev(const float* src, std::ptrdiff_t srcStride,
+                                       const int32_t* labels, const int32_t* labelToGroup,
+                                       int labWidth, int imgW, int imgH, int group, float fx,
+                                       float fy, float* out) {
+  out[0] = out[1] = out[2] = out[3] = 0.0f;
+  const int x0 = int(floorf(fx));
+  const int y0 = int(floorf(fy));
+  const float tx = fx - float(x0);
+  const float ty = fy - float(y0);
+  const float wx[2] = {1.0f - tx, tx};
+  const float wy[2] = {1.0f - ty, ty};
+
+  for (int j = 0; j < 2; ++j) {
+    const int sy = y0 + j;
+    if (sy < 0 || sy >= imgH) continue;
+    for (int i = 0; i < 2; ++i) {
+      const int sx = x0 + i;
+      if (sx < 0 || sx >= imgW) continue;
+      const int32_t lab = labels[std::ptrdiff_t(sy) * labWidth + sx];
+      if (lab == 0 || labelToGroup[lab] != group) continue;
+      const float wgt = wx[i] * wy[j];
+      if (wgt <= 0.0f) continue;
+      const float* p = src + srcStride * sy + std::ptrdiff_t(sx) * 4;
+      out[0] += p[0] * wgt;
+      out[1] += p[1] * wgt;
+      out[2] += p[2] * wgt;
+      out[3] += p[3] * wgt;
+    }
+  }
+}
+
+// One thread per destination pixel; each thread averages every shutter tap.
+__global__ void compositeKernel(float* dst, std::ptrdiff_t dstStride, const float* src,
+                                std::ptrdiff_t srcStride, const int32_t* labels,
+                                const int32_t* labelToGroup, int labWidth, int imgW, int imgH,
+                                int group, float cx, float cy, const DevTap* taps, int nTaps,
+                                int dx0, int dy0, int dw, int dh) {
+  const int lx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ly = blockIdx.y * blockDim.y + threadIdx.y;
+  if (lx >= dw || ly >= dh) return;
+
+  const int x = dx0 + lx;
+  const int y = dy0 + ly;
+
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int k = 0; k < nTaps; ++k) {
+    const DevTap t = taps[k];
+    if (!t.visible || t.opacity <= 0.0f) continue;
+
+    float jx = 0.0f, jy = 0.0f;
+    if (t.blur > 0.0f) {
+      discOffsetDev(k, nTaps, &jx, &jy);
+      jx *= t.blur;
+      jy *= t.blur;
+    }
+
+    // Inverse of  p' = centre + R(theta)*scale*(p - centre) + offset
+    const float inv = 1.0f / (fabsf(t.scale) < 1e-6f ? 1e-6f : t.scale);
+    const float c = __cosf(-t.rotation) * inv;
+    const float s = __sinf(-t.rotation) * inv;
+    const float ddx = float(x) + jx + 0.5f - cx - t.offsetX;
+    const float ddy = float(y) + jy + 0.5f - cy - t.offsetY;
+    const float fx = c * ddx - s * ddy + cx - 0.5f;
+    const float fy = s * ddx + c * ddy + cy - 0.5f;
+
+    float smp[4];
+    sampleMaskedDev(src, srcStride, labels, labelToGroup, labWidth, imgW, imgH, group, fx, fy,
+                    smp);
+    if (smp[3] <= 0.0f) continue;
+    acc[0] += smp[0] * t.opacity;
+    acc[1] += smp[1] * t.opacity;
+    acc[2] += smp[2] * t.opacity;
+    acc[3] += smp[3] * t.opacity;
+  }
+
+  if (acc[3] <= 0.0f) return;
+
+  // Premultiplied "over".
+  const float invTaps = 1.0f / float(nTaps);
+  float* o = dst + dstStride * y + std::ptrdiff_t(x) * 4;
+  const float a = acc[3] * invTaps;
+  const float ia = 1.0f - a;
+  o[0] = acc[0] * invTaps + o[0] * ia;
+  o[1] = acc[1] * invTaps + o[1] * ia;
+  o[2] = acc[2] * invTaps + o[2] * ia;
+  o[3] = a + o[3] * ia;
+}
+
+__global__ void dimKernel(float* dst, std::ptrdiff_t dstStride, const float* src,
+                          std::ptrdiff_t srcStride, int x0, int y0, int w, int h, float factor) {
+  const int lx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ly = blockIdx.y * blockDim.y + threadIdx.y;
+  if (lx >= w || ly >= h) return;
+  const int x = x0 + lx, y = y0 + ly;
+  const float* s = src + srcStride * y + std::ptrdiff_t(x) * 4;
+  float* d = dst + dstStride * y + std::ptrdiff_t(x) * 4;
+  for (int c = 0; c < 4; ++c) d[c] = fmaxf(d[c], s[c] * factor);
+}
+
+// One thread per pixel of the box's bounding band; writes only on the border.
+__global__ void boxKernel(float* dst, std::ptrdiff_t dstStride, int imgW, int imgH, int bx1,
+                          int by1, int bx2, int by2, int thickness, int colourIndex, int winX1,
+                          int winY1, int winX2, int winY2) {
+  const int lx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ly = blockIdx.y * blockDim.y + threadIdx.y;
+
+  const int ox1 = bx1 - thickness, oy1 = by1 - thickness;
+  const int w = (bx2 + thickness) - ox1, h = (by2 + thickness) - oy1;
+  if (lx >= w || ly >= h) return;
+
+  const int x = ox1 + lx, y = oy1 + ly;
+  if (x < winX1 || y < winY1 || x >= winX2 || y >= winY2) return;
+  if (x < 0 || y < 0 || x >= imgW || y >= imgH) return;
+
+  const bool onBorder = (x < bx1 + thickness - 1) || (x >= bx2 - thickness + 1) ||
+                        (y < by1 + thickness - 1) || (y >= by2 - thickness + 1);
+  if (!onBorder) return;
+
+  const float* c = kPalette[colourIndex & 7];
+  float* p = dst + dstStride * y + std::ptrdiff_t(x) * 4;
+  p[0] = c[0];
+  p[1] = c[1];
+  p[2] = c[2];
+  p[3] = 1.0f;
+}
+
+// Subsamples every 8th pixel in both axes, matching the CPU hash's sampling.
+__global__ void hashKernel(const float* src, std::ptrdiff_t stride, int width, int height,
+                           float threshold, unsigned long long* acc) {
+  const int gx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+  const int x = gx * 8, y = gy * 8;
+  if (x >= width || y >= height) return;
+
+  const float a = src[stride * y + std::ptrdiff_t(x) * 4 + 3];
+  const unsigned int q = (unsigned int)(fminf(15.0f, fmaxf(0.0f, a) * 15.0f));
+  unsigned long long h = (unsigned long long)(q + (a > threshold ? 16u : 0u));
+
+  // Mix in the position so a moved word changes the hash even if the histogram
+  // of alpha values does not.
+  h ^= (unsigned long long)(x) * 0x9E3779B97F4A7C15ull;
+  h ^= (unsigned long long)(y) * 0xC2B2AE3D27D4EB4Full;
+  h *= 0xFF51AFD7ED558CCDull;
+  h ^= h >> 33;
+
+  atomicAdd(acc, h);
+}
+
+RectI intersect(const RectI& a, const RectI& b) {
+  RectI r{std::max(a.x1, b.x1), std::max(a.y1, b.y1), std::min(a.x2, b.x2), std::min(a.y2, b.y2)};
+  return r.empty() ? RectI{0, 0, 0, 0} : r;
+}
+
+dim3 gridFor(int w, int h, dim3 block) {
+  return dim3((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+}
+
+}  // namespace
+
+bool cudaAvailable() {
+  static const bool ok = [] {
+    int n = 0;
+    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+  }();
+  return ok;
+}
+
+CudaSegmentation::~CudaSegmentation() { reset(); }
+
+void CudaSegmentation::reset() {
+  if (labels_) cudaFree(labels_);
+  if (labelToGroup_) cudaFree(labelToGroup_);
+  labels_ = nullptr;
+  labelToGroup_ = nullptr;
+  width_ = height_ = labelCount_ = 0;
+}
+
+bool CudaSegmentation::upload(const Segmentation& seg) {
+  if (seg.labelImage.empty() || seg.labelToGroup.empty()) return false;
+
+  const size_t pixels = size_t(seg.width) * seg.height;
+  if (labels_ == nullptr || seg.width != width_ || seg.height != height_) {
+    if (labels_) cudaFree(labels_);
+    labels_ = nullptr;
+    RTA_CUDA_OK(cudaMalloc(&labels_, pixels * sizeof(int32_t)));
+    width_ = seg.width;
+    height_ = seg.height;
+  }
+  if (labelToGroup_ == nullptr || int(seg.labelToGroup.size()) != labelCount_) {
+    if (labelToGroup_) cudaFree(labelToGroup_);
+    labelToGroup_ = nullptr;
+    RTA_CUDA_OK(cudaMalloc(&labelToGroup_, seg.labelToGroup.size() * sizeof(int32_t)));
+    labelCount_ = int(seg.labelToGroup.size());
+  }
+
+  RTA_CUDA_OK(cudaMemcpy(labels_, seg.labelImage.data(), pixels * sizeof(int32_t),
+                         cudaMemcpyHostToDevice));
+  RTA_CUDA_OK(cudaMemcpy(labelToGroup_, seg.labelToGroup.data(),
+                         seg.labelToGroup.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+  return true;
+}
+
+bool cudaDownload(std::vector<float>& out, const float* srcDev, std::ptrdiff_t srcStrideFloats,
+                  int width, int height) {
+  if (!srcDev || width <= 0 || height <= 0) return false;
+
+  // cudaMemcpy2D cannot take a negative pitch, so copy against the natural
+  // layout: walk from the row with the lowest address using |stride|.
+  const std::ptrdiff_t absStride = srcStrideFloats < 0 ? -srcStrideFloats : srcStrideFloats;
+  const float* base = srcStrideFloats < 0 ? srcDev + srcStrideFloats * (height - 1) : srcDev;
+
+  out.resize(size_t(absStride) * height);
+  RTA_CUDA_OK(cudaMemcpy2D(out.data(), size_t(absStride) * sizeof(float), base,
+                           size_t(absStride) * sizeof(float), size_t(width) * 4 * sizeof(float),
+                           size_t(height), cudaMemcpyDeviceToHost));
+  return true;
+}
+
+CudaScratch::~CudaScratch() {
+  if (accum_) cudaFree(accum_);
+  if (taps_) cudaFree(taps_);
+  accum_ = nullptr;
+  taps_ = nullptr;
+}
+
+void* CudaScratch::tapBuffer(size_t bytes) {
+  if (bytes == 0) return nullptr;
+  if (taps_ && tapBytes_ >= bytes) return taps_;
+  if (taps_) cudaFree(taps_);
+  taps_ = nullptr;
+  tapBytes_ = 0;
+  // Round up so a changing group count doesn't reallocate every frame.
+  const size_t want = bytes * 2;
+  if (cudaMalloc(&taps_, want) != cudaSuccess) {
+    taps_ = nullptr;
+    return nullptr;
+  }
+  tapBytes_ = want;
+  return taps_;
+}
+
+unsigned long long* CudaScratch::hashAccum() {
+  if (!tried_) {
+    tried_ = true;
+    if (cudaMalloc(&accum_, sizeof(unsigned long long)) != cudaSuccess) accum_ = nullptr;
+  }
+  return accum_;
+}
+
+uint64_t cudaHashAlpha(const float* srcDev, std::ptrdiff_t srcStride, int width, int height,
+                       float threshold, CudaScratch& scratch, void* stream, bool* ok) {
+  if (ok) *ok = false;
+  if (!srcDev || width <= 0 || height <= 0) return 0;
+
+  unsigned long long* acc = scratch.hashAccum();
+  if (!acc) return 0;
+
+  cudaStream_t s = asStream(stream);
+  uint64_t host = 0;
+  bool good = cudaMemsetAsync(acc, 0, sizeof(unsigned long long), s) == cudaSuccess;
+  if (good) {
+    const dim3 block(16, 16);
+    const int sw = (width + 7) / 8, sh = (height + 7) / 8;
+    hashKernel<<<gridFor(sw, sh, block), block, 0, s>>>(srcDev, srcStride, width, height,
+                                                        threshold, acc);
+    good = cudaGetLastError() == cudaSuccess &&
+           cudaMemcpyAsync(&host, acc, sizeof(host), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+           cudaStreamSynchronize(s) == cudaSuccess;
+  }
+
+  // Fold in the dimensions so a resize always invalidates.
+  host ^= (uint64_t(width) << 32) ^ uint64_t(height);
+  if (ok) *ok = good;
+  return host;
+}
+
+bool cudaClearWindow(float* dstDev, std::ptrdiff_t dstStride, int width, int height,
+                     const RectI& window, void* stream) {
+  if (!dstDev) return false;
+  const RectI win = intersect(window, RectI{0, 0, width, height});
+  if (win.empty()) return true;
+  const dim3 block(16, 16);
+  clearKernel<<<gridFor(win.width(), win.height(), block), block, 0, asStream(stream)>>>(
+      dstDev, dstStride, win.x1, win.y1, win.width(), win.height());
+  RTA_CUDA_OK(cudaGetLastError());
+  return true;
+}
+
+bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* srcDev,
+                         std::ptrdiff_t srcStride, int width, int height,
+                         const CudaSegmentation& devSeg, const std::vector<Group>& groups,
+                         const std::vector<GroupTransform>& transforms, int taps,
+                         const RectI& window, CudaScratch& scratch, void* stream) {
+  taps = std::max(1, taps);
+  if (!dstDev || !devSeg.valid() || transforms.size() != groups.size() * size_t(taps))
+    return false;
+
+  const RectI win = intersect(window, RectI{0, 0, width, height});
+  if (win.empty()) return true;
+
+  cudaStream_t s = asStream(stream);
+  const dim3 block(16, 16);
+
+  clearKernel<<<gridFor(win.width(), win.height(), block), block, 0, s>>>(
+      dstDev, dstStride, win.x1, win.y1, win.width(), win.height());
+
+  // Upload every tap in one transfer rather than per group.
+  std::vector<DevTap> host(transforms.size());
+  for (size_t i = 0; i < transforms.size(); ++i) {
+    const GroupTransform& t = transforms[i];
+    host[i] = DevTap{t.offsetX, t.offsetY, t.scale, t.rotation, t.blur, t.opacity, t.visible ? 1 : 0};
+  }
+  const size_t bytes = host.size() * sizeof(DevTap);
+  DevTap* devTaps = static_cast<DevTap*>(scratch.tapBuffer(bytes));
+  if (!devTaps) return false;
+  RTA_CUDA_OK(cudaMemcpyAsync(devTaps, host.data(), bytes, cudaMemcpyHostToDevice, s));
+
+  // Sequential launches on one stream preserve draw order, which matters
+  // because "over" is not commutative where groups overlap in flight.
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const GroupTransform* tg = &transforms[gi * size_t(taps)];
+
+    const RectI& b = groups[gi].bbox;
+    const float cx = 0.5f * float(b.x1 + b.x2);
+    const float cy = 0.5f * float(b.y1 + b.y2);
+
+    // Union over all taps, so a spinning or fast-moving group is not clipped
+    // to where it happens to sit at the frame's midpoint.
+    RectI dest{};
+    int live = 0;
+    for (int k = 0; k < taps; ++k) {
+      if (!tg[k].visible || tg[k].opacity <= 0.0f) continue;
+      ++live;
+      dest.unionWith(tapBounds(tg[k], b, cx, cy));
+    }
+    if (live == 0) continue;
+
+    dest.grow(2);
+    dest = intersect(dest, win);
+    if (dest.empty()) continue;
+
+    compositeKernel<<<gridFor(dest.width(), dest.height(), block), block, 0, s>>>(
+        dstDev, dstStride, srcDev, srcStride, devSeg.labels(), devSeg.labelToGroup(),
+        devSeg.width(), width, height, int(gi), cx, cy, devTaps + gi * size_t(taps), taps,
+        dest.x1, dest.y1, dest.width(), dest.height());
+  }
+
+  RTA_CUDA_OK(cudaGetLastError());
+
+  // host[] must outlive the async upload.
+  RTA_CUDA_OK(cudaStreamSynchronize(s));
+  return true;
+}
+
+bool cudaDrawDiagnostics(float* dstDev, std::ptrdiff_t dstStride, const float* srcDev,
+                         std::ptrdiff_t srcStride, int width, int height,
+                         const std::vector<Group>& groups, const RectI& window, int lineWidth,
+                         void* stream) {
+  if (!dstDev || !srcDev) return false;
+
+  const RectI win = intersect(window, RectI{0, 0, width, height});
+  if (win.empty()) return true;
+
+  cudaStream_t s = asStream(stream);
+  const dim3 block(16, 16);
+
+  dimKernel<<<gridFor(win.width(), win.height(), block), block, 0, s>>>(
+      dstDev, dstStride, srcDev, srcStride, win.x1, win.y1, win.width(), win.height(), 0.25f);
+
+  const int t = std::max(1, lineWidth);
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const RectI& b = groups[gi].bbox;
+    const int w = b.width() + 2 * t, h = b.height() + 2 * t;
+    if (w <= 0 || h <= 0) continue;
+    boxKernel<<<gridFor(w, h, block), block, 0, s>>>(dstDev, dstStride, width, height, b.x1, b.y1,
+                                                     b.x2, b.y2, t, int(gi), win.x1, win.y1,
+                                                     win.x2, win.y2);
+  }
+
+  RTA_CUDA_OK(cudaGetLastError());
+  return true;
+}
+
+}  // namespace rta
+
+#endif  // RTA_WITH_CUDA
