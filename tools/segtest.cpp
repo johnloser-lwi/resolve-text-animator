@@ -28,7 +28,7 @@ namespace {
 // compositor without a host in the loop.
 std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentation& seg,
                                const rta::AnimParams& anim, rta::Stage stage, int count,
-                               double atFraction, int& outW, int& outH) {
+                               double atFraction, double step, int& outW, int& outH) {
   rta::RectI area;
   for (const auto& g : seg.groups) area.unionWith(g.bbox);
   area.grow(int(anim.in.slideDistance) + 16);
@@ -54,9 +54,9 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
   const std::vector<int> rank = rta::revealOrder(seg.groups, seg.lineCount, s);
   const int taps = rta::tapCount(anim);
   for (int i = 0; i < count; ++i) {
-    const double t = atFraction >= 0.0
-                         ? total * atFraction
-                         : total * double(i) / double(std::max(1, count - 1));
+    const double t = step > 0.0 ? stageStart + double(i) * step
+                   : atFraction >= 0.0 ? total * atFraction
+                   : total * double(i) / double(std::max(1, count - 1));
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
       rta::transformTaps(stage, rank[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
   rta::AnimParams anim;
   int strip = 0;
   double atFraction = -1.0;
+  double step = 0.0;
   rta::Stage stage = rta::Stage::In;
   bool mirror = true;
   for (int i = 3; i < argc; ++i) {
@@ -139,6 +140,8 @@ int main(int argc, char** argv) {
       std::sscanf(next(), "%f,%f,%f,%f", &anim.in.bezier.x1, &anim.in.bezier.y1, &anim.in.bezier.x2,
                   &anim.in.bezier.y2);
       anim.in.easing = rta::Easing::Custom;
+    } else if (!std::strcmp(a, "--step")) {
+      step = std::atof(next());
     } else if (!std::strcmp(a, "--stage")) {
       stage = !std::strcmp(next(), "out") ? rta::Stage::Out : rta::Stage::In;
     } else if (!std::strcmp(a, "--nomirror")) {
@@ -191,7 +194,7 @@ int main(int argc, char** argv) {
   anim.out = rta::mirrorStage(anim.in, mirror);
 
   if (strip > 1) {
-    strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, ow, oh);
+    strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, step, ow, oh);
     result = strippedBuf.data();
     const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
     std::printf("strip: %d samples of the %s stage over %.1f frames\n", strip,

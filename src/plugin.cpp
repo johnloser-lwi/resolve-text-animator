@@ -39,13 +39,23 @@ int choiceAt(OFX::ChoiceParam* p, double t, int lo, int hi) {
 
 // Single funnel for adding parameters to the page.
 //
-// Deliberately plain. It is tempting to set eCacheInvalidateValueAll here --
-// nothing in this plugin is keyframed, so every parameter really does affect
-// every frame, and without it a caching host can replay stale frames after an
-// edit. That was tried and it broke project loading outright: restoring a
-// project sets every parameter on every clip, and each set then triggered a
-// full cache purge. If it is ever wanted again it belongs on the handful of
-// parameters that genuinely need it, not on all of them.
+// Every parameter declares that it invalidates the whole cache, which is what
+// MultiTransform does and for the same measured reason: Resolve keeps a
+// per-frame verdict about an effect and will happily keep serving frames it
+// rendered earlier. Its notes describe the symptom precisely -- "edits applied
+// while the playhead sat outside the range appeared to do nothing at all, and
+// only a manual cache purge fixed it".
+//
+// The OFX default, eCacheInvalidateValueChange, means "invalidate only the
+// frames this parameter's keyframe covers". That is right for a keyframed
+// effect and wrong here: nothing in this plugin is ever keyframed, the
+// parameters are constants the animator interprets against the render time, so
+// every parameter affects every frame.
+//
+// Deliberately NOT set here, for now. Adding it coincided with project loading
+// breaking outright, and while that was never isolated, re-breaking a project
+// is worse than a stale frame. isIdentity below covers the per-frame-verdict
+// half of the same problem without that risk.
 template <class T>
 void addParam(OFX::PageParamDescriptor* page, T* p) {
   page->addChild(*p);
@@ -174,6 +184,22 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   }
 
   void render(const OFX::RenderArguments& args) override;
+
+  bool isIdentity(const OFX::IsIdentityArguments&, OFX::Clip*&, double&) override {
+    // Never a pass-through, at any time.
+    //
+    // Answering per frame is the trap MultiTransform documents: outside its own
+    // animation an effect looks like the identity, so it declares itself a
+    // pass-through on exactly those frames -- and the host caches that verdict
+    // per frame. Move the animation to cover one of them and the host stays
+    // convinced nothing happens there, so the edit appears to do nothing until
+    // the cache is purged by hand.
+    //
+    // This plugin is never a pass-through anyway: even fully settled it has
+    // recomposited the title from its own segmentation. Saying so at every time
+    // leaves no per-frame verdict to go stale.
+    return false;
+  }
 
   // The frame that counts as clip time 0. Used by both render and the capture
   // buttons -- and it is essential that it is the SAME function for both.
