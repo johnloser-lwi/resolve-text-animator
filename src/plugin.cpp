@@ -186,9 +186,46 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // the clip is trimmed. This is how MultiTransform sidesteps the same gap.
   double originAt(double time) {
     if (_manualOrigin->getValueAtTime(time)) return _originFrame->getValueAtTime(time);
+
+    // Auto: the lowest frame the host has actually asked us to render.
+    //
+    // The host only ever renders frames inside the clip, so the running minimum
+    // IS the clip's first frame -- measured exactly right on every clip tested
+    // (1162, 1020, 1000, 0 and -112), including ones whose reported bounds were
+    // off by the whole head handle.
+    //
+    // It also makes the failure mode impossible by construction: clip time is
+    // args.time minus a running minimum of args.time, so it can never be
+    // negative, and an entrance can never sit in the "not started yet" state
+    // that draws nothing. Every bound the host reports failed that guarantee,
+    // because all of them describe the available media rather than the cut.
+    {
+      std::lock_guard<std::mutex> lock(_seenMutex);
+      if (_seenEarliest < 1e299) return _seenEarliest;
+    }
+
     double start = 0.0, length = 0.0;
     if (rta::getClipRange(this, start, length)) return start;
     return 0.0;
+  }
+
+  // Feed a render time into the running minimum. Must happen before originAt()
+  // is consulted for that same frame, or the clip's first frame would be
+  // measured against an origin that does not yet include it.
+  void observeRenderTime(double time) {
+    double rawT1 = 0.0, rawT2 = 0.0;
+    try {
+      timeLineGetBounds(rawT1, rawT2);
+    } catch (...) {
+    }
+    std::lock_guard<std::mutex> lock(_seenMutex);
+    if (rawT1 != _seenT1 || rawT2 != _seenT2) {
+      _seenT1 = rawT1;
+      _seenT2 = rawT2;
+      _seenEarliest = time;  // the cut changed: learn it again
+    } else if (time < _seenEarliest) {
+      _seenEarliest = time;
+    }
   }
 
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
@@ -489,6 +526,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // timeLineGetBounds t1 is the start minus the head handle. Measured on a clip
   // visibly running 1000..1149: t1 came back 967 and duration 184. Only the
   // playhead knows, so the button captures it.
+  observeRenderTime(args.time);  // must precede originAt for this frame
   const double origin = originAt(args.time);
   const double frames = args.time - origin;
 
@@ -503,17 +541,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       timeLineGetBounds(rawT1, rawT2);
     } catch (...) {
       rawOk = false;
-    }
-
-    {
-      std::lock_guard<std::mutex> lk(_seenMutex);
-      if (rawT1 != _seenT1 || rawT2 != _seenT2) {
-        _seenT1 = rawT1;
-        _seenT2 = rawT2;
-        _seenEarliest = args.time;  // bounds changed: start learning again
-      } else if (args.time < _seenEarliest) {
-        _seenEarliest = args.time;
-      }
     }
 
     _probeRaw[0] = rawT1;
