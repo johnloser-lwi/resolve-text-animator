@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 
+#include "edit_block.h"
+
 namespace rta {
 namespace {
 
@@ -195,7 +197,13 @@ bool CurveWidget::penDown(const OverlayContext& c, const OfxPointD& p) {
   else
     _drag = kNone;
 
-  if (_drag != kNone) writeHandle(c, _drag, panelToUnit(p));
+  if (_drag != kNone) {
+    // One block for the whole drag, so the host sees a single edit and a single
+    // undo step rather than one per mouse-move.
+    beginEdit(c.effect, "Adjust easing curve");
+    _editing = true;
+    writeHandle(c, _drag, panelToUnit(p));
+  }
   return true;
 }
 
@@ -205,10 +213,21 @@ bool CurveWidget::penMotion(const OverlayContext& c, const OfxPointD& p) {
   return true;
 }
 
-bool CurveWidget::penUp(const OverlayContext&, const OfxPointD&) {
+bool CurveWidget::penUp(const OverlayContext& c, const OfxPointD&) {
   if (_drag == kNone) return false;
   _drag = kNone;
+  if (_editing) {
+    _editing = false;
+    endEdit(c.effect);
+  }
   return true;
+}
+
+void CurveWidget::abandon(const OverlayContext& c) {
+  _drag = kNone;
+  if (!_editing) return;
+  _editing = false;
+  forceCloseEdits(c.effect);
 }
 
 }  // namespace rta

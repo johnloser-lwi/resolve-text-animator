@@ -39,6 +39,20 @@ int choiceAt(OFX::ChoiceParam* p, double t, int lo, int hi) {
 // (line 0 is the top line, +y slides downward). Converting here, at the single
 // boundary, is what keeps "animate the first line first" and "90 degrees rises
 // from below" meaning the same thing in Resolve as in the test harness.
+// Adds a parameter to the page, declaring that it invalidates the whole cache.
+//
+// Nothing in this plugin is ever keyframed: the parameters are constants that
+// the animator interprets against the render time, so *every* parameter affects
+// *every* frame. The OFX default -- invalidate only the range a parameter's own
+// keyframe covers -- gives a caching host no reason to discard anything, so it
+// keeps replaying stale frames after an edit. Resolve is lenient about this;
+// Fusion is not, and Fusion is the one behaving correctly.
+template <class T>
+void addParam(OFX::PageParamDescriptor* page, T* p) {
+  p->setCacheInvalidation(OFX::eCacheInvalidateValueAll);
+  addParam(page, p);
+}
+
 rta::RectI toLocal(const OfxRectI& r, const OfxRectI& region) {
   return rta::RectI{r.x1 - region.x1, region.y2 - r.y2, r.x2 - region.x1, region.y2 - r.y1};
 }
@@ -114,6 +128,19 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   }
 
   void render(const OFX::RenderArguments& args) override;
+
+  void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
+    // Declare that the output changes over time even though no parameter is
+    // animated.
+    //
+    // The animation here is internal: it is driven by the render time, not by
+    // host keyframes. Without this a host is entirely within its rights to
+    // render one frame and reuse it for the whole clip, because as far as it
+    // can tell nothing about the effect varies. Fusion does exactly that -- the
+    // effect appears to do nothing -- while Resolve's Edit page happens to
+    // re-render regardless, which is why it goes unnoticed there.
+    prefs.setOutputFrameVarying(true);
+  }
 
  private:
   OFX::Clip* _dstClip = nullptr;
@@ -274,8 +301,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   if (seg->empty()) return;
 
   // ---------------------------------------------------------------- animate
-  double fps = _srcClip->getFrameRate();
-  if (!(fps > 0.0)) fps = 25.0;
+  const double fps = rta::safeFrameRate(_srcClip, _dstClip);
   // Clip-relative, so trimming the clip's head re-anchors the animation to the
   // new first frame instead of stranding it at a fixed timeline position.
   // getFrameRange() is deliberately not used here: Resolve returns a 1000-minute
@@ -405,7 +431,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Word");
     p->appendOption("Line");
     p->setDefault(1);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("animation");
@@ -413,7 +439,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Fade");
     p->appendOption("Slide + Fade");
     p->setDefault(1);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("order");
@@ -423,7 +449,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Center Out");
     p->appendOption("Random");
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineOrder");
@@ -434,7 +460,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Top to Bottom");
     p->appendOption("Bottom to Top");
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::IntParamDescriptor* p = desc.defineIntParam("randomSeed");
@@ -442,7 +468,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0, 9999);
     p->setDisplayRange(0, 100);
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("easing");
@@ -453,7 +479,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("Back Out");
     p->appendOption("Custom (curve editor)");
     p->setDefault(2);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showCurveEditor");
@@ -462,7 +488,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "Draws the easing curve over the viewer. Set the Viewer's on-screen-control "
         "dropdown to \"Open FX Overlay\" to see it, then drag the two handles.");
     p->setDefault(false);
-    page->addChild(*p);
+    addParam(page, p);
   }
 
   // The bezier control points. They are driven by dragging the on-screen
@@ -483,7 +509,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         p->setRange(-10.0, 10.0);
       p->setDisplayRange(i % 2 == 0 ? 0.0 : -1.0, i % 2 == 0 ? 1.0 : 2.0);
       p->setDefault(defs[i]);
-      page->addChild(*p);
+      addParam(page, p);
     }
   }
   {
@@ -493,7 +519,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.0, 1000.0);
     p->setDisplayRange(0.0, 5.0);
     p->setDefault(0.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("duration");
@@ -502,7 +528,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.001, 100.0);
     p->setDisplayRange(0.05, 2.0);
     p->setDefault(0.5);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("stagger");
@@ -511,7 +537,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.0, 100.0);
     p->setDisplayRange(0.0, 0.5);
     p->setDefault(0.06);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("distanceUnits");
@@ -524,7 +550,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->appendOption("% of Text Height");
     p->appendOption("Pixels");
     p->setDefault(0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("slideDistance");
@@ -533,7 +559,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-10000.0, 10000.0);
     p->setDisplayRange(0.0, 30.0);
     p->setDefault(4.0);  // ~40px at 1080p, the old pixel default
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("slideAngle");
@@ -542,7 +568,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-360.0, 360.0);
     p->setDisplayRange(0.0, 360.0);
     p->setDefault(90.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startScale");
@@ -550,7 +576,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.01, 10.0);
     p->setDisplayRange(0.2, 2.0);
     p->setDefault(1.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
 
   {
@@ -560,7 +586,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-3600.0, 3600.0);
     p->setDisplayRange(-180.0, 180.0);
     p->setDefault(0.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startBlur");
@@ -571,7 +597,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.0, 500.0);
     p->setDisplayRange(0.0, 5.0);
     p->setDefault(0.0);
-    page->addChild(*p);
+    addParam(page, p);
   }
 
   {
@@ -587,7 +613,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
           "movement, scaling and rotation all blur.");
       p->setDefault(false);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("shutterAngle");
@@ -597,7 +623,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0.0, 360.0);
       p->setDefault(180.0);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::IntParamDescriptor* p = desc.defineIntParam("blurSamples");
@@ -607,7 +633,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(2, 32);
       p->setDefault(8);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
   }
 
@@ -624,7 +650,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0.0, 1.0);
       p->setDefault(0.15);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::IntParamDescriptor* p = desc.defineIntParam("minBlobArea");
@@ -634,7 +660,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(1, 64);
       p->setDefault(4);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("wordGapSensitivity");
@@ -644,7 +670,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0.3, 3.0);
       p->setDefault(1.0);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
@@ -654,7 +680,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDisplayRange(0, 6);
       p->setDefault(0);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
     {
       OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showDiagnostics");
@@ -662,7 +688,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setHint("Draws a coloured box around each detected unit over the static text.");
       p->setDefault(false);
       p->setParent(*g);
-      page->addChild(*p);
+      addParam(page, p);
     }
   }
 }

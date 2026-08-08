@@ -86,6 +86,16 @@ class CurveInteract : public OFX::OverlayInteract {
     return _curve.penUp(c, args.penPosition);
   }
 
+  void loseFocus(const OFX::FocusArgs& args) override {
+    // A drag released outside the viewer, or interrupted by a page switch,
+    // never delivers its mouse-up. Without this the edit block it opened stays
+    // open for the rest of the session and the host's parameter state is left
+    // inconsistent.
+    if (!_curve.dragging()) return;
+    OverlayContext c;
+    if (build(c, args.time, args.pixelScale, nullptr)) _curve.abandon(c);
+  }
+
  private:
   // Snapshots parameters and viewport for one event. Never throws: an exception
   // escaping into the host mid-draw is far worse than a frame without overlay.
@@ -123,8 +133,8 @@ class CurveInteract : public OFX::OverlayInteract {
       // Playhead tracks the first group's progress -- that is the curve the
       // handles are shaping. Uses the same clip-relative origin as the renderer,
       // or the dot would drift away from what is actually on screen.
-      double fps = src->getFrameRate();
-      if (!(fps > 0.0)) fps = 25.0;
+      const double fps =
+          safeFrameRate(src, _effect->fetchClip(kOfxImageEffectOutputClipName));
       const double seconds = toClipTime(_effect, time) / fps;
       out.progress = (seconds - a.startTime) / std::max(1e-6, a.duration);
       out.hasProgress = out.progress >= 0.0 && out.progress <= 1.0;

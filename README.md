@@ -88,6 +88,30 @@ independently of whether the timing is right. If words are mis-split, adjust
 | **Motion Blur** | Motion Blur on/off, Shutter Angle (180° = normal cine shutter), Samples |
 | **Detection** | Alpha Threshold, Min Blob Area, Word Gap, Bridge Radius, Show Detection |
 
+### Working in Fusion as well as Edit
+
+Three declarations are needed for this plugin to behave in Fusion. Resolve's
+Edit page is lenient about all of them and shows none of the symptoms, so they
+are easy to miss — but Fusion is the one behaving correctly.
+
+1. **`setOutputFrameVarying(true)`** in `getClipPreferences`. The animation is
+   driven by the render time, not by host keyframes, so as far as a host can
+   tell *nothing about the effect varies*. It is then entirely within its rights
+   to render one frame and reuse it for the whole clip — which is exactly what
+   Fusion does, making the effect appear to do nothing at all.
+
+2. **`eCacheInvalidateValueAll`** on every parameter. Nothing here is ever
+   keyframed; the parameters are constants interpreted against the render time,
+   so every parameter affects every frame. The OFX default only invalidates the
+   range a parameter's own keyframe covers, which gives a caching host no reason
+   to discard anything, and it replays stale frames after an edit.
+
+3. **Edit blocks** around parameter writes from the overlay (`edit_block.h`).
+   The spec requires `paramEditBegin`/`End` when a plugin sets its own
+   parameters. Without them the host is never told the edit happened. The
+   symptom is distinctive: edits through the host's *own* Inspector work, while
+   anything dragged in the curve editor appears to do nothing.
+
 ### Timing is clip-relative
 
 **Start** is measured from the clip's own first frame, so `0` means "when the
