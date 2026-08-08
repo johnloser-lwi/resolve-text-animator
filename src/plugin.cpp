@@ -181,6 +181,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _wordGapSensitivity = fetchDoubleParam("wordGapSensitivity");
     _bridgeRadius = fetchIntParam("bridgeRadius");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
+    _hostWarning = fetchStringParam("hostWarning");
+    updateHostWarning();
   }
 
   void render(const OFX::RenderArguments& args) override;
@@ -298,7 +300,42 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // defined so existing projects still load, and are ignored.
   }
 
+  // Warn when the host's clip bounds say the timing cannot be trusted.
+  //
+  // A negative t1 means the clip reaches back before its source start -- head
+  // handle on a Fusion clip, which is the case where Resolve's render time
+  // follows the composition rather than the trimmed clip and the reveal ends up
+  // offset. A PNG or a plain still never reports this, and those work
+  // correctly, so the sign of t1 separates the two cleanly.
+  //
+  // Written to the LABEL, not the value: Resolve draws only the label of a
+  // string parameter, so a message left in the value would be invisible.
+  void updateHostWarning() {
+    double t1 = 0.0, t2 = 0.0;
+    bool ok = true;
+    try {
+      timeLineGetBounds(t1, t2);
+    } catch (...) {
+      ok = false;
+    }
+    try {
+      if (ok && t1 < 0.0)
+        _hostWarning->setLabel("(!) Source offset detected - reveal may start late. "
+                               "Offset it with Start (frames), or apply inside the Fusion comp.");
+      else
+        _hostWarning->setLabel("Timing OK");
+    } catch (...) {
+    }
+  }
+
+  void changedClip(const OFX::InstanceChangedArgs&, const std::string&) override {
+    updateHostWarning();
+  }
+
   void getClipPreferences(OFX::ClipPreferencesSetter& prefs) override {
+    // Clip prefs are recomputed when the clip or its trim changes, which is
+    // exactly when this needs re-checking.
+    updateHostWarning();
     // Declare that the output changes over time even though no parameter is
     // animated.
     //
@@ -322,6 +359,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur;
+  OFX::StringParam* _hostWarning;
 
   // Exit stage.
   OFX::BooleanParam *_enableIn, *_enableOut, *_linkOut, *_mirrorOut;
@@ -834,6 +872,19 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
 
   OFX::PageParamDescriptor* page = desc.definePageParam("Controls");
 
+  {
+    // Status line. Resolve draws a string parameter's label rather than its
+    // value, so the text lives in the label and is rewritten at runtime.
+    OFX::StringParamDescriptor* p = desc.defineStringParam("hostWarning");
+    p->setStringType(OFX::eStringTypeLabel);
+    p->setLabels("Timing OK", "Timing", "Timing");
+    p->setHint(
+        "Warns when the host reports a source offset for this clip, which makes "
+        "the reveal start later than the clip's first frame. Fusion clips with a "
+        "trimmed head do this; stills and PNGs do not.");
+    p->setDefault("");
+    addParam(page, p);
+  }
   {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableIn");
     p->setLabels("In Animation", "In", "Enable In Animation");
