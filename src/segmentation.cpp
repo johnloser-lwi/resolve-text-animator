@@ -397,10 +397,64 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     medianGap = float(allGaps[allGaps.size() / 2]);
   }
 
+  // A typeface sets two kinds of gap -- between letters, and between words --
+  // and they form two clusters. Otsu's method finds the split between them
+  // directly, which is what makes the same setting work across faces.
+  //
+  // A fixed multiple of the line height cannot: a condensed bold caps face has
+  // tall glyphs and tight tracking, so a height-derived floor lands ABOVE its
+  // word gaps and the whole line merges. Measured on one such title, no single
+  // sensitivity worked for it and for a lighter, wider face at the same time.
+  float otsuGap = 0.0f;
+  if (allGaps.size() >= 6) {
+    int maxGap = 0;
+    for (int g : allGaps) maxGap = std::max(maxGap, g);
+    if (maxGap > 0) {
+      std::vector<int> hist(size_t(maxGap) + 1, 0);
+      for (int g : allGaps) ++hist[size_t(g)];
+
+      const double total = double(allGaps.size());
+      double sumAll = 0.0;
+      for (int v = 0; v <= maxGap; ++v) sumAll += double(v) * hist[size_t(v)];
+
+      double wB = 0.0, sumB = 0.0, bestVar = -1.0;
+      int bestT = 0;
+      double bestM0 = 0.0, bestM1 = 0.0;
+      for (int t = 0; t < maxGap; ++t) {
+        wB += hist[size_t(t)];
+        if (wB <= 0.0) continue;
+        const double wF = total - wB;
+        if (wF <= 0.0) break;
+        sumB += double(t) * hist[size_t(t)];
+        const double m0 = sumB / wB;              // letter gaps
+        const double m1 = (sumAll - sumB) / wF;   // word gaps
+        const double var = wB * wF * (m0 - m1) * (m0 - m1);
+        if (var > bestVar) {
+          bestVar = var;
+          bestT = t;
+          bestM0 = m0;
+          bestM1 = m1;
+        }
+      }
+
+      // Only trust it when the two clusters are genuinely apart. A single-word
+      // line has letter gaps only, and Otsu will happily split those down the
+      // middle and shatter the word.
+      // Midway between the two cluster means, not the Otsu index itself. The
+      // index sits at the top edge of the letter-gap cluster, so the tail of
+      // that cluster spills over it and ordinary letters break as words.
+      (void)bestT;
+      if (bestM1 >= 2.0 * std::max(bestM0, 1.0)) otsuGap = float(0.5 * (bestM0 + bestM1));
+    }
+  }
+
   // 9. Emit groups.
-  auto pushGroup = [&](const RectI& bbox, int line, int idx, std::vector<int> labels) {
+  auto pushGroup = [&](const RectI& bbox, float sx1, float sx2, int line, int idx,
+                       std::vector<int> labels) {
     Group g;
     g.bbox = bbox;
+    g.sx1 = sx1;
+    g.sx2 = sx2;
     g.line = line;
     g.indexInLine = idx;
     g.labels = std::move(labels);
@@ -411,42 +465,55 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     const auto& glyphs = lineGlyphs[li];
     if (glyphs.empty()) continue;
     const float lineHeight = float(lineSpans[li].height());
-    const float breakAt =
-        params.wordGapSensitivity * std::max(medianGap * 1.8f, lineHeight * 0.22f);
+    // Prefer the split the gaps themselves show. The height-derived floor stays
+    // as the fallback for when they show nothing usable -- a single word, or a
+    // face whose letter and word spacing genuinely overlap.
+    const float breakAt = params.wordGapSensitivity *
+                          (otsuGap > 0.0f ? otsuGap
+                                          : std::max(medianGap * 1.8f, lineHeight * 0.22f));
 
     switch (params.mode) {
       case GroupMode::Character:
         for (size_t i = 0; i < glyphs.size(); ++i)
-          pushGroup(glyphs[i].bbox, int(li), int(i), glyphs[i].labels);
+          pushGroup(glyphs[i].bbox, glyphs[i].sx1, glyphs[i].sx2, int(li), int(i),
+                    glyphs[i].labels);
         break;
 
       case GroupMode::Line: {
         RectI box;
+        float lo = glyphs[0].sx1, hi = glyphs[0].sx2;
         std::vector<int> labels;
         for (const auto& g : glyphs) {
           box.unionWith(g.bbox);
+          lo = std::min(lo, g.sx1);
+          hi = std::max(hi, g.sx2);
           labels.insert(labels.end(), g.labels.begin(), g.labels.end());
         }
-        pushGroup(box, int(li), 0, std::move(labels));
+        pushGroup(box, lo, hi, int(li), 0, std::move(labels));
         break;
       }
 
       case GroupMode::Word: {
         RectI box = glyphs[0].bbox;
+        float lo = glyphs[0].sx1, hi = glyphs[0].sx2;
         std::vector<int> labels = glyphs[0].labels;
         int idx = 0;
         for (size_t i = 1; i < glyphs.size(); ++i) {
-          const float gap = float(glyphs[i].bbox.x1 - glyphs[i - 1].bbox.x2);
+          const float gap = glyphs[i].sx1 - glyphs[i - 1].sx2;
           if (gap > breakAt) {
-            pushGroup(box, int(li), idx++, std::move(labels));
+            pushGroup(box, lo, hi, int(li), idx++, std::move(labels));
             box = glyphs[i].bbox;
+            lo = glyphs[i].sx1;
+            hi = glyphs[i].sx2;
             labels = glyphs[i].labels;
           } else {
             box.unionWith(glyphs[i].bbox);
+            lo = std::min(lo, glyphs[i].sx1);
+            hi = std::max(hi, glyphs[i].sx2);
             labels.insert(labels.end(), glyphs[i].labels.begin(), glyphs[i].labels.end());
           }
         }
-        pushGroup(box, int(li), idx, std::move(labels));
+        pushGroup(box, lo, hi, int(li), idx, std::move(labels));
         break;
       }
     }
