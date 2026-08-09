@@ -79,41 +79,18 @@ class CurveInteract : public OFX::OverlayInteract {
     const WarningState w = warningState(_effect);
     if (!w.any()) return;
 
-    std::string lines[2];
-    int n = 0;
-    if (w.clipTooShort)
-      lines[n++] = "!!  CLIP TOO SHORT  -  THE ANIMATION CANNOT FINISH  -  MAKE THE CLIP LONGER";
-    if (w.sourceOffset)
-      lines[n++] = "!!  SOURCE OFFSET  -  REVEAL STARTS LATE  -  LOWER START, OR WORK IN FUSION";
+    const double x = c.rod.x1 + c.sx(24.0);
+    double y = c.rod.y2 - c.sy(28.0);
 
-    const double lineH = c.sy(30.0);
-    const double pad = c.sy(14.0);
-    const double bannerH = pad * 2.0 + lineH * n;
-    const double top = c.rod.y2;
-
-    // A solid band rather than loose text: the picture underneath is arbitrary,
-    // and red-on-anything is only reliably legible with its own background.
-    SetColour(c, Colour{0.62f, 0.04f, 0.06f, 0.92f});
-    FillRect(c, c.rod.x1, top - bannerH, c.rod.x2, top);
-
-    // Bright edge along the bottom of the band so it reads as an alert bar and
-    // not as part of the image.
-    SetColour(c, Colour{1.0f, 0.35f, 0.35f, 1.0f});
-    SetLineWidth(c, 2.0f);
-    Line(c, c.rod.x1, top - bannerH, c.rod.x2, top - bannerH);
-
-    // A frame around the whole picture. Impossible to mistake for content, and
-    // it survives the viewer being scaled down to a thumbnail.
-    SetLineWidth(c, std::max(3.0f, float(c.sx(6.0))));
-    StrokeRect(c, c.rod.x1 + c.sx(3.0), c.rod.y1 + c.sy(3.0), c.rod.x2 - c.sx(3.0),
-               c.rod.y2 - c.sy(3.0));
-
-    SetColour(c, Colour{1.0f, 1.0f, 1.0f, 1.0f});
-    double y = top - pad;
-    for (int i = 0; i < n; ++i) {
-      BoldText(c, lines[i], c.rod.x1 + c.sx(20.0), y,
-               kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop, 1.6);
-      y -= lineH;
+    SetColour(c, Colour{1.0f, 0.25f, 0.25f, 1.0f});
+    if (w.clipTooShort) {
+      Text(c, "(!) CLIP TOO SHORT - the animation cannot finish. Make the clip longer.", x, y,
+           kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+      y -= c.sy(22.0);
+    }
+    if (w.sourceOffset) {
+      Text(c, "(!) SOURCE OFFSET - reveal starts late. Lower Start (frames), or work in Fusion.",
+           x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
     }
   }
 
