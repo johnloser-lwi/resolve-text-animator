@@ -417,7 +417,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   // its neighbour while the visible gap is wide; row by row, the letters are
   // compared where they actually come near each other.
   std::vector<std::vector<float>> lineGaps(lineGlyphs.size());
-  std::vector<std::vector<int>> lineGapMin(lineGlyphs.size());
+  std::vector<std::vector<float>> lineGapMin(lineGlyphs.size());
   {
     // Row extents per glyph, built from the label image one line at a time.
     std::vector<int> labelToGlyph(size_t(labelCount) + 1, -1);
@@ -450,7 +450,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       }
 
       lineGaps[li].assign(ng, 0.0f);
-      lineGapMin[li].assign(ng, 0);
+      lineGapMin[li].assign(ng, 0.0f);
       std::vector<int> perRow;
       for (size_t i = 1; i < ng; ++i) {
         perRow.clear();
@@ -467,7 +467,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
         // still measuring where the letters genuinely come closest.
         int trueMin = INT_MAX;
         for (int g : perRow) trueMin = std::min(trueMin, g);
-        lineGapMin[li][i] = trueMin == INT_MAX ? 0 : trueMin;
+        lineGapMin[li][i] = trueMin == INT_MAX ? 0.0f : float(trueMin);
 
         int best = INT_MAX;
         if (!perRow.empty()) {
@@ -513,6 +513,8 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
 
       const float n = std::max(0.0f, lineGaps[li][i]) / scale;
       lineNorm[li][i] = n;
+      // The closest approach in the same units, for the manual threshold.
+      lineGapMin[li][i] /= scale;
       allNorm.push_back(int(n * 1000.0f));
     }
   }
@@ -619,8 +621,8 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
           // starts a new word. Same grouping bridging would produce, but the
           // letters are never fused, so character boundaries -- and the manual
           // splits that name them -- survive.
-          bool brk = params.maxLetterGap > 0 ? lineGapMin[li][i] > params.maxLetterGap
-                                             : lineNorm[li][i] > breakAt;
+          bool brk = params.maxLetterGap > 0.0f ? lineGapMin[li][i] > params.maxLetterGap
+                                                : lineNorm[li][i] > breakAt;
 
           // Overlapping letters are never a word break, whatever the statistics
           // say. If the two extents overlap there is no blank column between

@@ -22,20 +22,24 @@ struct DetectParams {
   float wordGapSensitivity = 1.0f;
   int bridgeRadius = 0;          // dilate before labeling, to join script fonts
 
-  // The widest gap, in pixels, that still counts as being INSIDE a word.
-  // Anything wider starts a new word.
+  // The widest gap that still counts as being INSIDE a word, as a FRACTION OF
+  // LETTER HEIGHT. Anything wider starts a new word.
   //
-  // Stated as the gap itself rather than as a dilation radius. Bridging achieves
-  // the same grouping by growing every letter by r, which joins gaps up to 2r --
-  // so the number that control takes is half the distance it is really about,
-  // and it describes the mechanism instead of the decision.
+  // Relative, not pixels. A pixel value silently changes meaning the moment the
+  // proxy resolution changes, or the timeline resolution, or the point size --
+  // the same title at half resolution has half the gaps, so a threshold tuned at
+  // full res splits every letter in proxy. Letter height moves with all three,
+  // so a ratio holds. It is also the same yardstick the automatic path uses.
+  //
+  // A word space is roughly a quarter to a third of letter height in most
+  // typefaces, so useful values sit near 0.3.
   //
   // Unlike bridging, the letters are never fused: every character boundary
   // survives, so Character mode still shows letters and a manual split inside a
   // word is still possible.
   //
   // Zero leaves word breaks to the measured gap statistics.
-  int maxLetterGap = 0;
+  float maxLetterGap = 0.0f;
   GroupMode mode = GroupMode::Word;
 
   // Italic compensation. Letters are measured in a sheared coordinate system,

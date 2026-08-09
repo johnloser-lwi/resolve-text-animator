@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
         }
       }
     } else if (!std::strcmp(a, "--maxgap")) {
-      p.maxLetterGap = std::atoi(next());
+      p.maxLetterGap = float(std::atof(next()));
     } else if (!std::strcmp(a, "--bridge")) {
       p.bridgeRadius = std::atoi(next());
     } else if (!std::strcmp(a, "--minarea")) {

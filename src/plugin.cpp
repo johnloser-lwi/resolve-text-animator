@@ -209,7 +209,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _splitBefore = fetchStringParam("splitBefore");
     _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
-    _maxLetterGap = fetchIntParam("maxLetterGap");
+    _maxLetterGap = fetchDoubleParam("characterGap");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");
     updateHostWarning();
@@ -429,13 +429,13 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::Clip* _srcClip = nullptr;
 
   OFX::ChoiceParam *_groupMode, *_animation, *_easing, *_order, *_lineOrder, *_distanceUnits;
-  OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_maxLetterGap, *_blurSamples;
+  OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_blurSamples;
   OFX::IntParam* _startBlurSamples;
   bool _syncingSamples = false;
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
   OFX::DoubleParam *_startRotation, *_startBlur, *_shutterAngle;
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
-  OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant;
+  OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant, *_maxLetterGap;
   OFX::BooleanParam* _autoSlant;
   OFX::StringParam *_mergeAt, *_splitBefore;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
@@ -595,7 +595,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
   det.bridgeRadius = std::max(0, _bridgeRadius->getValueAtTime(args.time));
-  det.maxLetterGap = std::max(0, _maxLetterGap->getValueAtTime(args.time));
+  det.maxLetterGap = float(std::max(0.0, _maxLetterGap->getValueAtTime(args.time)));
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
   rta::AnimParams anim;
@@ -1649,6 +1649,37 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       addParam(page, p);
     }
     {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("characterGap");
+      p->setLabels("Character Gap", "Char Gap", "Character Gap");
+      p->setHint(
+          "The widest gap between two characters that still keeps them in the same word, as "
+          "a fraction of letter height; anything wider starts a new word. Relative, so it "
+          "survives a change of proxy or timeline resolution -- a pixel value would not. A "
+          "word space is about 0.25 to 0.35 in most typefaces. Overrides Word Gap entirely, "
+          "and never fuses characters, so Character mode and Split Before still work. "
+          "0 leaves word breaks to the measured gaps.");
+      p->setRange(0.0, 4.0);
+      p->setDisplayRange(0.0, 1.2);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
+      p->setLabels("Character Padding", "Char Padding", "Character Padding");
+      p->setHint(
+          "Grows every mark by this many pixels before the characters are found, so strokes "
+          "that nearly touch become one character. For script faces whose hairline joins "
+          "break a cursive word into fragments. Note this FUSES what it joins, so pushing it "
+          "far enough to weld whole words also destroys the characters inside them -- use "
+          "Character Gap for word grouping instead.");
+      p->setRange(0, 128);
+      p->setDisplayRange(0, 40);
+      p->setDefault(0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
       OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("autoSlant");
       p->setLabels("Auto Italic", "Auto Italic", "Auto Italic Slant");
       p->setHint(
@@ -1689,33 +1720,6 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
           "Character indices that must start a new unit, e.g. \"12, 30\". Set Group Mode to "
           "Character to read the index of any letter, then switch back.");
       p->setDefault("");
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::IntParamDescriptor* p = desc.defineIntParam("maxLetterGap");
-      p->setLabels("Max Letter Gap", "Letter Gap", "Max Letter Gap");
-      p->setHint(
-          "The widest gap, in pixels, that still counts as being inside a word; anything "
-          "wider starts a new word. Overrides Word Gap entirely. Unlike Bridge Radius it "
-          "does not fuse the letters, so Character mode and Split Before still work. "
-          "0 leaves word breaks to the measured gaps.");
-      p->setRange(0, 256);
-      p->setDisplayRange(0, 80);
-      p->setDefault(0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
-      p->setLabels("Bridge Radius", "Bridge", "Bridge Radius");
-      p->setHint(
-          "Joins glyphs that nearly touch, by growing every mark before the letters are "
-          "labelled. For script faces, and for thin fonts where the gap between letters is "
-          "wide relative to the strokes. Too far and it bridges neighbouring words as well.");
-      p->setRange(0, 128);
-      p->setDisplayRange(0, 40);
-      p->setDefault(0);
       p->setParent(*g);
       addParam(page, p);
     }
