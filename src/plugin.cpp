@@ -246,11 +246,25 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // the worst of them: eleven different values on one clip, sliding across
     // the range its head had been extended by.
     //
-    // The running minimum is kept only as a safety net for a host that does
-    // hand out absolute frames, where it collapses to the clip's first frame
-    // anyway. It can only fall, so it can never push the animation later.
-    std::lock_guard<std::mutex> lock(_seenMutex);
-    return _seenEarliest < 1e299 ? _seenEarliest : 0.0;
+    // t1 straight from the host, with no state of any kind.
+    //
+    // This is deliberately the version that trims correctly. t1 moves with the
+    // clip, so shortening it -- or moving it along the timeline -- re-anchors
+    // the animation immediately. Its one failure is extending the head, where
+    // t1 starts including the unused handle and the reveal begins early; that
+    // residue is what Start (frames) offsets and what the timing indicator
+    // flags.
+    //
+    // The alternative, a running minimum of render times, has the mirror-image
+    // fault and a worse one: it follows an extension but can never follow a
+    // shorter trim, because it only ever falls. And every attempt to let it
+    // re-learn -- on bounds change, on t2 change -- reset it to the frame being
+    // rendered, pinning clip time to 0 so the entrance never started at all.
+    // Three separate versions broke that way. Being wrong only when the head is
+    // extended is a much smaller fault than not animating.
+    double start = 0.0, length = 0.0;
+    if (rta::getClipRange(this, start, length)) return start;
+    return 0.0;
   }
 
 
