@@ -223,21 +223,46 @@ namespace {
 
 // Progress of one stage: 1 is settled, 0 is fully away. An inactive stage sits
 // at 1 so it never pulls a group off screen.
-float stageProgress(Stage stage, int rank, double frames, double stageStart,
+//
+// `e` may legitimately exceed 1 -- that IS overshoot, and it is what carries a
+// group past its resting position before it settles. Whether a group is drawn
+// at all is decided by the raw window position, never by `e`, because clamping
+// on the eased value throws overshoot away for every property at once.
+struct StageEval {
+  float e = 1.0f;
+  bool hidden = false;
+  bool animating = false;  // inside its own window right now
+};
+
+StageEval stageEval(Stage stage, int rank, double frames, double stageStart,
                     const StageSettings& s, bool enabled) {
-  if (!enabled) return 1.0f;
+  StageEval r;
+  if (!enabled) return r;
 
   const double dur = std::max(1e-6, s.duration);
   const float raw = float((frames - (stageStart + double(rank) * s.stagger)) / dur);
 
   if (stage == Stage::In) {
-    if (raw <= 0.0f) return 0.0f;  // not arrived yet
-    if (raw >= 1.0f) return 1.0f;
-    return applyEasing(raw, s.easing, s.bezier);
+    if (raw <= 0.0f) {
+      r.e = 0.0f;
+      r.hidden = true;  // not arrived yet
+      return r;
+    }
+    if (raw >= 1.0f) return r;  // settled
+    r.e = applyEasing(raw, s.easing, s.bezier);
+    r.animating = true;
+    return r;
   }
-  if (raw <= 0.0f) return 1.0f;  // exit not begun
-  if (raw >= 1.0f) return 0.0f;  // gone
-  return applyEasing(1.0f - raw, s.easing, s.bezier);
+
+  if (raw <= 0.0f) return r;  // exit not begun
+  if (raw >= 1.0f) {
+    r.e = 0.0f;
+    r.hidden = true;  // gone
+    return r;
+  }
+  r.e = applyEasing(1.0f - raw, s.easing, s.bezier);
+  r.animating = true;
+  return r;
 }
 
 }  // namespace
@@ -245,29 +270,32 @@ float stageProgress(Stage stage, int rank, double frames, double stageStart,
 GroupTransform transformCombined(int rankIn, int rankOut, double frames, double inStart,
                                  double outStart, const StageSettings& in,
                                  const StageSettings& out, bool enableIn, bool enableOut) {
-  const float eIn = stageProgress(Stage::In, rankIn, frames, inStart, in, enableIn);
-  const float eOut = stageProgress(Stage::Out, rankOut, frames, outStart, out, enableOut);
+  const StageEval a = stageEval(Stage::In, rankIn, frames, inStart, in, enableIn);
+  const StageEval b = stageEval(Stage::Out, rankOut, frames, outStart, out, enableOut);
 
-  // Whichever stage is further from settled owns the group, and brings its own
-  // slide, rotation and blur with it -- so an exit that interrupts an entrance
-  // departs using the exit's settings rather than inheriting the entrance's.
-  const bool outLeads = eOut < eIn;
-  const float e = outLeads ? eOut : eIn;
-  const StageSettings& s = outLeads ? out : in;
-
-  if (e <= 0.0f) {
+  // Drawn or not is decided by the windows, so an overshooting curve keeps its
+  // overshoot instead of being flattened to the resting pose.
+  if (a.hidden || b.hidden) {
     GroupTransform t;  // not arrived, or gone
     t.visible = false;
     return t;
   }
-  if (e >= 1.0f) {
-    GroupTransform t;
-    t.visible = true;
-    t.opacity = 1.0f;
-    t.scale = 1.0f;
-    return t;
-  }
-  return poseAt(e, s);
+
+  // The stage that is actually running owns the group, and brings its own
+  // slide, rotation and blur with it -- so an exit that interrupts an entrance
+  // departs using the exit's settings rather than inheriting the entrance's.
+  //
+  // Whether it is running comes from its window, NOT from comparing eased
+  // values. An overshooting entrance sits above 1 while the dormant exit rests
+  // at exactly 1, so "further from settled" handed the group to the stage doing
+  // nothing and flattened the overshoot away.
+  //
+  // When both really are running -- a genuine overlap -- the smaller value wins,
+  // which is the one further from arrived.
+  const bool outLeads = b.animating && (!a.animating || b.e < a.e);
+  // poseAt is the identity at exactly 1, so a settled group needs no special
+  // case, and a value past 1 comes through as overshoot.
+  return poseAt(outLeads ? b.e : a.e, outLeads ? out : in);
 }
 
 void transformTapsCombined(int rankIn, int rankOut, double frames, double inStart, double outStart,
