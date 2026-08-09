@@ -128,6 +128,8 @@ int main(int argc, char** argv) {
           if (!*c) break;
         }
       }
+    } else if (!std::strcmp(a, "--maxgap")) {
+      p.maxLetterGap = std::atoi(next());
     } else if (!std::strcmp(a, "--bridge")) {
       p.bridgeRadius = std::atoi(next());
     } else if (!std::strcmp(a, "--minarea")) {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace rta {
@@ -35,29 +36,42 @@ struct UnionFind {
 
 // ------------------------------------------------------------------ dilation
 
-// Separable max filter. Used to bridge the hairline joins of script fonts so
-// that a cursive word labels as one component instead of shattering.
+// Separable binary dilation. Used to bridge the hairline joins of script fonts
+// so that a cursive word labels as one component instead of shattering.
+//
+// Cost does not depend on the radius. The obvious version scans the window at
+// every pixel, so it slows down as the radius grows -- which is felt exactly
+// when dragging the Bridge Radius slider, since every change re-runs the whole
+// analysis. Instead each line is swept twice, carrying the position of the
+// nearest set pixel behind and ahead; a pixel is set if either is within r.
+// Exact for a binary mask, and identical to the window scan it replaces.
+void dilateLine(const uint8_t* src, uint8_t* dst, int n, std::ptrdiff_t stride, int r,
+                std::vector<int>& prev, std::vector<int>& next) {
+  const int kFar = std::numeric_limits<int>::max() / 4;
+
+  int last = -kFar;
+  for (int i = 0; i < n; ++i) {
+    if (src[i * stride]) last = i;
+    prev[size_t(i)] = last;
+  }
+  int ahead = kFar;
+  for (int i = n - 1; i >= 0; --i) {
+    if (src[i * stride]) ahead = i;
+    next[size_t(i)] = ahead;
+  }
+  for (int i = 0; i < n; ++i)
+    dst[i * stride] = uint8_t((i - prev[size_t(i)] <= r) || (next[size_t(i)] - i <= r));
+}
+
 std::vector<uint8_t> dilate(const std::vector<uint8_t>& src, int w, int h, int r) {
   std::vector<uint8_t> tmp(size_t(w) * h, 0);
   std::vector<uint8_t> out(size_t(w) * h, 0);
-  for (int y = 0; y < h; ++y) {
-    const uint8_t* s = &src[size_t(y) * w];
-    uint8_t* d = &tmp[size_t(y) * w];
-    for (int x = 0; x < w; ++x) {
-      uint8_t m = 0;
-      const int lo = std::max(0, x - r), hi = std::min(w - 1, x + r);
-      for (int i = lo; i <= hi && !m; ++i) m = s[i];
-      d[x] = m;
-    }
-  }
-  for (int x = 0; x < w; ++x) {
-    for (int y = 0; y < h; ++y) {
-      uint8_t m = 0;
-      const int lo = std::max(0, y - r), hi = std::min(h - 1, y + r);
-      for (int i = lo; i <= hi && !m; ++i) m = tmp[size_t(i) * w + x];
-      out[size_t(y) * w + x] = m;
-    }
-  }
+  std::vector<int> prev(size_t(std::max(w, h))), next(size_t(std::max(w, h)));
+
+  for (int y = 0; y < h; ++y)
+    dilateLine(&src[size_t(y) * w], &tmp[size_t(y) * w], w, 1, r, prev, next);
+  for (int x = 0; x < w; ++x)
+    dilateLine(&tmp[size_t(x)], &out[size_t(x)], h, w, r, prev, next);
   return out;
 }
 
@@ -403,6 +417,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   // its neighbour while the visible gap is wide; row by row, the letters are
   // compared where they actually come near each other.
   std::vector<std::vector<float>> lineGaps(lineGlyphs.size());
+  std::vector<std::vector<int>> lineGapMin(lineGlyphs.size());
   {
     // Row extents per glyph, built from the label image one line at a time.
     std::vector<int> labelToGlyph(size_t(labelCount) + 1, -1);
@@ -435,6 +450,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       }
 
       lineGaps[li].assign(ng, 0.0f);
+      lineGapMin[li].assign(ng, 0);
       std::vector<int> perRow;
       for (size_t i = 1; i < ng; ++i) {
         perRow.clear();
@@ -449,6 +465,10 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
         // real, but not what separates words, and taking it merged 'Text' with
         // 'Animator'. The 10th percentile ignores that one extreme row while
         // still measuring where the letters genuinely come closest.
+        int trueMin = INT_MAX;
+        for (int g : perRow) trueMin = std::min(trueMin, g);
+        lineGapMin[li][i] = trueMin == INT_MAX ? 0 : trueMin;
+
         int best = INT_MAX;
         if (!perRow.empty()) {
           const size_t k = size_t(0.10 * double(perRow.size() - 1) + 0.5);
@@ -595,8 +615,29 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
         int idx = 0, held = 1;
         size_t first = 0;
         for (size_t i = 1; i < glyphs.size(); ++i) {
-          const float gap = lineNorm[li][i];
-          if (gap > breakAt) {
+          // Max Letter Gap, when set, decides this outright: a gap wider than it
+          // starts a new word. Same grouping bridging would produce, but the
+          // letters are never fused, so character boundaries -- and the manual
+          // splits that name them -- survive.
+          bool brk = params.maxLetterGap > 0 ? lineGapMin[li][i] > params.maxLetterGap
+                                             : lineNorm[li][i] > breakAt;
+
+          // Overlapping letters are never a word break, whatever the statistics
+          // say. If the two extents overlap there is no blank column between
+          // them, so no space was ever set there.
+          //
+          // This is not redundant with the row-wise gap. That gap is the tenth
+          // percentile of the rows, not the minimum -- the minimum is where a
+          // triangular glyph's foot reaches under its neighbour, and taking it
+          // merged real words. But in a thin face an 'A' meets the 'T' after it
+          // only at the very top and very bottom, and those are exactly the rows
+          // the percentile discards, so ANIMATION split into ANIMA and TION with
+          // the two boxes visibly overlapping on screen.
+          //
+          // Measured deskewed, because in an italic every letter overlaps its
+          // neighbour in raw x and the test would never fire.
+          if (glyphs[i].sx1 - glyphs[i - 1].sx2 <= 0.0f) brk = false;
+          if (brk) {
             pushGroup(box, lo, hi, held, int(li), idx++, int(first), std::move(labels));
             first = i;
             box = glyphs[i].bbox;

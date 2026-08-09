@@ -21,6 +21,21 @@ struct DetectParams {
   int minBlobArea = 4;           // in pixels, at analysis resolution
   float wordGapSensitivity = 1.0f;
   int bridgeRadius = 0;          // dilate before labeling, to join script fonts
+
+  // The widest gap, in pixels, that still counts as being INSIDE a word.
+  // Anything wider starts a new word.
+  //
+  // Stated as the gap itself rather than as a dilation radius. Bridging achieves
+  // the same grouping by growing every letter by r, which joins gaps up to 2r --
+  // so the number that control takes is half the distance it is really about,
+  // and it describes the mechanism instead of the decision.
+  //
+  // Unlike bridging, the letters are never fused: every character boundary
+  // survives, so Character mode still shows letters and a manual split inside a
+  // word is still possible.
+  //
+  // Zero leaves word breaks to the measured gap statistics.
+  int maxLetterGap = 0;
   GroupMode mode = GroupMode::Word;
 
   // Italic compensation. Letters are measured in a sheared coordinate system,
@@ -53,7 +68,7 @@ struct DetectParams {
   bool operator==(const DetectParams& o) const {
     return alphaThreshold == o.alphaThreshold && minBlobArea == o.minBlobArea &&
            wordGapSensitivity == o.wordGapSensitivity &&
-           bridgeRadius == o.bridgeRadius && mode == o.mode &&
+           bridgeRadius == o.bridgeRadius && maxLetterGap == o.maxLetterGap && mode == o.mode &&
            autoSlant == o.autoSlant && italicSlant == o.italicSlant &&
            mergeAt == o.mergeAt && splitBefore == o.splitBefore;
   }

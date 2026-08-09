@@ -209,6 +209,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _splitBefore = fetchStringParam("splitBefore");
     _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
+    _maxLetterGap = fetchIntParam("maxLetterGap");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");
     updateHostWarning();
@@ -428,7 +429,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::Clip* _srcClip = nullptr;
 
   OFX::ChoiceParam *_groupMode, *_animation, *_easing, *_order, *_lineOrder, *_distanceUnits;
-  OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_blurSamples;
+  OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_maxLetterGap, *_blurSamples;
   OFX::IntParam* _startBlurSamples;
   bool _syncingSamples = false;
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
@@ -594,6 +595,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
   det.bridgeRadius = std::max(0, _bridgeRadius->getValueAtTime(args.time));
+  det.maxLetterGap = std::max(0, _maxLetterGap->getValueAtTime(args.time));
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
   rta::AnimParams anim;
@@ -965,6 +967,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       u.y1 = g.bbox.y1;
       u.x2 = g.bbox.x2;
       u.y2 = g.bbox.y2;
+      u.sx1 = g.sx1;
+      u.sx2 = g.sx2;
       u.glyphIndex = g.glyphIndex;
       u.glyphStarts = g.glyphStarts;
       u.glyphIndices = g.glyphIndices;
@@ -1019,11 +1023,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       trace.why = "cuda-composite-failed";
       return;
     }
-    if (diagnostics) {
-      rta::cudaDrawDiagnostics(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
-                               dstView.width, dstView.height, useSeg->groups, window, 2,
-                               useSeg->slantTan, useSeg->height / 2, args.pCudaStream);
-    }
     trace.why = "ok-cuda";
     return;
   }
@@ -1031,19 +1030,10 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 
   rta::compositeGroups(dstView, srcView, *useSeg, transforms, taps, window);
 
-  if (diagnostics) {
-    // Draw the detected boxes over the *source* layout, not the animated one,
-    // so the overlay answers "did detection work" independently of timing.
-    for (int y = std::max(0, window.y1); y < std::min(dstView.height, window.y2); ++y) {
-      const float* s = srcView.at(std::max(0, window.x1), y);
-      float* d = dstView.at(std::max(0, window.x1), y);
-      const int n = std::min(dstView.width, window.x2) - std::max(0, window.x1);
-      for (int i = 0; i < n * 4; i += 4) {
-        for (int c = 0; c < 4; ++c) d[i + c] = std::max(d[i + c], s[i + c] * 0.25f);
-      }
-    }
-    rta::drawDiagnostics(dstView, *useSeg, 2);
-  }
+  // Show Detection deliberately draws NOTHING here. It is a viewer overlay
+  // (interact/overlay.cpp), so it can be left on permanently without reaching
+  // render cache, Deliver, or a round trip through Fusion.
+  (void)diagnostics;
   trace.why = "ok-cpu";
 }
 
@@ -1703,11 +1693,28 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       addParam(page, p);
     }
     {
+      OFX::IntParamDescriptor* p = desc.defineIntParam("maxLetterGap");
+      p->setLabels("Max Letter Gap", "Letter Gap", "Max Letter Gap");
+      p->setHint(
+          "The widest gap, in pixels, that still counts as being inside a word; anything "
+          "wider starts a new word. Overrides Word Gap entirely. Unlike Bridge Radius it "
+          "does not fuse the letters, so Character mode and Split Before still work. "
+          "0 leaves word breaks to the measured gaps.");
+      p->setRange(0, 256);
+      p->setDisplayRange(0, 80);
+      p->setDefault(0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
       OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
       p->setLabels("Bridge Radius", "Bridge", "Bridge Radius");
-      p->setHint("Joins glyphs that nearly touch. Use for script fonts.");
-      p->setRange(0, 32);
-      p->setDisplayRange(0, 6);
+      p->setHint(
+          "Joins glyphs that nearly touch, by growing every mark before the letters are "
+          "labelled. For script faces, and for thin fonts where the gap between letters is "
+          "wide relative to the strokes. Too far and it bridges neighbouring words as well.");
+      p->setRange(0, 128);
+      p->setDisplayRange(0, 40);
       p->setDefault(0);
       p->setParent(*g);
       addParam(page, p);

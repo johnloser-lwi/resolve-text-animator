@@ -18,6 +18,15 @@
 namespace rta {
 namespace {
 
+// Same hues the harness uses for its diagnostic PNGs, so a box means the same
+// colour in both places.
+constexpr Colour kUnitPalette[8] = {
+    {1.00f, 0.20f, 0.25f, 0.95f}, {0.20f, 0.85f, 1.00f, 0.95f},
+    {1.00f, 0.85f, 0.15f, 0.95f}, {0.35f, 1.00f, 0.35f, 0.95f},
+    {1.00f, 0.45f, 1.00f, 0.95f}, {0.55f, 0.55f, 1.00f, 0.95f},
+    {1.00f, 0.60f, 0.20f, 0.95f}, {0.20f, 1.00f, 0.75f, 0.95f},
+};
+
 // Fetched once, optionally: a host without the draw suite gets no overlay
 // rather than a plugin that fails to load.
 OfxDrawSuiteV1* drawSuite() {
@@ -74,6 +83,7 @@ class CurveInteract : public OFX::OverlayInteract {
     // reason to look at the overlay when something is wrong.
     drawWarnings(c);
     drawSlant(c);
+    drawUnits(c);
 
     if (!showCurve(args.time)) return true;
     _curve.layout(c);
@@ -151,6 +161,64 @@ class CurveInteract : public OFX::OverlayInteract {
     const double y = c.rod.y2 - c.sy(w.any() ? 72.0 : 28.0);
     Text(c, buf, c.rod.x1 + c.sx(24.0), y,
          kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+  }
+
+  // Detected units, outlined and numbered, on the OVERLAY rather than burned
+  // into the picture.
+  //
+  // The earlier version drew these into the rendered frame, on the reasoning that
+  // the CPU and CUDA paths had to agree about the numbering. That reasoning was
+  // wrong: the numbering is data, and the overlay reads the same published data
+  // that the drag and Alt-click already use, so there is nothing to disagree
+  // about. Drawing into the frame meant Show Detection could not simply be left
+  // on -- it would reach render cache and Deliver. An overlay never does.
+  void drawUnits(const OverlayContext& c) {
+    bool show = false;
+    try {
+      show = _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(c.time);
+    } catch (...) {
+      return;
+    }
+    if (!show) return;
+
+    const AnalysisState a = analysisState(_effect);
+    if (a.units.empty() || a.width <= 0 || a.height <= 0) return;
+
+    const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
+    if (w <= 0.0 || h <= 0.0) return;
+    const double sx = w / double(a.width), sy = h / double(a.height);
+    const double yMid = double(a.height) / 2.0;
+    const double slant = std::tan(double(a.slantDegrees) * 3.14159265358979323846 / 180.0);
+
+    for (size_t i = 0; i < a.units.size(); ++i) {
+      const DetectedUnit& u = a.units[i];
+      const Colour col = kUnitPalette[i % 8];
+
+      // Image y runs down, canonical y runs up.
+      const double top = c.rod.y2 - double(u.y1) * sy;
+      const double bot = c.rod.y2 - double(u.y2) * sy;
+      // The lean, applied at each edge's own row, so the outline follows the type.
+      const bool sheared = u.sx2 > u.sx1;
+      const double l0 = sheared ? double(u.sx1) : double(u.x1);
+      const double r0 = sheared ? double(u.sx2) : double(u.x2);
+      const double shTop = sheared ? (double(u.y1) - yMid) * slant : 0.0;
+      const double shBot = sheared ? (double(u.y2) - yMid) * slant : 0.0;
+
+      const OfxPointD quad[5] = {
+          {c.rod.x1 + (l0 - shTop) * sx, top}, {c.rod.x1 + (r0 - shTop) * sx, top},
+          {c.rod.x1 + (r0 - shBot) * sx, bot}, {c.rod.x1 + (l0 - shBot) * sx, bot},
+          {c.rod.x1 + (l0 - shTop) * sx, top},
+      };
+      SetColour(c, col);
+      SetLineWidth(c, 1.0f);
+      Polyline(c, quad, 5);
+
+      // The character index this unit starts at -- the number the overrides name.
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%d", u.glyphIndex);
+      Text(c, buf, quad[0].x + c.sx(3.0), top + c.sy(14.0),
+           kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+    }
   }
 
   bool showCurve(double time) {

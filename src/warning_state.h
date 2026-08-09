@@ -69,6 +69,9 @@ inline void clearWarningState(const void* effect) {
 // scale is.
 struct DetectedUnit {
   int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+  // Deskewed extent, so the overlay can outline an italic unit with the
+  // parallelogram it really occupies rather than an upright box.
+  float sx1 = 0.0f, sx2 = 0.0f;
   // Character index this unit starts at, and the index of each of its letters.
   // Overrides are addressed by character, so these are what the viewer writes.
   int glyphIndex = 0;
