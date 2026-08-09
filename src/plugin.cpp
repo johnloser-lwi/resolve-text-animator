@@ -275,37 +275,19 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // entrance is zero opacity, so the text simply sat invisible until the
     // bounds happened to settle.
     //
-    // The origin is only discarded when it falls outside the media the clip is
-    // cut from, which is the one thing that cannot be true of a real first
-    // frame. That covers the clip genuinely moving, without reacting to noise.
-    // Re-learn whenever the clip's TRIM changes, keyed on t2.
+    // Monotonically decreasing. Nothing here ever raises it.
     //
-    // Resolve's render time follows the clip's SOURCE position, not its
-    // timeline position -- the same caveat Gyroflow hit, where a subclip with a
-    // non-zero start pulled data from the start of the source instead. Trimming
-    // the head therefore moves args.time for the clip's first frame, so the
-    // anchor has to move with it.
-    //
-    // A minimum that only ever falls cannot: it follows the clip when the head
-    // is extended and then can never follow it back, leaving the animation
-    // offset by the trim amount for good.
-    //
-    // t2 is the key because it is the one bound that holds still -- measured
-    // constant at 119 while t1 returned eleven different values on the same
-    // clip -- and it changes when the clip is genuinely re-trimmed. t1 is never
-    // used for anything.
-    if (haveBounds && rawT2 != _seenT2) _seenEarliest = time;
-
-    // Monotonically decreasing within one trim state.
-    //
-    // Every previous version reset this when the host's bounds looked wrong,
-    // which moved the anchor FORWARD onto the frame being rendered -- clip time
-    // then snapped back and the reveal froze or restarted. The host's bounds
-    // are not trustworthy anyway: measured eleven different values for t1 on
-    // one clip, sliding across exactly the range its head had been extended by.
+    // Re-learning on a bounds change was tried and reverted: it set the anchor
+    // to the frame being rendered, and the bounds do change -- t2 was measured
+    // flipping between 0 and 119 on one clip, t1 across eleven values. Each
+    // flip pinned clip time back to 0, which is an entrance's first frame, so
+    // nothing was drawn and the reveal never started. That was the intended fix
+    // for a head-trim offset and it cost far more than it bought.
     //
     // A value that can only fall cannot move the animation backwards, and the
-    // lowest frame the host ever asks for is the clip's first frame.
+    // lowest frame the host ever asks for is the clip's first frame. The
+    // residual head-trim offset on Fusion clips is handled by Start (frames),
+    // and flagged by the timing indicator rather than guessed at.
     if (time < _seenEarliest) _seenEarliest = time;
     _seenT1 = rawT1;
     _seenT2 = rawT2;
