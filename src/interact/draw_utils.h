@@ -96,6 +96,19 @@ inline void Text(const OverlayContext& c, const std::string& s, double x, double
   c.draw->drawText(c.ctx, s.c_str(), &p, alignment);
 }
 
+// Text drawn several times at small offsets, which thickens the strokes.
+//
+// The draw suite has no font size or weight control -- drawText takes a string,
+// a point and an alignment, and the host picks everything else. Overdrawing is
+// the only way to make a warning read as bold rather than as another label.
+inline void BoldText(const OverlayContext& c, const std::string& s, double x, double y,
+                     int alignment, double weight = 1.4) {
+  const double dx = c.sx(weight), dy = c.sy(weight);
+  const double offs[9][2] = {{0, 0},   {dx, 0},   {-dx, 0},  {0, dy},  {0, -dy},
+                             {dx, dy}, {-dx, dy}, {dx, -dy}, {-dx, -dy}};
+  for (const auto& o : offs) Text(c, s, x + o[0], y + o[1], alignment);
+}
+
 // A square handle of fixed on-screen size, outlined so it stays visible over
 // both bright and dark footage.
 inline void Handle(const OverlayContext& c, double x, double y, const Colour& fill,
