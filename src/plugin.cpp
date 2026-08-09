@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "interact/overlay.h"
 #include "probe.h"
 #include "segmentation.h"
+#include "warning_state.h"
 
 #define kPluginName "Text Animator"
 #define kPluginGrouping "Text"
@@ -204,6 +206,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     updateHostWarning();
   }
 
+  ~TextAnimatorPlugin() override { rta::clearWarningState(this); }
+
   void render(const OFX::RenderArguments& args) override;
 
   bool isIdentity(const OFX::IsIdentityArguments&, OFX::Clip*&, double&) override {
@@ -337,8 +341,15 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // the row -- the rest of the width goes to the value field -- so a sentence
     // here just renders as "(!) Source ...usion comp.". The explanation lives
     // in the tooltip, which has room.
+    // Clip-too-short wins: it is the one the user can act on directly.
+    const char* text = "Timing OK";
+    if (!_fitOk.load(std::memory_order_relaxed))
+      text = "(!) Clip too short";
+    else if (ok && t1 < 0.0)
+      text = "(!) Source offset";
+
     try {
-      _hostWarning->setLabel(ok && t1 < 0.0 ? "(!) Source offset" : "Timing OK");
+      _hostWarning->setLabel(text);
       // The field itself is meaningless; greying it out stops it reading as
       // something to type into.
       _hostWarning->setEnabled(false);
@@ -393,6 +404,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // Lowest render time seen since the clip's reported bounds last changed --
   // i.e. the clip's first frame, which is the only place it can be learned.
   // Reset on a bounds change so re-trimming re-learns it.
+  // Set by render, read by the indicator: does every animation fit the clip?
+  std::atomic<bool> _fitOk{true};
+
   std::mutex _seenMutex;
   double _seenT1 = 1e300, _seenT2 = 1e300, _seenEarliest = 1e300;
 
@@ -696,8 +710,13 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     rta::probeOnChange("cliptime", buf);
   }
 
-  // Pick the stage driving this frame. A frame is only ever in one of them,
-  // which is what lets the two stages group the text differently.
+  // The entrance and exit are evaluated TOGETHER when they share a grouping, so
+  // an exit that begins before the entrance has settled blends with it instead
+  // of cutting it off. With different group modes the two segmentations have
+  // different groups and there is nothing to combine, so that case still picks
+  // one stage per frame.
+  const bool combined = anim.enableOut && outMode == det.mode && segOut && !segOut->empty();
+
   rta::Stage stage = rta::Stage::Settled;
   const rta::Segmentation* useSeg = segIn.get();
   const rta::StageSettings* useSet = &anim.in;
@@ -705,20 +724,27 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   double stageStart = anim.startTime;
   double rawSlide = rawSlideIn, rawBlur = rawBlurIn;
 
+  double outSeqStart = 0.0;
+  bool outUsable = false;
   if (anim.enableOut && haveLength && segOut && !segOut->empty()) {
-    const double outStart =
-        clipLength - anim.outOffset - rta::stageSpan(segOut->groups.size(), anim.out);
-    if (frames >= outStart) {
+    outSeqStart = clipLength - anim.outOffset - rta::stageSpan(segOut->groups.size(), anim.out);
+    outUsable = true;
+  }
+
+  if (!combined) {
+    if (outUsable && frames >= outSeqStart) {
       stage = rta::Stage::Out;
       useSeg = segOut.get();
       useSet = &anim.out;
       useMode = outMode;
-      stageStart = outStart;
+      stageStart = outSeqStart;
       rawSlide = rawSlideOut;
       rawBlur = rawBlurOut;
     }
+    if (stage != rta::Stage::Out) stage = anim.enableIn ? rta::Stage::In : rta::Stage::Settled;
+  } else {
+    stage = anim.enableIn ? rta::Stage::In : rta::Stage::Settled;
   }
-  if (stage != rta::Stage::Out) stage = anim.enableIn ? rta::Stage::In : rta::Stage::Settled;
 
   {
     // The timing mapping being right does not mean the animation is running:
@@ -762,9 +788,42 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   const std::vector<int> rank = rta::revealOrder(useSeg->groups, useSeg->lineCount, active);
   const int taps = rta::tapCount(anim);
   std::vector<rta::GroupTransform> transforms(useSeg->groups.size() * size_t(taps));
-  for (size_t i = 0; i < useSeg->groups.size(); ++i)
-    rta::transformTaps(stage, rank[i], frames, stageStart, anim, active,
-                       &transforms[i * size_t(taps)]);
+
+  if (combined && outUsable) {
+    // Both stages share a grouping, so each group can be asked for both and take
+    // whichever is further from settled.
+    rta::StageSettings outActive = anim.out;
+    outActive.slideDistance = rawSlideOut * lengthScale;
+    outActive.startBlur = rawBlurOut * lengthScale;
+    const std::vector<int> rankOut =
+        rta::revealOrder(useSeg->groups, useSeg->lineCount, outActive);
+    for (size_t i = 0; i < useSeg->groups.size(); ++i)
+      rta::transformTapsCombined(rank[i], rankOut[i], frames, anim.startTime, outSeqStart, anim,
+                                 active, outActive, &transforms[i * size_t(taps)]);
+  } else {
+    for (size_t i = 0; i < useSeg->groups.size(); ++i)
+      rta::transformTaps(stage, rank[i], frames, stageStart, anim, active,
+                         &transforms[i * size_t(taps)]);
+  }
+
+  // Room check for the indicator, using the group count we just measured.
+  {
+    const rta::FitReport fit = rta::checkFit(useSeg->groups.size(), anim, clipLength, haveLength);
+    _fitOk.store(fit.ok(), std::memory_order_relaxed);
+
+    // Publish for the overlay, which is where these are actually legible.
+    double wt1 = 0.0, wt2 = 0.0;
+    bool wok = true;
+    try {
+      timeLineGetBounds(wt1, wt2);
+    } catch (...) {
+      wok = false;
+    }
+    rta::WarningState w;
+    w.sourceOffset = wok && wt1 < 0.0;
+    w.clipTooShort = !fit.ok();
+    rta::setWarningState(this, w);
+  }
 
 #if RTA_WITH_CUDA
   if (useCuda) {

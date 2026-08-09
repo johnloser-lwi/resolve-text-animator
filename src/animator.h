@@ -116,6 +116,36 @@ int tapCount(const AnimParams& p);
 void transformTaps(Stage stage, int revealRank, double frames, double stageStart,
                    const AnimParams& p, const StageSettings& s, GroupTransform* out);
 
+// Pose with the entrance and exit evaluated together, so they may overlap.
+//
+// Each stage yields a progress in 0..1 where 1 is settled -- the entrance rises
+// to 1, the exit falls back to 0 -- and the group takes whichever is FURTHER
+// from settled. Outside an overlap that is exactly the single-stage result,
+// because the inactive stage sits at 1. Inside one, a word that is still
+// arriving while the exit has begun leaves from wherever it had got to, rather
+// than the exit cutting the entrance off at its own start.
+//
+// Both stages must share a grouping for this: with different group modes the
+// two segmentations have different groups and there is nothing to combine.
+GroupTransform transformCombined(int rankIn, int rankOut, double frames, double inStart,
+                                 double outStart, const StageSettings& in,
+                                 const StageSettings& out, bool enableIn, bool enableOut);
+
+void transformTapsCombined(int rankIn, int rankOut, double frames, double inStart, double outStart,
+                           const AnimParams& p, const StageSettings& in, const StageSettings& out,
+                           GroupTransform* outTaps);
+
+// Whether each stage has room to finish inside `clipLength` frames.
+struct FitReport {
+  bool inFits = true;
+  bool outFits = true;
+  double inNeeds = 0.0;   // frames from the clip start to the entrance settling
+  double outStart = 0.0;  // frame the exit begins on; negative means before the clip
+  bool ok() const { return inFits && outFits; }
+};
+
+FitReport checkFit(size_t groupCount, const AnimParams& p, double clipLength, bool haveLength);
+
 // Derives the exit settings from the entrance when the two are linked.
 //
 // Mirror means the text retreats the way it came: an entrance that rises from

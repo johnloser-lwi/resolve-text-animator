@@ -10,6 +10,7 @@
 #include "clip_time.h"
 #include "curve_widget.h"
 #include "draw_utils.h"
+#include "warning_state.h"
 
 namespace rta {
 namespace {
@@ -60,14 +61,50 @@ class CurveInteract : public OFX::OverlayInteract {
   bool draw(const OFX::DrawArgs& args) override {
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, gDrawContext)) return false;
+
+    // Warnings first, and independently of the curve editor: they are the whole
+    // reason to look at the overlay when something is wrong.
+    drawWarnings(c);
+
+    if (!showCurve(args.time)) return true;
     _curve.layout(c);
     _curve.draw(c);
     return true;
   }
 
+  // Red, large, top-left of the image. Resolve gives a plugin no colour control
+  // in the Inspector, truncates the label and draws a value box beside it -- so
+  // that is a poor place for an alert and this is a good one.
+  void drawWarnings(const OverlayContext& c) {
+    const WarningState w = warningState(_effect);
+    if (!w.any()) return;
+
+    const double x = c.rod.x1 + c.sx(24.0);
+    double y = c.rod.y2 - c.sy(28.0);
+
+    SetColour(c, Colour{1.0f, 0.25f, 0.25f, 1.0f});
+    if (w.clipTooShort) {
+      Text(c, "(!) CLIP TOO SHORT - the animation cannot finish. Make the clip longer.", x, y,
+           kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+      y -= c.sy(22.0);
+    }
+    if (w.sourceOffset) {
+      Text(c, "(!) SOURCE OFFSET - reveal starts late. Lower Start (frames), or work in Fusion.",
+           x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+    }
+  }
+
+  bool showCurve(double time) {
+    try {
+      return _effect->fetchBooleanParam("showCurveEditor")->getValueAtTime(time);
+    } catch (...) {
+      return false;
+    }
+  }
+
   bool penDown(const OFX::PenArgs& args) override {
     OverlayContext c;
-    if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+    if (!build(c, args.time, args.pixelScale, nullptr) || !showCurve(args.time)) return false;
     _curve.layout(c);
     return _curve.penDown(c, args.penPosition);
   }
@@ -75,7 +112,7 @@ class CurveInteract : public OFX::OverlayInteract {
   bool penMotion(const OFX::PenArgs& args) override {
     if (!_curve.dragging()) return false;
     OverlayContext c;
-    if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+    if (!build(c, args.time, args.pixelScale, nullptr) || !showCurve(args.time)) return false;
     _curve.layout(c);
     return _curve.penMotion(c, args.penPosition);
   }
@@ -103,7 +140,6 @@ class CurveInteract : public OFX::OverlayInteract {
              OfxDrawContextHandle ctx) {
     try {
       if (!_effect || !drawSuite()) return false;
-      if (!_effect->fetchBooleanParam("showCurveEditor")->getValueAtTime(time)) return false;
 
       OFX::Clip* src = _effect->fetchClip(kOfxImageEffectSimpleSourceClipName);
       if (!src || !src->isConnected()) return false;

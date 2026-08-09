@@ -219,6 +219,91 @@ GroupTransform transformFor(Stage stage, int revealRank, double frames, double s
   return poseAt(applyEasing(1.0f - raw, s.easing, s.bezier), s);
 }
 
+namespace {
+
+// Progress of one stage: 1 is settled, 0 is fully away. An inactive stage sits
+// at 1 so it never pulls a group off screen.
+float stageProgress(Stage stage, int rank, double frames, double stageStart,
+                    const StageSettings& s, bool enabled) {
+  if (!enabled) return 1.0f;
+
+  const double dur = std::max(1e-6, s.duration);
+  const float raw = float((frames - (stageStart + double(rank) * s.stagger)) / dur);
+
+  if (stage == Stage::In) {
+    if (raw <= 0.0f) return 0.0f;  // not arrived yet
+    if (raw >= 1.0f) return 1.0f;
+    return applyEasing(raw, s.easing, s.bezier);
+  }
+  if (raw <= 0.0f) return 1.0f;  // exit not begun
+  if (raw >= 1.0f) return 0.0f;  // gone
+  return applyEasing(1.0f - raw, s.easing, s.bezier);
+}
+
+}  // namespace
+
+GroupTransform transformCombined(int rankIn, int rankOut, double frames, double inStart,
+                                 double outStart, const StageSettings& in,
+                                 const StageSettings& out, bool enableIn, bool enableOut) {
+  const float eIn = stageProgress(Stage::In, rankIn, frames, inStart, in, enableIn);
+  const float eOut = stageProgress(Stage::Out, rankOut, frames, outStart, out, enableOut);
+
+  // Whichever stage is further from settled owns the group, and brings its own
+  // slide, rotation and blur with it -- so an exit that interrupts an entrance
+  // departs using the exit's settings rather than inheriting the entrance's.
+  const bool outLeads = eOut < eIn;
+  const float e = outLeads ? eOut : eIn;
+  const StageSettings& s = outLeads ? out : in;
+
+  if (e <= 0.0f) {
+    GroupTransform t;  // not arrived, or gone
+    t.visible = false;
+    return t;
+  }
+  if (e >= 1.0f) {
+    GroupTransform t;
+    t.visible = true;
+    t.opacity = 1.0f;
+    t.scale = 1.0f;
+    return t;
+  }
+  return poseAt(e, s);
+}
+
+void transformTapsCombined(int rankIn, int rankOut, double frames, double inStart, double outStart,
+                           const AnimParams& p, const StageSettings& in, const StageSettings& out,
+                           GroupTransform* outTaps) {
+  const int n = tapCount(p);
+  if (n == 1) {
+    outTaps[0] = transformCombined(rankIn, rankOut, frames, inStart, outStart, in, out,
+                                   p.enableIn, p.enableOut);
+    return;
+  }
+  const double span = p.motionBlur ? (p.shutterAngle / 360.0) : 0.0;
+  for (int k = 0; k < n; ++k) {
+    const double f = (double(k) / double(n - 1)) - 0.5;
+    outTaps[k] = transformCombined(rankIn, rankOut, frames + span * f, inStart, outStart, in, out,
+                                   p.enableIn, p.enableOut);
+  }
+}
+
+FitReport checkFit(size_t groupCount, const AnimParams& p, double clipLength, bool haveLength) {
+  FitReport r;
+  r.inNeeds = p.startTime + stageSpan(groupCount, p.in);
+  if (!haveLength || groupCount == 0) return r;
+
+  // The entrance must settle before the clip ends.
+  if (p.enableIn) r.inFits = r.inNeeds <= clipLength;
+
+  // The exit must begin after the clip starts, or its first groups are already
+  // part-gone on the clip's first frame.
+  if (p.enableOut) {
+    r.outStart = clipLength - p.outOffset - stageSpan(groupCount, p.out);
+    r.outFits = r.outStart >= 0.0;
+  }
+  return r;
+}
+
 int tapCount(const AnimParams& p) {
   // Defocus alone still needs multiple taps; only a fully sharp, non-blurred
   // render can get away with one.
