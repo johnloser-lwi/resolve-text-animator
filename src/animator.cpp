@@ -332,6 +332,80 @@ FitReport checkFit(size_t groupCount, const AnimParams& p, double clipLength, bo
   return r;
 }
 
+int adaptiveTapCount(const std::vector<Group>& groups, const std::vector<GroupTransform>& ends,
+                     int maxTaps, double pixelsPerSample) {
+  if (maxTaps <= 1) return 1;
+  if (ends.size() < groups.size() * 2) return maxTaps;  // no measurement: pay full
+
+  const double perSample = std::max(0.25, pixelsPerSample);
+
+  double maxTravel = 0.0;  // pixels a group moves across the shutter
+  double maxBlur = 0.0;    // largest defocus radius, either end
+
+  for (size_t g = 0; g < groups.size(); ++g) {
+    const GroupTransform& a = ends[g * 2];
+    const GroupTransform& b = ends[g * 2 + 1];
+    if (!a.visible && !b.visible) continue;
+
+    maxBlur = std::max({maxBlur, double(a.blur), double(b.blur)});
+
+    // A fade with no movement still varies across the shutter, so opacity has
+    // to count as travel or a cross-fading group would collapse to one tap and
+    // band. Scaled into pixels so it shares the one budget: a full 0->1 fade is
+    // worth as much as crossing the group's own height.
+    //
+    // A tap outside the group's window contributes nothing to the composite, so
+    // it counts as opacity 0 rather than as its default-constructed pose.
+    const RectI& bb = groups[g].bbox;
+    const double opA = a.visible ? double(a.opacity) : 0.0;
+    const double opB = b.visible ? double(b.opacity) : 0.0;
+    maxTravel = std::max(maxTravel, std::fabs(opB - opA) * double(bb.height()));
+
+    // Corner travel needs two real poses. Measuring against a tap that draws
+    // nothing compares against an identity pose that was never on screen, and
+    // reads the group's whole start offset as travel -- which spiked the budget
+    // to 47 taps on the frame a group first appears, for a group that is barely
+    // visible yet.
+    if (!a.visible || !b.visible) continue;
+
+    // Corner travel, which unlike a centre offset also catches a group that
+    // spins or scales without going anywhere.
+    const float cx = 0.5f * float(bb.x1 + bb.x2);
+    const float cy = 0.5f * float(bb.y1 + bb.y2);
+    const float xs[4] = {float(bb.x1), float(bb.x2), float(bb.x1), float(bb.x2)};
+    const float ys[4] = {float(bb.y1), float(bb.y1), float(bb.y2), float(bb.y2)};
+    for (int i = 0; i < 4; ++i) {
+      double px[2], py[2];
+      const GroupTransform* t[2] = {&a, &b};
+      for (int e = 0; e < 2; ++e) {
+        const double c = std::cos(t[e]->rotation) * t[e]->scale;
+        const double s = std::sin(t[e]->rotation) * t[e]->scale;
+        const double dx = xs[i] - cx, dy = ys[i] - cy;
+        px[e] = cx + c * dx - s * dy + t[e]->offsetX;
+        py[e] = cy + s * dx + c * dy + t[e]->offsetY;
+      }
+      maxTravel = std::max(maxTravel, std::hypot(px[1] - px[0], py[1] - py[0]));
+    }
+  }
+
+  // Motion: one tap per `perSample` pixels of travel, so the smear is sampled
+  // at roughly constant density however fast the group is going.
+  int need = int(maxTravel / perSample) + 1;
+
+  // Defocus: the taps tile a disc rather than a line, so the count that holds
+  // the same spacing goes with the AREA. Treating it as linear leaves visible
+  // rings in a large blur.
+  if (maxBlur > 0.0) {
+    const double perAxis = 2.0 * maxBlur / perSample;
+    need = std::max(need, int(perAxis * perAxis * 0.25) + 1);
+    // A disc sampled once is not a blur, it is the image nudged off centre by
+    // the single Vogel offset. Any defocus at all buys at least two taps.
+    need = std::max(need, 2);
+  }
+
+  return std::min(maxTaps, std::max(1, need));
+}
+
 int tapCount(const AnimParams& p) {
   // Defocus alone still needs multiple taps; only a fully sharp, non-blurred
   // render can get away with one.

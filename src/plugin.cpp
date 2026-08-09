@@ -168,6 +168,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _motionBlur = fetchBooleanParam("motionBlur");
     _shutterAngle = fetchDoubleParam("shutterAngle");
     _blurSamples = fetchIntParam("blurSamples");
+    _adaptiveSamples = fetchBooleanParam("adaptiveSamples");
+    _pixelsPerSample = fetchDoubleParam("pixelsPerSample");
+    _startBlurSamples = fetchIntParam("startBlurSamples");
     _distanceUnits = fetchChoiceParam("distanceUnits");
 
     _enableIn = fetchBooleanParam("enableIn");
@@ -311,7 +314,24 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _seenT2 = rawT2;
   }
 
-  void changedParam(const OFX::InstanceChangedArgs&, const std::string&) override {
+  void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
+    // One value, two sliders. The guard matters because setValue dispatches
+    // straight back into changedParam, which would otherwise bounce forever.
+    if (!_syncingSamples && (name == "blurSamples" || name == "startBlurSamples")) {
+      _syncingSamples = true;
+      const bool fromMotion = name == "blurSamples";
+      const int v = fromMotion ? _blurSamples->getValueAtTime(args.time)
+                               : _startBlurSamples->getValueAtTime(args.time);
+      rta::beginEdit(this, "Blur samples");
+      if (fromMotion)
+        _startBlurSamples->setValue(v);
+      else
+        _blurSamples->setValue(v);
+      rta::endEdit(this);
+      _syncingSamples = false;
+      return;
+    }
+
     // Nothing to capture. The clip boundary is already frame 0, so there is no
     // anchor to set -- and the buttons that used to write one are what pinned a
     // -10 into the clip and shifted every animation by the length of the head
@@ -383,11 +403,14 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   OFX::ChoiceParam *_groupMode, *_animation, *_easing, *_order, *_lineOrder, *_distanceUnits;
   OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_blurSamples;
+  OFX::IntParam* _startBlurSamples;
+  bool _syncingSamples = false;
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
   OFX::DoubleParam *_startRotation, *_startBlur, *_shutterAngle;
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity;
-  OFX::BooleanParam *_showDiagnostics, *_motionBlur;
+  OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples;
+  OFX::DoubleParam* _pixelsPerSample;
   OFX::StringParam* _hostWarning;
 
   // Exit stage.
@@ -525,6 +548,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   anim.motionBlur = _motionBlur->getValueAtTime(args.time);
   anim.shutterAngle = _shutterAngle->getValueAtTime(args.time);
   anim.blurSamples = _blurSamples->getValueAtTime(args.time);
+  anim.adaptiveSamples = _adaptiveSamples->getValueAtTime(args.time);
+  anim.pixelsPerSample = _pixelsPerSample->getValueAtTime(args.time);
 
   rta::StageSettings& in = anim.in;
   in.animation = rta::Animation(choiceAt(_animation, args.time, 0, 1));
@@ -786,24 +811,57 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   anim.out.startBlur = rawBlurOut * lengthScale;
 
   const std::vector<int> rank = rta::revealOrder(useSeg->groups, useSeg->lineCount, active);
-  const int taps = rta::tapCount(anim);
-  std::vector<rta::GroupTransform> transforms(useSeg->groups.size() * size_t(taps));
 
-  if (combined && outUsable) {
-    // Both stages share a grouping, so each group can be asked for both and take
-    // whichever is further from settled.
-    rta::StageSettings outActive = anim.out;
-    outActive.slideDistance = rawSlideOut * lengthScale;
-    outActive.startBlur = rawBlurOut * lengthScale;
-    const std::vector<int> rankOut =
-        rta::revealOrder(useSeg->groups, useSeg->lineCount, outActive);
-    for (size_t i = 0; i < useSeg->groups.size(); ++i)
-      rta::transformTapsCombined(rank[i], rankOut[i], frames, anim.startTime, outSeqStart, anim,
-                                 active, outActive, &transforms[i * size_t(taps)]);
+  rta::StageSettings outActive = anim.out;
+  outActive.slideDistance = rawSlideOut * lengthScale;
+  outActive.startBlur = rawBlurOut * lengthScale;
+  const bool useCombined = combined && outUsable;
+  // Both stages share a grouping, so each group can be asked for both and take
+  // whichever is further from settled.
+  const std::vector<int> rankOut =
+      useCombined ? rta::revealOrder(useSeg->groups, useSeg->lineCount, outActive)
+                  : std::vector<int>();
+
+  // Fills `out` with exactly `n` taps per group, through the same evaluator the
+  // real render uses -- the measuring pass must not be a second implementation
+  // that can drift from it.
+  auto buildTaps = [&](int n, std::vector<rta::GroupTransform>& out) {
+    rta::AnimParams q = anim;
+    if (n <= 1) {
+      // tapCount only answers 1 when nothing asks for supersampling.
+      q.motionBlur = false;
+      q.in.startBlur = 0.0;
+      q.out.startBlur = 0.0;
+    } else {
+      q.blurSamples = n;
+    }
+    const int got = rta::tapCount(q);
+    out.assign(useSeg->groups.size() * size_t(got), rta::GroupTransform());
+    for (size_t i = 0; i < useSeg->groups.size(); ++i) {
+      if (useCombined)
+        rta::transformTapsCombined(rank[i], rankOut[i], frames, anim.startTime, outSeqStart, q,
+                                   active, outActive, &out[i * size_t(got)]);
+      else
+        rta::transformTaps(stage, rank[i], frames, stageStart, q, active, &out[i * size_t(got)]);
+    }
+    return got;
+  };
+
+  int taps = rta::tapCount(anim);
+  std::vector<rta::GroupTransform> transforms;
+
+  if (taps > 1 && anim.adaptiveSamples) {
+    // Two taps land exactly on the shutter's ends, which is all the measurement
+    // needs: how far anything travels between them, and how wide the defocus is.
+    std::vector<rta::GroupTransform> ends;
+    buildTaps(2, ends);
+    taps = rta::adaptiveTapCount(useSeg->groups, ends, taps, anim.pixelsPerSample);
+    if (taps == 2)
+      transforms.swap(ends);  // already have them
+    else
+      taps = buildTaps(taps, transforms);
   } else {
-    for (size_t i = 0; i < useSeg->groups.size(); ++i)
-      rta::transformTaps(stage, rank[i], frames, stageStart, anim, active,
-                         &transforms[i * size_t(taps)]);
+    taps = buildTaps(taps, transforms);
   }
 
   // Room check for the indicator, using the group count we just measured.
@@ -837,7 +895,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   }
 #endif
 
-  {
+  if (!transforms.empty()) {
     // What the animator actually produced for the first group. If the composite
     // draws nothing while the diagnostics overlay still appears, this is the
     // only place left that can explain it.
@@ -1199,6 +1257,21 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setDefault(0.0);
     addParam(page, p);
   }
+  {
+    // Mirrors the Samples in the Motion Blur group -- the two blurs share one
+    // tap budget, and having the control only under Motion Blur made it look
+    // like it did not apply to Start Blur at all. Kept in step by changedParam.
+    OFX::IntParamDescriptor* p = desc.defineIntParam("startBlurSamples");
+    p->setLabels("Blur Samples", "Samples", "Start Blur Samples");
+    p->setHint(
+        "Taps used for Start Blur. Shared with Motion Blur > Samples -- they are "
+        "one value shown in both places, because both blurs are drawn in the "
+        "same pass.");
+    p->setRange(2, 64);
+    p->setDisplayRange(2, 32);
+    p->setDefault(8);
+    addParam(page, p);
+  }
 
   // ------------------------------------------------------------ out stage
   {
@@ -1422,6 +1495,29 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setRange(2, 64);
       p->setDisplayRange(2, 32);
       p->setDefault(8);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("adaptiveSamples");
+      p->setLabels("Adaptive Samples", "Adaptive", "Adaptive Samples");
+      p->setHint(
+          "Spend taps in proportion to how much the frame actually smears, so Samples becomes "
+          "an upper bound rather than a fixed cost. A settled title costs one tap however high "
+          "Samples is set.");
+      p->setDefault(true);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("pixelsPerSample");
+      p->setLabels("Sample Density", "Density", "Pixels Per Sample");
+      p->setHint(
+          "Pixels of smear each adaptive tap covers. Lower is smoother and slower. Ignored "
+          "when Adaptive Samples is off.");
+      p->setRange(0.25, 16.0);
+      p->setDisplayRange(0.5, 8.0);
+      p->setDefault(2.0);
       p->setParent(*g);
       addParam(page, p);
     }

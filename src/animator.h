@@ -69,6 +69,12 @@ struct AnimParams {
   bool motionBlur = false;
   double shutterAngle = 180.0;  // degrees of a frame the shutter is open
   int blurSamples = 8;          // taps for motion blur and defocus alike
+
+  // Spend taps in proportion to how much the frame actually smears, instead of
+  // paying the slider's worst case on every frame. blurSamples becomes an upper
+  // bound rather than a fixed cost.
+  bool adaptiveSamples = true;
+  double pixelsPerSample = 2.0;  // larger is cheaper and coarser
 };
 
 struct GroupTransform {
@@ -107,6 +113,24 @@ GroupTransform transformFor(Stage stage, int revealRank, double frames, double s
 // How many transform samples each group needs this frame. 1 unless motion blur
 // or a defocus is in play, in which case the shutter interval is supersampled.
 int tapCount(const AnimParams& p);
+
+// How many taps this frame genuinely needs, given the poses at the two ends of
+// the shutter. `ends` holds exactly 2 transforms per group, group-major, and
+// `maxTaps` is the ceiling from tapCount.
+//
+// Taps here do double duty and the budget must cover BOTH, which is what makes
+// this different from a pure motion-blur plugin:
+//
+//   * motion  -- taps spread across the shutter in TIME, so the need scales
+//                with how far a group travels while the shutter is open;
+//   * defocus -- taps spread across a disc in SPACE at a single instant, so the
+//                need scales with the blur radius and is completely independent
+//                of whether anything moves.
+//
+// Judging by movement alone would collapse a defocus to one tap and delete it,
+// since with motion blur off every tap sits at the same instant by construction.
+int adaptiveTapCount(const std::vector<Group>& groups, const std::vector<GroupTransform>& ends,
+                     int maxTaps, double pixelsPerSample);
 
 // Fills `out` with tapCount(p) transforms spanning the shutter interval.
 //
