@@ -33,7 +33,7 @@ class CurveWidget {
   enum Drag { kNone, kDragP1, kDragP2 };
 
   // Grows the plotted y range so an overshooting curve stays visible instead of
-  // being drawn flat against the panel edge.
+  // being drawn flat against the panel edge. Latched: see the definition.
   void fitRange(const OverlayContext& c);
 
   OfxPointD unitToPanel(double ux, double uy) const;
@@ -43,6 +43,8 @@ class CurveWidget {
   OfxRectD _rect{0, 0, 0, 0};  // whole panel
   OfxRectD _plot{0, 0, 0, 0};  // plotting area inside it
   double _yMin = 0.0, _yMax = 1.0;
+  bool _haveRange = false;      // _yMin/_yMax hold a latched range
+  int _rangeEasing = -1;        // easing the latched range was chosen for
   Drag _drag = kNone;
   bool _editing = false;  // an edit block is open for the current drag
 };

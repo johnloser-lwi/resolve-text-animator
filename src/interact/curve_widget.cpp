@@ -32,8 +32,24 @@ const char* easingName(Easing e) {
 }  // namespace
 
 void CurveWidget::fitRange(const OverlayContext& c) {
-  // A Back Out or a hand-shaped overshoot swings well past 0..1, and a curve
-  // clipped to the panel edge tells you nothing about its shape.
+  // The plotted y range is LATCHED, not refitted every draw.
+  //
+  // Refitting continuously turns a drag into a feedback loop: pulling a handle
+  // up grows the range, growing the range rescales the plot, and the rescale
+  // drags the handle back down under the cursor. The graph appears to fight the
+  // edit, which is exactly the wrong feel for a curve editor.
+  //
+  // Freezing it for the duration of the drag is the whole fix. Between drags
+  // the fit is free to move in BOTH directions -- a range that could only grow
+  // stayed zoomed out after one wild drag, so pulling the handle back to
+  // something sane left the curve stuck in a sliver at the middle of the panel.
+  if (_drag != kNone && _haveRange) return;
+
+  // Changing the easing type is a fresh start; otherwise a range stretched for
+  // Back Out would keep squashing Linear into the middle of the panel forever.
+  const int easing = int(c.anim.in.easing);
+  if (easing != _rangeEasing) _haveRange = false;
+
   double lo = kYMinDefault, hi = kYMaxDefault;
   for (int i = 0; i <= kCurveSegments; ++i) {
     const double y = applyEasing(float(i) / kCurveSegments, c.anim.in.easing, c.anim.in.bezier);
@@ -51,6 +67,8 @@ void CurveWidget::fitRange(const OverlayContext& c) {
   const double margin = 0.12 * std::max(1.0, hi - lo);
   _yMin = std::min(kYMinDefault, lo - margin);
   _yMax = std::max(kYMaxDefault, hi + margin);
+  _rangeEasing = easing;
+  _haveRange = true;
 }
 
 void CurveWidget::layout(const OverlayContext& c) {
