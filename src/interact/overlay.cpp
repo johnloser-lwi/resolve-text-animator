@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "ofxDrawSuite.h"
@@ -54,6 +55,11 @@ class CurveInteract : public OFX::OverlayInteract {
       addParamToSlaveTo(_effect->fetchDoubleParam("easeX2"));
       addParamToSlaveTo(_effect->fetchDoubleParam("easeY2"));
       addParamToSlaveTo(_effect->fetchBooleanParam("showCurveEditor"));
+      // The slant guides have to follow their own controls, or dragging the
+      // angle would leave the lines behind until something else forced a redraw.
+      addParamToSlaveTo(_effect->fetchBooleanParam("showDiagnostics"));
+      addParamToSlaveTo(_effect->fetchBooleanParam("autoSlant"));
+      addParamToSlaveTo(_effect->fetchDoubleParam("italicSlant"));
     } catch (...) {
     }
   }
@@ -65,6 +71,7 @@ class CurveInteract : public OFX::OverlayInteract {
     // Warnings first, and independently of the curve editor: they are the whole
     // reason to look at the overlay when something is wrong.
     drawWarnings(c);
+    drawSlant(c);
 
     if (!showCurve(args.time)) return true;
     _curve.layout(c);
@@ -92,6 +99,56 @@ class CurveInteract : public OFX::OverlayInteract {
       Text(c, "(!) SOURCE OFFSET - reveal starts late. Lower Start (frames), or work in Fusion.",
            x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
     }
+  }
+
+  // The italic angle, drawn as lines you can match against the letters. A number
+  // in the Inspector says nothing about whether it fits the type; a line lying
+  // along the stems says everything, which is the difference between adjusting
+  // the angle and guessing at it.
+  //
+  // Shown with Show Detection, since that is already the detection-tuning mode.
+  void drawSlant(const OverlayContext& c) {
+    bool show = false;
+    try {
+      show = _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(c.time);
+    } catch (...) {
+      return;
+    }
+    if (!show) return;
+
+    const WarningState w = warningState(_effect);
+    const AnalysisState a = analysisState(_effect);
+    if (!a.haveSlant) return;
+
+    bool autoOn = true;
+    try {
+      autoOn = _effect->fetchBooleanParam("autoSlant")->getValueAtTime(c.time);
+    } catch (...) {
+    }
+
+    // Positive degrees lean right, and +y is up in canonical space, so the top
+    // of each guide moves right by height * tan(angle).
+    const double rad = double(a.slantDegrees) * 3.14159265358979323846 / 180.0;
+    const double h = c.rod.y2 - c.rod.y1;
+    const double dx = std::tan(rad) * h;
+
+    SetColour(c, Colour{0.20f, 0.85f, 1.0f, 0.55f});
+    SetLineWidth(c, 1.0f);
+    const int kLines = 9;
+    for (int i = 1; i < kLines; ++i) {
+      const double f = double(i) / double(kLines);
+      const double x = c.rod.x1 + f * (c.rod.x2 - c.rod.x1);
+      Line(c, x - dx * 0.5, c.rod.y1, x + dx * 0.5, c.rod.y2);
+    }
+
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "ITALIC %.1f deg  %s", a.slantDegrees,
+                  autoOn ? "(auto)" : "(manual)");
+    SetColour(c, Colour{0.20f, 0.85f, 1.0f, 1.0f});
+    // Below any warning text, so the two never sit on top of each other.
+    const double y = c.rod.y2 - c.sy(w.any() ? 72.0 : 28.0);
+    Text(c, buf, c.rod.x1 + c.sx(24.0), y,
+         kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
   }
 
   bool showCurve(double time) {

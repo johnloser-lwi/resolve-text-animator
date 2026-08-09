@@ -203,13 +203,18 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _alphaThreshold = fetchDoubleParam("alphaThreshold");
     _minBlobArea = fetchIntParam("minBlobArea");
     _wordGapSensitivity = fetchDoubleParam("wordGapSensitivity");
+    _autoSlant = fetchBooleanParam("autoSlant");
+    _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");
     updateHostWarning();
   }
 
-  ~TextAnimatorPlugin() override { rta::clearWarningState(this); }
+  ~TextAnimatorPlugin() override {
+    rta::clearWarningState(this);
+    rta::clearAnalysisState(this);
+  }
 
   void render(const OFX::RenderArguments& args) override;
 
@@ -332,6 +337,24 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
       return;
     }
 
+    // Ticking Auto Italic copies the measured angle into the manual control, so
+    // the number is visible instead of living only inside the analysis -- and so
+    // that unticking it later leaves a sensible angle to refine by hand rather
+    // than snapping back to zero.
+    //
+    // This happens HERE, on the user's click, and never from render. Changing a
+    // parameter during render is not allowed by OFX, and a render-time write is
+    // exactly what pinned a stale value into a project once already.
+    if (name == "autoSlant" && _autoSlant->getValueAtTime(args.time)) {
+      const rta::AnalysisState a = rta::analysisState(this);
+      if (a.haveSlant) {
+        rta::beginEdit(this, "Detected italic slant");
+        _italicSlant->setValue(a.slantDegrees);
+        rta::endEdit(this);
+      }
+      return;
+    }
+
     // Nothing to capture. The clip boundary is already frame 0, so there is no
     // anchor to set -- and the buttons that used to write one are what pinned a
     // -10 into the clip and shifted every animation by the length of the head
@@ -408,7 +431,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
   OFX::DoubleParam *_startRotation, *_startBlur, *_shutterAngle;
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
-  OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity;
+  OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant;
+  OFX::BooleanParam* _autoSlant;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples;
   OFX::DoubleParam* _pixelsPerSample;
   OFX::StringParam* _hostWarning;
@@ -537,6 +561,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.alphaThreshold = float(_alphaThreshold->getValueAtTime(args.time));
   det.minBlobArea = std::max(1, _minBlobArea->getValueAtTime(args.time));
   det.wordGapSensitivity = float(_wordGapSensitivity->getValueAtTime(args.time));
+  det.autoSlant = _autoSlant->getValueAtTime(args.time);
+  det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
   det.bridgeRadius = std::max(0, _bridgeRadius->getValueAtTime(args.time));
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
@@ -881,6 +907,13 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     w.sourceOffset = wok && wt1 < 0.0;
     w.clipTooShort = !fit.ok();
     rta::setWarningState(this, w);
+
+    // Publish what detection measured, so the overlay can show it and ticking
+    // Auto Italic can hand it to the manual control.
+    rta::AnalysisState a;
+    a.slantDegrees = useSeg->slantDegrees;
+    a.haveSlant = true;
+    rta::setAnalysisState(this, a);
   }
 
 #if RTA_WITH_CUDA
@@ -932,7 +965,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     if (diagnostics) {
       rta::cudaDrawDiagnostics(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
                                dstView.width, dstView.height, useSeg->groups, window, 2,
-                               args.pCudaStream);
+                               useSeg->slantTan, useSeg->height / 2, args.pCudaStream);
     }
     trace.why = "ok-cuda";
     return;
@@ -1555,6 +1588,28 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setRange(0.05, 10.0);
       p->setDisplayRange(0.3, 3.0);
       p->setDefault(1.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("autoSlant");
+      p->setLabels("Auto Italic", "Auto Italic", "Auto Italic Slant");
+      p->setHint(
+          "Measure the italic slant from the image and group letters as if the text were "
+          "upright. Turn off to set the angle by hand.");
+      p->setDefault(true);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("italicSlant");
+      p->setLabels("Italic Slant", "Slant", "Italic Slant");
+      p->setHint(
+          "Degrees the letters lean right. Only used when Auto Italic is off. Letters are "
+          "measured as though standing upright; nothing moves on screen.");
+      p->setRange(-45.0, 45.0);
+      p->setDisplayRange(-30.0, 30.0);
+      p->setDefault(0.0);
       p->setParent(*g);
       addParam(page, p);
     }

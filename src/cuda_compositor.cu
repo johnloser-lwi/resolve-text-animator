@@ -152,24 +152,40 @@ __global__ void dimKernel(float* dst, std::ptrdiff_t dstStride, const float* src
   for (int c = 0; c < 4; ++c) d[c] = fmaxf(d[c], s[c] * factor);
 }
 
-// One thread per pixel of the box's bounding band; writes only on the border.
-__global__ void boxKernel(float* dst, std::ptrdiff_t dstStride, int imgW, int imgH, int bx1,
-                          int by1, int bx2, int by2, int thickness, int colourIndex, int winX1,
-                          int winY1, int winX2, int winY2) {
+// One thread per pixel of the outline's bounding band; writes only on the edge.
+//
+// The sides lean with the type: at row y the group spans
+// [sx1 + shear, sx2 + shear] with shear = (y - yMid) * slantTan. Mirrors the CPU
+// drawDiagnostics exactly -- the two paths must not disagree about where a word
+// was found.
+__global__ void boxKernel(float* dst, std::ptrdiff_t dstStride, int imgW, int imgH, float sx1,
+                          float sx2, float slantTan, int yMid, int by1, int by2, int thickness,
+                          int colourIndex, int pad, int winX1, int winY1, int winX2, int winY2) {
   const int lx = blockIdx.x * blockDim.x + threadIdx.x;
   const int ly = blockIdx.y * blockDim.y + threadIdx.y;
 
-  const int ox1 = bx1 - thickness, oy1 = by1 - thickness;
-  const int w = (bx2 + thickness) - ox1, h = (by2 + thickness) - oy1;
-  if (lx >= w || ly >= h) return;
+  const int oy1 = by1 - thickness;
+  const int h = (by2 + thickness) - oy1;
+  const int y = oy1 + ly;
+  if (ly >= h) return;
 
-  const int x = ox1 + lx, y = oy1 + ly;
+  const float shear = float(y - yMid) * slantTan;
+  const int left = int(sx1 + shear);
+  const int right = int(sx2 + shear);
+
+  const int ox1 = left - thickness - pad;
+  const int w = (right + thickness + pad) - ox1;
+  if (lx >= w) return;
+  const int x = ox1 + lx;
+
   if (x < winX1 || y < winY1 || x >= winX2 || y >= winY2) return;
   if (x < 0 || y < 0 || x >= imgW || y >= imgH) return;
 
-  const bool onBorder = (x < bx1 + thickness - 1) || (x >= bx2 - thickness + 1) ||
-                        (y < by1 + thickness - 1) || (y >= by2 - thickness + 1);
-  if (!onBorder) return;
+  const bool onSide = (x >= left - thickness && x < left) ||
+                      (x >= right - 1 && x < right + thickness);
+  const bool onCap = (y < by1 + thickness - 1) || (y >= by2 - thickness + 1);
+  const bool inSpan = x >= left - thickness && x < right + thickness;
+  if (!(onSide || (onCap && inSpan))) return;
 
   const float* c = kPalette[colourIndex & 7];
   float* p = dst + dstStride * y + std::ptrdiff_t(x) * 4;
@@ -410,7 +426,7 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
 bool cudaDrawDiagnostics(float* dstDev, std::ptrdiff_t dstStride, const float* srcDev,
                          std::ptrdiff_t srcStride, int width, int height,
                          const std::vector<Group>& groups, const RectI& window, int lineWidth,
-                         void* stream) {
+                         float slantTan, int yMid, void* stream) {
   if (!dstDev || !srcDev) return false;
 
   const RectI win = intersect(window, RectI{0, 0, width, height});
@@ -424,12 +440,22 @@ bool cudaDrawDiagnostics(float* dstDev, std::ptrdiff_t dstStride, const float* s
 
   const int t = std::max(1, lineWidth);
   for (size_t gi = 0; gi < groups.size(); ++gi) {
-    const RectI& b = groups[gi].bbox;
-    const int w = b.width() + 2 * t, h = b.height() + 2 * t;
+    const Group& g = groups[gi];
+    const RectI& b = g.bbox;
+    const bool sheared = g.sx2 > g.sx1;
+    const float sx1 = sheared ? g.sx1 : float(b.x1);
+    const float sx2 = sheared ? g.sx2 : float(b.x2);
+    const float tanUsed = sheared ? slantTan : 0.0f;
+
+    const int h = b.height() + 2 * t;
+    // The lean moves the span sideways row by row, so the launch has to be wide
+    // enough for the extremes, not just for the upright box.
+    const int pad = int(std::fabs(tanUsed) * float(h)) + 2;
+    const int w = int(sx2 - sx1) + 2 * t + 2 * pad;
     if (w <= 0 || h <= 0) continue;
-    boxKernel<<<gridFor(w, h, block), block, 0, s>>>(dstDev, dstStride, width, height, b.x1, b.y1,
-                                                     b.x2, b.y2, t, int(gi), win.x1, win.y1,
-                                                     win.x2, win.y2);
+    boxKernel<<<gridFor(w, h, block), block, 0, s>>>(dstDev, dstStride, width, height, sx1, sx2,
+                                                     tanUsed, yMid, b.y1, b.y2, t, int(gi), pad,
+                                                     win.x1, win.y1, win.x2, win.y2);
   }
 
   RTA_CUDA_OK(cudaGetLastError());

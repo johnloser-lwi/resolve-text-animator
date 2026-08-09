@@ -53,4 +53,38 @@ inline void clearWarningState(const void* effect) {
   detail::warnMap().erase(effect);
 }
 
+// What the analysis measured, for the overlay to display and for the Auto
+// Italic toggle to hand to the manual control.
+//
+// Kept separate from WarningState because it is not a warning -- any() must go
+// on meaning "something is wrong", or the red alert text would fire on every
+// clip that merely contains slanted type.
+struct AnalysisState {
+  float slantDegrees = 0.0f;
+  bool haveSlant = false;
+};
+
+namespace detail {
+inline std::map<const void*, AnalysisState>& analysisMap() {
+  static std::map<const void*, AnalysisState> m;
+  return m;
+}
+}  // namespace detail
+
+inline void setAnalysisState(const void* effect, const AnalysisState& s) {
+  std::lock_guard<std::mutex> lock(detail::warnMutex());
+  detail::analysisMap()[effect] = s;
+}
+
+inline AnalysisState analysisState(const void* effect) {
+  std::lock_guard<std::mutex> lock(detail::warnMutex());
+  auto it = detail::analysisMap().find(effect);
+  return it == detail::analysisMap().end() ? AnalysisState{} : it->second;
+}
+
+inline void clearAnalysisState(const void* effect) {
+  std::lock_guard<std::mutex> lock(detail::warnMutex());
+  detail::analysisMap().erase(effect);
+}
+
 }  // namespace rta

@@ -22,10 +22,22 @@ struct DetectParams {
   int bridgeRadius = 0;          // dilate before labeling, to join script fonts
   GroupMode mode = GroupMode::Word;
 
+  // Italic compensation. Letters are measured in a sheared coordinate system,
+  // x' = x - (y * tan(slant)), so an oblique face is grouped as though it were
+  // upright. Only the MEASUREMENT is deskewed -- the pixels are never moved, so
+  // groups still render exactly where the glyphs are.
+  //
+  // Without this an italic 'T' leans over the letter after it, which reads as
+  // heavy x-overlap and chains a whole line into one glyph, and the gaps that
+  // separate words shrink to nothing.
+  bool autoSlant = true;         // measure the slant from the image
+  float italicSlant = 0.0f;      // degrees, used when autoSlant is off
+
   bool operator==(const DetectParams& o) const {
     return alphaThreshold == o.alphaThreshold && minBlobArea == o.minBlobArea &&
            wordGapSensitivity == o.wordGapSensitivity &&
-           bridgeRadius == o.bridgeRadius && mode == o.mode;
+           bridgeRadius == o.bridgeRadius && mode == o.mode &&
+           autoSlant == o.autoSlant && italicSlant == o.italicSlant;
   }
   bool operator!=(const DetectParams& o) const { return !(*this == o); }
 };
@@ -33,6 +45,12 @@ struct DetectParams {
 // One animatable unit: a character, a word, or a whole line depending on mode.
 struct Group {
   RectI bbox;
+  // Deskewed horizontal extent. bbox is the axis-aligned box the compositor
+  // works in; this pair plus Segmentation::slantTan is the PARALLELOGRAM the
+  // group really occupies, which is what the diagnostics overlay draws so an
+  // italic word is outlined by its own shape rather than by a rectangle that
+  // swallows the letters either side of it.
+  float sx1 = 0.0f, sx2 = 0.0f;
   int line = 0;        // 0-based, top to bottom
   int indexInLine = 0; // 0-based, left to right
   std::vector<int> labels;  // component labels belonging to this group
@@ -48,6 +66,11 @@ struct Segmentation {
   std::vector<int> labelToGroup;
   std::vector<Group> groups;
   int lineCount = 0;
+  // Italic slant actually used. Degrees for display; the tangent is what the
+  // geometry needs, and deriving one from the other in two places invites them
+  // to disagree. Shear at row y is (y - height/2) * slantTan.
+  float slantDegrees = 0.0f;
+  float slantTan = 0.0f;
 
   bool empty() const { return groups.empty(); }
 };

@@ -105,6 +105,12 @@ int main(int argc, char** argv) {
       p.wordGapSensitivity = float(std::atof(next()));
     } else if (!std::strcmp(a, "--alpha")) {
       p.alphaThreshold = float(std::atof(next()));
+    } else if (!std::strcmp(a, "--slant")) {
+      p.autoSlant = false;
+      p.italicSlant = float(std::atof(next()));
+    } else if (!std::strcmp(a, "--noslant")) {
+      p.autoSlant = false;
+      p.italicSlant = 0.0f;
     } else if (!std::strcmp(a, "--bridge")) {
       p.bridgeRadius = std::atoi(next());
     } else if (!std::strcmp(a, "--minarea")) {
@@ -178,7 +184,8 @@ int main(int argc, char** argv) {
   rta::ImageView view{buf.data(), w, h, std::ptrdiff_t(w) * 4};
   const rta::Segmentation seg = rta::segment(view, p);
 
-  std::printf("%dx%d  lines=%d  groups=%zu\n", w, h, seg.lineCount, seg.groups.size());
+  std::printf("%dx%d  lines=%d  groups=%zu  slant=%.1fdeg\n", w, h, seg.lineCount,
+              seg.groups.size(), seg.slantDegrees);
   for (size_t i = 0; i < seg.groups.size(); ++i) {
     const rta::Group& g = seg.groups[i];
     std::printf("  [%2zu] line=%d idx=%d  x=%d..%d y=%d..%d  (%dx%d) labels=%zu\n", i, g.line,

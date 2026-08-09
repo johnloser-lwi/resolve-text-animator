@@ -64,15 +64,92 @@ std::vector<uint8_t> dilate(const std::vector<uint8_t>& src, int w, int h, int r
 
 struct Component {
   RectI bbox;
+  // Horizontal extent measured in the deskewed frame. For upright text this is
+  // just bbox.x1/x2; for an italic it is the range the letter would occupy if
+  // it were standing straight, which is what grouping has to reason about.
+  float sx1 = 0.0f, sx2 = 0.0f;
   int area = 0;
   bool alive = false;
 };
 
-// Fraction of the narrower box's width that the two boxes share in x.
-float xOverlapRatio(const RectI& a, const RectI& b) {
-  const int overlap = std::min(a.x2, b.x2) - std::max(a.x1, b.x1);
-  if (overlap <= 0) return 0.0f;
-  return float(overlap) / float(std::max(1, std::min(a.width(), b.width())));
+// Estimates the italic slant of the text, as tan(angle).
+//
+// Sheared by the right amount, the vertical stems of every letter line up into
+// tall narrow columns, so the vertical projection profile becomes as peaky as it
+// can get. Sum of squares measures exactly that peakiness -- it is maximised
+// when the same ink is concentrated into fewer columns -- so the best shear is
+// the one that scores highest. This is the classic deskew, and it needs no
+// knowledge of the typeface.
+float detectSlant(const std::vector<uint8_t>& mask, int w, int h) {
+  // One pass to collect the ink, subsampled: the estimate only needs the
+  // overall distribution, and this keeps the search over candidates cheap.
+  // Rows are subsampled, columns are NOT. Skipping columns quietly rigs the
+  // measurement: with a stride of 2 every sample lands on an even column at zero
+  // shear, so all the ink falls in half the bins and the score doubles, while any
+  // real shear scatters samples across both parities and scores lower. Zero then
+  // wins every time and a 20-degree italic reads as upright.
+  std::vector<int> px, py;
+  px.reserve(size_t(w) * h / 16);
+  for (int y = 0; y < h; y += 3) {
+    const uint8_t* row = &mask[size_t(y) * w];
+    for (int x = 0; x < w; ++x) {
+      if (!row[x]) continue;
+      px.push_back(x);
+      py.push_back(y);
+    }
+  }
+  if (px.size() < 64) return 0.0f;  // too little ink to say anything
+
+  const int yMid = h / 2;
+  std::vector<int> hist(size_t(w) + 1, 0);
+
+  auto score = [&](float t) {
+    std::fill(hist.begin(), hist.end(), 0);
+    for (size_t i = 0; i < px.size(); ++i) {
+      // floor, not truncation: int() rounds toward zero and so biases rows above
+      // the middle differently from rows below, blurring the very peak we want.
+      const int sx = px[i] - int(std::floor(float(py[i] - yMid) * t));
+      if (sx < 0 || sx > w) continue;
+      ++hist[size_t(sx)];
+    }
+    double s = 0.0;
+    for (int c : hist) s += double(c) * double(c);
+    return s;
+  };
+
+  // Coarse sweep. +-0.7 covers roughly +-35 degrees, past any real oblique face.
+  double bestScore = score(0.0f);
+  float bestTan = 0.0f;  // upright unless something clearly beats it
+  for (int step = -35; step <= 35; ++step) {
+    const float t = float(step) * 0.02f;
+    const double s = score(t);
+    // Must beat the incumbent by a margin, so upright text is never nudged off
+    // zero by noise in the profile.
+    if (s > bestScore * 1.002) {
+      bestScore = s;
+      bestTan = t;
+    }
+  }
+
+  // Refine around the winner: the coarse step is about 1.1 degrees, enough to
+  // leave a couple of degrees of error on the estimate.
+  const float coarse = bestTan;
+  for (int step = -4; step <= 4; ++step) {
+    const float t = coarse + float(step) * 0.005f;
+    const double s = score(t);
+    if (s > bestScore) {
+      bestScore = s;
+      bestTan = t;
+    }
+  }
+  return bestTan;
+}
+
+// Fraction of the narrower span that the two spans share in x.
+float xOverlapRatio(float a1, float a2, float b1, float b2) {
+  const float overlap = std::min(a2, b2) - std::max(a1, b1);
+  if (overlap <= 0.0f) return 0.0f;
+  return overlap / std::max(1.0f, std::min(a2 - a1, b2 - b1));
 }
 
 // Fraction of the shorter box's height that the two boxes share in y.
@@ -89,8 +166,9 @@ float yOverlapRatio(const RectI& a, const RectI& b) {
 // glyph. What actually distinguishes a diacritic is that it sits clear above
 // (or below) its base with no vertical overlap, whereas adjacent letters
 // always share most of their vertical extent.
-bool sameGlyph(const RectI& a, const RectI& b) {
-  return xOverlapRatio(a, b) >= 0.6f && yOverlapRatio(a, b) <= 0.2f;
+bool sameGlyph(const Component& a, const Component& b) {
+  return xOverlapRatio(a.sx1, a.sx2, b.sx1, b.sx2) >= 0.6f &&
+         yOverlapRatio(a.bbox, b.bbox) <= 0.2f;
 }
 
 }  // namespace
@@ -180,21 +258,41 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
 
   // 4. Write labels back onto true text pixels only, and gather stats.
   seg.labelImage.assign(size_t(w) * h, 0);
+  // Italic compensation, measured once for the whole image: the slant is a
+  // property of the typeface, so estimating it per line would only add noise.
+  // Sign convention for the outside world: POSITIVE degrees means the letters
+  // lean right, the way a normal italic does. Internally the shear that undoes
+  // that lean is the negative of it, which is what slantTan holds.
+  constexpr float kPi = 3.14159265358979323846f;
+  const float slantTan = params.autoSlant ? detectSlant(mask, w, h)
+                                          : -std::tan(params.italicSlant * kPi / 180.0f);
+  const int yMid = h / 2;
+  seg.slantDegrees = -std::atan(slantTan) * 180.0f / kPi;
+  seg.slantTan = slantTan;
+
   std::vector<Component> comps(size_t(labelCount) + 1);
   for (int y = 0; y < h; ++y) {
+    // Deskewed x of this row. Only the measurement shears; seg.labelImage still
+    // records where the pixels really are, so rendering is untouched.
+    const float shear = float(y - yMid) * slantTan;
     for (int x = 0; x < w; ++x) {
       const size_t p = size_t(y) * w + x;
       if (!mask[p] || prov[p] == 0) continue;
       const int lab = remap[uf.find(prov[p])];
       seg.labelImage[p] = lab;
       Component& c = comps[lab];
+      const float sx = float(x) - shear;
       if (c.area == 0) {
         c.bbox = RectI{x, y, x + 1, y + 1};
+        c.sx1 = sx;
+        c.sx2 = sx + 1.0f;
       } else {
         c.bbox.x1 = std::min(c.bbox.x1, x);
         c.bbox.y1 = std::min(c.bbox.y1, y);
         c.bbox.x2 = std::max(c.bbox.x2, x + 1);
         c.bbox.y2 = std::max(c.bbox.y2, y + 1);
+        c.sx1 = std::min(c.sx1, sx);
+        c.sx2 = std::max(c.sx2, sx + 1.0f);
       }
       ++c.area;
     }
@@ -254,6 +352,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   //    one glyph -- the dot of an i/j, the bars of an =, an umlaut and its base.
   struct Glyph {
     RectI bbox;
+    float sx1 = 0.0f, sx2 = 0.0f;  // deskewed extent, for ordering and gaps
     std::vector<int> labels;
   };
   std::vector<std::vector<Glyph>> lineGlyphs(lineSpans.size());
@@ -265,7 +364,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     for (size_t i = 0; i < ids.size(); ++i) guf.add();
     for (size_t i = 0; i < ids.size(); ++i) {
       for (size_t j = i + 1; j < ids.size(); ++j) {
-        if (sameGlyph(comps[ids[i]].bbox, comps[ids[j]].bbox)) guf.unite(int(i), int(j));
+        if (sameGlyph(comps[ids[i]], comps[ids[j]])) guf.unite(int(i), int(j));
       }
     }
     std::vector<int> rootToGlyph(ids.size(), -1);
@@ -274,22 +373,23 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       const int root = guf.find(int(i));
       if (rootToGlyph[root] < 0) {
         rootToGlyph[root] = int(glyphs.size());
-        glyphs.push_back(Glyph{comps[ids[i]].bbox, {}});
+        glyphs.push_back(Glyph{comps[ids[i]].bbox, comps[ids[i]].sx1, comps[ids[i]].sx2, {}});
       }
       Glyph& g = glyphs[rootToGlyph[root]];
       g.bbox.unionWith(comps[ids[i]].bbox);
+      g.sx1 = std::min(g.sx1, comps[ids[i]].sx1);
+      g.sx2 = std::max(g.sx2, comps[ids[i]].sx2);
       g.labels.push_back(ids[i]);
     }
     std::sort(glyphs.begin(), glyphs.end(),
-              [](const Glyph& a, const Glyph& b) { return a.bbox.x1 < b.bbox.x1; });
+              [](const Glyph& a, const Glyph& b) { return a.sx1 < b.sx1; });
   }
 
-  // 8. Word breaks from gap statistics. The median gap adapts to the font's
-  //    tracking; the line-height floor keeps tightly-set text from shattering.
+  // 8. Word breaks from gap statistics.
   std::vector<int> allGaps;
   for (const auto& glyphs : lineGlyphs) {
     for (size_t i = 1; i < glyphs.size(); ++i)
-      allGaps.push_back(std::max(0, glyphs[i].bbox.x1 - glyphs[i - 1].bbox.x2));
+      allGaps.push_back(int(std::max(0.0f, glyphs[i].sx1 - glyphs[i - 1].sx2)));
   }
   float medianGap = 0.0f;
   if (!allGaps.empty()) {

@@ -108,7 +108,7 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStrideFloats, const fl
 bool cudaDrawDiagnostics(float* dstDev, std::ptrdiff_t dstStrideFloats, const float* srcDev,
                          std::ptrdiff_t srcStrideFloats, int width, int height,
                          const std::vector<Group>& groups, const RectI& window, int lineWidth,
-                         void* stream);
+                         float slantTan, int yMid, void* stream);
 
 #endif  // RTA_WITH_CUDA
 
