@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "tiny_font.h"
+
 namespace rta {
 namespace {
 
@@ -59,6 +61,31 @@ void drawDiagnostics(const ImageView& dst, const Segmentation& seg, int lineWidt
         const int right = sheared ? int(g.sx2 + shear) : b.x2;
         for (int x = left - k; x < right + k; ++x) plot(dst, x, y, c);
       }
+    }
+
+    // The CHARACTER index this unit starts at -- the number the overrides speak.
+    // Numbering units instead renumbers them after every merge, so the next
+    // correction could not be expressed; character indices never move.
+    const int label = g.glyphIndex;
+    const int scale = std::max(2, b.height() / 14);
+    const int gw = digitsWidth(label, scale), gh = 5 * scale;
+    const float shearTop = sheared ? float(b.y1 - yMid) * seg.slantTan : 0.0f;
+    const int ox = (sheared ? int(g.sx1 + shearTop) : b.x1) + scale;
+    const int oy = b.y1 - gh - 2 * scale;
+
+    const float black[3] = {0.0f, 0.0f, 0.0f};
+    for (int y = oy - scale; y < oy + gh + scale; ++y)
+      for (int x = ox - scale; x < ox + gw + scale; ++x) plot(dst, x, y, black);
+
+    int value = label, digits = 1;
+    for (int v = value; v >= 10; v /= 10) ++digits;
+    for (int d = digits - 1; d >= 0; --d) {
+      const int digit = value % 10;
+      value /= 10;
+      const int dx = ox + d * (4 * scale);
+      for (int row = 0; row < gh; ++row)
+        for (int col = 0; col < 3 * scale; ++col)
+          if (digitPixel(digit, col, row, scale)) plot(dst, dx + col, oy + row, c);
     }
   }
 }

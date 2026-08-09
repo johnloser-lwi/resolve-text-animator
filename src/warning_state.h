@@ -13,6 +13,7 @@
 
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace rta {
 
@@ -59,9 +60,28 @@ inline void clearWarningState(const void* effect) {
 // Kept separate from WarningState because it is not a warning -- any() must go
 // on meaning "something is wrong", or the red alert text would fire on every
 // clip that merely contains slanted type.
+// One detected unit, as the viewer needs to see it.
+//
+// Positions are IMAGE PIXELS, top-down, alongside the image size they were
+// measured at. The overlay works in canonical coordinates with y up, so it
+// rescales these against the region of definition -- which keeps the mapping
+// correct at any render scale without the overlay having to know what that
+// scale is.
+struct DetectedUnit {
+  int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+  // Character index this unit starts at, and the index of each of its letters.
+  // Overrides are addressed by character, so these are what the viewer writes.
+  int glyphIndex = 0;
+  std::vector<int> glyphStarts;   // left edge of each letter, image pixels
+  std::vector<int> glyphIndices;  // character index of each letter
+};
+
 struct AnalysisState {
   float slantDegrees = 0.0f;
   bool haveSlant = false;
+
+  int width = 0, height = 0;  // image the units were measured in
+  std::vector<DetectedUnit> units;
 };
 
 namespace detail {

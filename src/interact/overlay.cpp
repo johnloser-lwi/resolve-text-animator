@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "ofxDrawSuite.h"
 #include "ofxsInteract.h"
@@ -11,6 +12,7 @@
 #include "clip_time.h"
 #include "curve_widget.h"
 #include "draw_utils.h"
+#include "edit_block.h"
 #include "warning_state.h"
 
 namespace rta {
@@ -159,11 +161,133 @@ class CurveInteract : public OFX::OverlayInteract {
     }
   }
 
+  // --- direct editing of the grouping -------------------------------------
+  //
+  // Drag across two or more units to join them; hold Alt and click inside one to
+  // cut it at the nearest letter. Both write the same Merge/Split lists the
+  // Inspector shows, so the two ways of working stay interchangeable and an edit
+  // made here can be read, corrected or cleared by hand.
+  //
+  // Only active with Show Detection on, which is when the numbers are visible
+  // and the user is thinking about grouping rather than animation.
+
+  // Unit under a canonical point, or -1.
+  int unitAt(const OverlayContext& c, const AnalysisState& a, const OfxPointD& p) const {
+    if (a.width <= 0 || a.height <= 0) return -1;
+    const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
+    if (w <= 0.0 || h <= 0.0) return -1;
+    for (size_t i = 0; i < a.units.size(); ++i) {
+      const DetectedUnit& u = a.units[i];
+      const double x1 = c.rod.x1 + double(u.x1) / a.width * w;
+      const double x2 = c.rod.x1 + double(u.x2) / a.width * w;
+      // Image y runs down, canonical y runs up.
+      const double y1 = c.rod.y2 - double(u.y2) / a.height * h;
+      const double y2 = c.rod.y2 - double(u.y1) / a.height * h;
+      if (p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2) return int(i);
+    }
+    return -1;
+  }
+
+  void appendParam(const OverlayContext& c, const char* name, const std::string& add,
+                   const char* label) {
+    try {
+      OFX::StringParam* sp = c.effect->fetchStringParam(name);
+      std::string cur;
+      sp->getValue(cur);
+      const bool empty = cur.find_first_not_of(" \t") == std::string::npos;
+      beginEdit(c.effect, label);
+      sp->setValue(empty ? add : cur + ", " + add);
+      endEdit(c.effect);
+    } catch (...) {
+    }
+  }
+
+  bool editGrouping(const OverlayContext& c, const OfxPointD& p, bool alt, bool down) {
+    const AnalysisState a = analysisState(_effect);
+    if (a.units.empty()) return false;
+
+    const int hit = unitAt(c, a, p);
+    if (down) {
+      _dragUnit = hit;
+      if (hit < 0) return false;
+
+      if (alt) {
+        // Split at the letter boundary nearest the click. The cut is expressed
+        // against the ORIGINAL unit that owns that letter, and its offset within
+        // it -- a merged unit spans several originals, so its own letter count
+        // would name the wrong place.
+        const DetectedUnit& u = a.units[size_t(hit)];
+        if (u.glyphStarts.size() < 2) return true;  // nothing to cut
+        const double w = c.rod.x2 - c.rod.x1;
+        const double px = (p.x - c.rod.x1) / w * a.width;
+        size_t best = 1;
+        double bestD = 1e30;
+        for (size_t j = 1; j < u.glyphStarts.size(); ++j) {
+          const double d = std::fabs(double(u.glyphStarts[j]) - px);
+          if (d < bestD) {
+            bestD = d;
+            best = j;
+          }
+        }
+        if (best < u.glyphIndices.size()) {
+          char buf[32];
+          std::snprintf(buf, sizeof(buf), "%d", u.glyphIndices[best]);
+          appendParam(c, "splitBefore", buf, "Split unit");
+        }
+        _dragUnit = -1;
+      }
+      return true;
+    }
+
+    // Pen up: a drag that started on one unit and ended on another merges the
+    // whole run between them.
+    const int from = _dragUnit;
+    _dragUnit = -1;
+    if (from < 0 || hit < 0 || hit == from) return from >= 0;
+
+    // Joining a run of units means removing the boundary that starts each one
+    // after the first. Those are character indices, which do not move when the
+    // merge is applied -- so a second drag on the same line still works.
+    const int lo = std::min(from, hit), hi = std::max(from, hit);
+    std::string list;
+    for (int i = lo + 1; i <= hi; ++i) {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%d", a.units[size_t(i)].glyphIndex);
+      if (!list.empty()) list += ", ";
+      list += buf;
+    }
+    if (!list.empty()) appendParam(c, "mergeAt", list, "Merge units");
+    return true;
+  }
+
+  bool groupingMode(double time) {
+    try {
+      return _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(time);
+    } catch (...) {
+      return false;
+    }
+  }
+
   bool penDown(const OFX::PenArgs& args) override {
     OverlayContext c;
-    if (!build(c, args.time, args.pixelScale, nullptr) || !showCurve(args.time)) return false;
+    if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+    if (groupingMode(args.time)) {
+      // Alt is not carried on PenArgs, so it is tracked from key events.
+      if (editGrouping(c, args.penPosition, _altDown, /*down*/ true)) return true;
+    }
+    if (!showCurve(args.time)) return false;
     _curve.layout(c);
     return _curve.penDown(c, args.penPosition);
+  }
+
+  bool keyDown(const OFX::KeyArgs& args) override {
+    if (args.keySymbol == kOfxKey_Alt_L || args.keySymbol == kOfxKey_Alt_R) _altDown = true;
+    return false;
+  }
+
+  bool keyUp(const OFX::KeyArgs& args) override {
+    if (args.keySymbol == kOfxKey_Alt_L || args.keySymbol == kOfxKey_Alt_R) _altDown = false;
+    return false;
   }
 
   bool penMotion(const OFX::PenArgs& args) override {
@@ -177,6 +301,9 @@ class CurveInteract : public OFX::OverlayInteract {
   bool penUp(const OFX::PenArgs& args) override {
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+    if (_dragUnit >= 0 && groupingMode(args.time)) {
+      if (editGrouping(c, args.penPosition, _altDown, /*down*/ false)) return true;
+    }
     return _curve.penUp(c, args.penPosition);
   }
 
@@ -237,6 +364,8 @@ class CurveInteract : public OFX::OverlayInteract {
 
   OFX::ImageEffect* _effect = nullptr;
   CurveWidget _curve;
+  int _dragUnit = -1;   // unit a merge drag started on
+  bool _altDown = false;
 };
 
 // Wraps the Support library's interact entry so the draw context, which only

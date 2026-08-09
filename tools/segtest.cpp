@@ -49,9 +49,9 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
   // is needed to see it; in the plugin it is anchored to the clip's end.
   const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
   const double stageStart = stage == rta::Stage::Out ? 0.0 : anim.startTime;
-  const double total = stageStart + rta::stageSpan(seg.groups.size(), s);
-
   const std::vector<int> rank = rta::revealOrder(seg.groups, seg.lineCount, s);
+  const std::vector<double> delays = rta::revealDelays(seg.groups, rank, s);
+  const double total = stageStart + rta::stageSpan(rta::maxDelay(delays), s);
   const int taps = rta::tapCount(anim);
   for (int i = 0; i < count; ++i) {
     const double t = step > 0.0 ? stageStart + double(i) * step
@@ -59,7 +59,7 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
                    : total * double(i) / double(std::max(1, count - 1));
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
-      rta::transformTaps(stage, rank[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
+      rta::transformTaps(stage, delays[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
     rta::compositeGroups(fv, src, seg, xf, taps, rta::RectI{0, 0, src.width, src.height});
 
     for (int y = 0; y < th; ++y) {
@@ -111,12 +111,31 @@ int main(int argc, char** argv) {
     } else if (!std::strcmp(a, "--noslant")) {
       p.autoSlant = false;
       p.italicSlant = 0.0f;
+    } else if (!std::strcmp(a, "--merge") || !std::strcmp(a, "--split")) {
+      // Character indices, comma separated.
+      std::vector<int>& dst = (a[2] == 'm') ? p.mergeAt : p.splitBefore;
+      const char* list = next();
+      int v = 0;
+      bool has = false;
+      for (const char* c = list;; ++c) {
+        if (*c >= '0' && *c <= '9') {
+          v = v * 10 + (*c - '0');
+          has = true;
+        } else {
+          if (has) dst.push_back(v);
+          v = 0;
+          has = false;
+          if (!*c) break;
+        }
+      }
     } else if (!std::strcmp(a, "--bridge")) {
       p.bridgeRadius = std::atoi(next());
     } else if (!std::strcmp(a, "--minarea")) {
       p.minBlobArea = std::atoi(next());
     } else if (!std::strcmp(a, "--strip")) {
       strip = std::atoi(next());
+    } else if (!std::strcmp(a, "--bylength")) {
+      anim.in.staggerByLength = true;
     } else if (!std::strcmp(a, "--stagger")) {
       anim.in.stagger = std::atof(next());
     } else if (!std::strcmp(a, "--dur")) {
@@ -206,7 +225,7 @@ int main(int argc, char** argv) {
     const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
     std::printf("strip: %d samples of the %s stage over %.1f frames\n", strip,
                 stage == rta::Stage::Out ? "OUT" : "IN",
-                rta::stageSpan(seg.groups.size(), s));
+                rta::stageSpan(rta::maxDelay(rta::revealDelays(seg.groups, rta::revealOrder(seg.groups, seg.lineCount, s), s)), s));
   } else {
     rta::drawDiagnostics(view, seg, 2);
   }

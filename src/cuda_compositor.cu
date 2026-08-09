@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "tiny_font.h"
 #include "transform_geom.h"
 
 namespace rta {
@@ -192,6 +193,47 @@ __global__ void boxKernel(float* dst, std::ptrdiff_t dstStride, int imgW, int im
   p[0] = c[0];
   p[1] = c[1];
   p[2] = c[2];
+  p[3] = 1.0f;
+}
+
+// Stamps a group's index above its box, matching the CPU diagnostics. Both paths
+// must number the groups identically -- the numbers are what a manual merge or
+// split names, so a disagreement would silently retarget an override.
+__global__ void indexKernel(float* dst, std::ptrdiff_t dstStride, int imgW, int imgH, int ox,
+                            int oy, int value, int digits, int scale, int colourIndex, int winX1,
+                            int winY1, int winX2, int winY2) {
+  const int lx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ly = blockIdx.y * blockDim.y + threadIdx.y;
+
+  const int gw = digits * (4 * scale) - scale, gh = 5 * scale;
+  if (lx >= gw + 2 * scale || ly >= gh + 2 * scale) return;
+
+  const int x = ox - scale + lx, y = oy - scale + ly;
+  if (x < winX1 || y < winY1 || x >= winX2 || y >= winY2) return;
+  if (x < 0 || y < 0 || x >= imgW || y >= imgH) return;
+
+  // Dark plate first: a bare digit over white type is invisible.
+  float r = 0.0f, g = 0.0f, b = 0.0f;
+
+  const int cx = lx - scale, cy = ly - scale;
+  if (cx >= 0 && cy >= 0 && cy < gh) {
+    const int cell = cx / (4 * scale);
+    const int inCell = cx - cell * (4 * scale);
+    if (cell < digits && inCell < 3 * scale) {
+      int v = value;
+      for (int k = digits - 1; k > cell; --k) v /= 10;
+      if (digitPixel(v % 10, inCell, cy, scale)) {
+        r = kPalette[colourIndex & 7][0];
+        g = kPalette[colourIndex & 7][1];
+        b = kPalette[colourIndex & 7][2];
+      }
+    }
+  }
+
+  float* p = dst + dstStride * y + std::ptrdiff_t(x) * 4;
+  p[0] = r;
+  p[1] = g;
+  p[2] = b;
   p[3] = 1.0f;
 }
 
@@ -456,6 +498,20 @@ bool cudaDrawDiagnostics(float* dstDev, std::ptrdiff_t dstStride, const float* s
     boxKernel<<<gridFor(w, h, block), block, 0, s>>>(dstDev, dstStride, width, height, sx1, sx2,
                                                      tanUsed, yMid, b.y1, b.y2, t, int(gi), pad,
                                                      win.x1, win.y1, win.x2, win.y2);
+
+    // The character index this unit starts at, matching the CPU path exactly:
+    // the number is what a manual override names.
+    const int label = g.glyphIndex;
+    const int scale = std::max(2, b.height() / 14);
+    int digits = 1;
+    for (int v = label; v >= 10; v /= 10) ++digits;
+    const float shearTop = tanUsed * float(b.y1 - yMid);
+    const int ox = int(sx1 + shearTop) + scale;
+    const int oy = b.y1 - 5 * scale - 2 * scale;
+    const int lw = digits * (4 * scale) - scale + 2 * scale, lh = 5 * scale + 2 * scale;
+    indexKernel<<<gridFor(lw, lh, block), block, 0, s>>>(dstDev, dstStride, width, height, ox, oy,
+                                                         label, digits, scale, int(gi), win.x1,
+                                                         win.y1, win.x2, win.y2);
   }
 
   RTA_CUDA_OK(cudaGetLastError());

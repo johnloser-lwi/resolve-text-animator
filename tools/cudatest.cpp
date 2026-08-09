@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
   }
 
   const std::vector<int> rank = rta::revealOrder(seg.groups, seg.lineCount, anim.in);
+  const std::vector<double> delays = rta::revealDelays(seg.groups, rank, anim.in);
   const int taps = rta::tapCount(anim);
   const rta::RectI window{0, 0, w, h};
 
@@ -103,7 +104,7 @@ int main(int argc, char** argv) {
     const double t = f;
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
-      rta::transformTaps(rta::Stage::In, rank[g], t, anim.startTime, anim, anim.in,
+      rta::transformTaps(rta::Stage::In, delays[g], t, anim.startTime, anim, anim.in,
                          &xf[g * size_t(taps)]);
 
     rta::compositeGroups(cpuView, srcView, seg, xf, taps, window);

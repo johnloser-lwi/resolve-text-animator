@@ -168,9 +168,42 @@ GroupTransform poseAt(float e, const StageSettings& p) {
 
 }  // namespace
 
-double stageSpan(size_t groupCount, const StageSettings& s) {
-  if (groupCount == 0) return 0.0;
-  return double(groupCount - 1) * s.stagger + s.duration;
+std::vector<double> revealDelays(const std::vector<Group>& groups, const std::vector<int>& rank,
+                                 const StageSettings& s) {
+  const size_t n = groups.size();
+  std::vector<double> delays(n, 0.0);
+  if (n == 0 || rank.size() != n) return delays;
+
+  if (!s.staggerByLength) {
+    for (size_t i = 0; i < n; ++i) delays[i] = double(rank[i]);
+    return delays;
+  }
+
+  // Walk the reveal order and accumulate characters. Each group waits for all
+  // the text before it, so a long word pushes everything after it back by its
+  // own length rather than by a single step.
+  std::vector<size_t> byRank(n);
+  for (size_t i = 0; i < n; ++i) {
+    const int r = rank[i];
+    if (r >= 0 && size_t(r) < n) byRank[size_t(r)] = i;
+  }
+  double acc = 0.0;
+  for (size_t r = 0; r < n; ++r) {
+    const size_t gi = byRank[r];
+    delays[gi] = acc;
+    acc += double(std::max(1, groups[gi].glyphCount));
+  }
+  return delays;
+}
+
+double maxDelay(const std::vector<double>& delays) {
+  double m = 0.0;
+  for (double d : delays) m = std::max(m, d);
+  return m;
+}
+
+double stageSpan(double maxDelayUnits, const StageSettings& s) {
+  return std::max(0.0, maxDelayUnits) * s.stagger + s.duration;
 }
 
 StageSettings mirrorStage(const StageSettings& in, bool mirror) {
@@ -184,12 +217,12 @@ StageSettings mirrorStage(const StageSettings& in, bool mirror) {
   return out;
 }
 
-GroupTransform transformFor(Stage stage, int revealRank, double frames, double stageStart,
+GroupTransform transformFor(Stage stage, double delayUnits, double frames, double stageStart,
                             const StageSettings& s) {
   if (stage == Stage::Settled) return settledPose();
 
   const double dur = std::max(1e-6, s.duration);
-  const double t0 = stageStart + double(revealRank) * s.stagger;
+  const double t0 = stageStart + delayUnits * s.stagger;
 
   // No fudge here. A group's start frame is progress 0 -- opacity 0, fully
   // offset -- and the fade climbs from there. Nudging it so the first frame
@@ -234,13 +267,13 @@ struct StageEval {
   bool animating = false;  // inside its own window right now
 };
 
-StageEval stageEval(Stage stage, int rank, double frames, double stageStart,
+StageEval stageEval(Stage stage, double delayUnits, double frames, double stageStart,
                     const StageSettings& s, bool enabled) {
   StageEval r;
   if (!enabled) return r;
 
   const double dur = std::max(1e-6, s.duration);
-  const float raw = float((frames - (stageStart + double(rank) * s.stagger)) / dur);
+  const float raw = float((frames - (stageStart + delayUnits * s.stagger)) / dur);
 
   if (stage == Stage::In) {
     if (raw <= 0.0f) {
@@ -267,11 +300,11 @@ StageEval stageEval(Stage stage, int rank, double frames, double stageStart,
 
 }  // namespace
 
-GroupTransform transformCombined(int rankIn, int rankOut, double frames, double inStart,
+GroupTransform transformCombined(double delayIn, double delayOut, double frames, double inStart,
                                  double outStart, const StageSettings& in,
                                  const StageSettings& out, bool enableIn, bool enableOut) {
-  const StageEval a = stageEval(Stage::In, rankIn, frames, inStart, in, enableIn);
-  const StageEval b = stageEval(Stage::Out, rankOut, frames, outStart, out, enableOut);
+  const StageEval a = stageEval(Stage::In, delayIn, frames, inStart, in, enableIn);
+  const StageEval b = stageEval(Stage::Out, delayOut, frames, outStart, out, enableOut);
 
   // Drawn or not is decided by the windows, so an overshooting curve keeps its
   // overshoot instead of being flattened to the resting pose.
@@ -298,27 +331,28 @@ GroupTransform transformCombined(int rankIn, int rankOut, double frames, double 
   return poseAt(outLeads ? b.e : a.e, outLeads ? out : in);
 }
 
-void transformTapsCombined(int rankIn, int rankOut, double frames, double inStart, double outStart,
-                           const AnimParams& p, const StageSettings& in, const StageSettings& out,
-                           GroupTransform* outTaps) {
+void transformTapsCombined(double delayIn, double delayOut, double frames, double inStart,
+                           double outStart, const AnimParams& p, const StageSettings& in,
+                           const StageSettings& out, GroupTransform* outTaps) {
   const int n = tapCount(p);
   if (n == 1) {
-    outTaps[0] = transformCombined(rankIn, rankOut, frames, inStart, outStart, in, out,
+    outTaps[0] = transformCombined(delayIn, delayOut, frames, inStart, outStart, in, out,
                                    p.enableIn, p.enableOut);
     return;
   }
   const double span = p.motionBlur ? (p.shutterAngle / 360.0) : 0.0;
   for (int k = 0; k < n; ++k) {
     const double f = (double(k) / double(n - 1)) - 0.5;
-    outTaps[k] = transformCombined(rankIn, rankOut, frames + span * f, inStart, outStart, in, out,
+    outTaps[k] = transformCombined(delayIn, delayOut, frames + span * f, inStart, outStart, in, out,
                                    p.enableIn, p.enableOut);
   }
 }
 
-FitReport checkFit(size_t groupCount, const AnimParams& p, double clipLength, bool haveLength) {
+FitReport checkFit(double maxDelayIn, double maxDelayOut, const AnimParams& p, double clipLength,
+                   bool haveLength) {
   FitReport r;
-  r.inNeeds = p.startTime + stageSpan(groupCount, p.in);
-  if (!haveLength || groupCount == 0) return r;
+  r.inNeeds = p.startTime + stageSpan(maxDelayIn, p.in);
+  if (!haveLength) return r;
 
   // The entrance must settle before the clip ends.
   if (p.enableIn) r.inFits = r.inNeeds <= clipLength;
@@ -326,7 +360,7 @@ FitReport checkFit(size_t groupCount, const AnimParams& p, double clipLength, bo
   // The exit must begin after the clip starts, or its first groups are already
   // part-gone on the clip's first frame.
   if (p.enableOut) {
-    r.outStart = clipLength - p.outOffset - stageSpan(groupCount, p.out);
+    r.outStart = clipLength - p.outOffset - stageSpan(maxDelayOut, p.out);
     r.outFits = r.outStart >= 0.0;
   }
   return r;
@@ -414,11 +448,11 @@ int tapCount(const AnimParams& p) {
   return std::min(64, std::max(2, p.blurSamples));
 }
 
-void transformTaps(Stage stage, int revealRank, double frames, double stageStart,
+void transformTaps(Stage stage, double delayUnits, double frames, double stageStart,
                    const AnimParams& p, const StageSettings& s, GroupTransform* out) {
   const int n = tapCount(p);
   if (n == 1) {
-    out[0] = transformFor(stage, revealRank, frames, stageStart, s);
+    out[0] = transformFor(stage, delayUnits, frames, stageStart, s);
     return;
   }
 
@@ -428,7 +462,7 @@ void transformTaps(Stage stage, int revealRank, double frames, double stageStart
   const double span = p.motionBlur ? (p.shutterAngle / 360.0) : 0.0;
   for (int k = 0; k < n; ++k) {
     const double f = (double(k) / double(n - 1)) - 0.5;
-    out[k] = transformFor(stage, revealRank, frames + span * f, stageStart, s);
+    out[k] = transformFor(stage, delayUnits, frames + span * f, stageStart, s);
   }
 }
 
@@ -442,9 +476,8 @@ void discOffset(int tap, int taps, float* dx, float* dy) {
   *dy = r * std::sin(a);
 }
 
-double totalDuration(size_t groupCount, const AnimParams& p) {
-  if (groupCount == 0) return 0.0;
-  return p.startTime + stageSpan(groupCount, p.in);
+double totalDuration(double maxDelayUnits, const AnimParams& p) {
+  return p.startTime + stageSpan(maxDelayUnits, p.in);
 }
 
 }  // namespace rta

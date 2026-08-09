@@ -160,6 +160,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _startTime = fetchDoubleParam("startTime");
     _duration = fetchDoubleParam("duration");
     _stagger = fetchDoubleParam("stagger");
+    _staggerByLength = fetchBooleanParam("staggerByLength");
     _slideDistance = fetchDoubleParam("slideDistance");
     _slideAngle = fetchDoubleParam("slideAngle");
     _startScale = fetchDoubleParam("startScale");
@@ -204,6 +205,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _minBlobArea = fetchIntParam("minBlobArea");
     _wordGapSensitivity = fetchDoubleParam("wordGapSensitivity");
     _autoSlant = fetchBooleanParam("autoSlant");
+    _mergeAt = fetchStringParam("mergeAt");
+    _splitBefore = fetchStringParam("splitBefore");
     _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
@@ -433,7 +436,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant;
   OFX::BooleanParam* _autoSlant;
-  OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples;
+  OFX::StringParam *_mergeAt, *_splitBefore;
+  OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
   OFX::StringParam* _hostWarning;
 
@@ -563,6 +567,32 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.wordGapSensitivity = float(_wordGapSensitivity->getValueAtTime(args.time));
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
+  {
+    // Both lists are plain integers; anything that is not a digit separates, so
+    // commas, spaces and a half-typed entry all behave.
+    auto parse = [](const std::string& in, std::vector<int>& out) {
+      int v = 0;
+      bool has = false;
+      for (size_t i = 0; i <= in.size(); ++i) {
+        const char c = i < in.size() ? in[i] : ',';
+        if (c >= '0' && c <= '9') {
+          v = v * 10 + (c - '0');
+          has = true;
+        } else {
+          if (has) out.push_back(v);
+          v = 0;
+          has = false;
+        }
+      }
+    };
+    std::string m, sp;
+    _mergeAt->getValueAtTime(args.time, m);
+    _splitBefore->getValueAtTime(args.time, sp);
+    parse(m, det.mergeAt);
+    parse(sp, det.splitBefore);
+  }
+  det.autoSlant = _autoSlant->getValueAtTime(args.time);
+  det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
   det.bridgeRadius = std::max(0, _bridgeRadius->getValueAtTime(args.time));
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
@@ -589,6 +619,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   in.randomSeed = _randomSeed->getValueAtTime(args.time);
   in.duration = _duration->getValueAtTime(args.time);
   in.stagger = _stagger->getValueAtTime(args.time);
+  in.staggerByLength = _staggerByLength->getValueAtTime(args.time);
   in.slideAngle = _slideAngle->getValueAtTime(args.time);
   in.startScale = _startScale->getValueAtTime(args.time);
   in.startRotation = _startRotation->getValueAtTime(args.time);
@@ -619,6 +650,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     o.randomSeed = _outRandomSeed->getValueAtTime(args.time);
     o.duration = _outDuration->getValueAtTime(args.time);
     o.stagger = _outStagger->getValueAtTime(args.time);
+    o.staggerByLength = in.staggerByLength;  // one switch governs both stages
     o.slideAngle = _outSlideAngle->getValueAtTime(args.time);
     o.startScale = _outStartScale->getValueAtTime(args.time);
     o.startRotation = _outStartRotation->getValueAtTime(args.time);
@@ -778,7 +810,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   double outSeqStart = 0.0;
   bool outUsable = false;
   if (anim.enableOut && haveLength && segOut && !segOut->empty()) {
-    outSeqStart = clipLength - anim.outOffset - rta::stageSpan(segOut->groups.size(), anim.out);
+    {
+      const std::vector<int> rOut = rta::revealOrder(segOut->groups, segOut->lineCount, anim.out);
+      outSeqStart = clipLength - anim.outOffset -
+                    rta::stageSpan(rta::maxDelay(rta::revealDelays(segOut->groups, rOut, anim.out)),
+                                   anim.out);
+    }
     outUsable = true;
   }
 
@@ -837,6 +874,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   anim.out.startBlur = rawBlurOut * lengthScale;
 
   const std::vector<int> rank = rta::revealOrder(useSeg->groups, useSeg->lineCount, active);
+  const std::vector<double> delayIn = rta::revealDelays(useSeg->groups, rank, active);
 
   rta::StageSettings outActive = anim.out;
   outActive.slideDistance = rawSlideOut * lengthScale;
@@ -847,6 +885,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   const std::vector<int> rankOut =
       useCombined ? rta::revealOrder(useSeg->groups, useSeg->lineCount, outActive)
                   : std::vector<int>();
+  const std::vector<double> delayOut =
+      useCombined ? rta::revealDelays(useSeg->groups, rankOut, outActive) : std::vector<double>();
 
   // Fills `out` with exactly `n` taps per group, through the same evaluator the
   // real render uses -- the measuring pass must not be a second implementation
@@ -865,10 +905,11 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     out.assign(useSeg->groups.size() * size_t(got), rta::GroupTransform());
     for (size_t i = 0; i < useSeg->groups.size(); ++i) {
       if (useCombined)
-        rta::transformTapsCombined(rank[i], rankOut[i], frames, anim.startTime, outSeqStart, q,
+        rta::transformTapsCombined(delayIn[i], delayOut[i], frames, anim.startTime, outSeqStart, q,
                                    active, outActive, &out[i * size_t(got)]);
       else
-        rta::transformTaps(stage, rank[i], frames, stageStart, q, active, &out[i * size_t(got)]);
+        rta::transformTaps(stage, delayIn[i], frames, stageStart, q, active,
+                           &out[i * size_t(got)]);
     }
     return got;
   };
@@ -892,7 +933,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 
   // Room check for the indicator, using the group count we just measured.
   {
-    const rta::FitReport fit = rta::checkFit(useSeg->groups.size(), anim, clipLength, haveLength);
+    const double mdIn = rta::maxDelay(delayIn);
+    const double mdOut = useCombined ? rta::maxDelay(delayOut) : mdIn;
+    const rta::FitReport fit = rta::checkFit(mdIn, mdOut, anim, clipLength, haveLength);
     _fitOk.store(fit.ok(), std::memory_order_relaxed);
 
     // Publish for the overlay, which is where these are actually legible.
@@ -913,6 +956,20 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     rta::AnalysisState a;
     a.slantDegrees = useSeg->slantDegrees;
     a.haveSlant = true;
+    a.width = useSeg->width;
+    a.height = useSeg->height;
+    a.units.reserve(useSeg->groups.size());
+    for (const rta::Group& g : useSeg->groups) {
+      rta::DetectedUnit u;
+      u.x1 = g.bbox.x1;
+      u.y1 = g.bbox.y1;
+      u.x2 = g.bbox.x2;
+      u.y2 = g.bbox.y2;
+      u.glyphIndex = g.glyphIndex;
+      u.glyphStarts = g.glyphStarts;
+      u.glyphIndices = g.glyphIndices;
+      a.units.push_back(std::move(u));
+    }
     rta::setAnalysisState(this, a);
   }
 
@@ -1228,6 +1285,16 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(0.0, 100000.0);
     p->setDisplayRange(0.0, 15.0);
     p->setDefault(2.0);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("staggerByLength");
+    p->setLabels("Stagger by Length", "By Length", "Stagger by Word Length");
+    p->setHint(
+        "Spend the stagger per character instead of per unit, so a long word holds the screen "
+        "longer before the next one starts. Matches how Resolve's Follower behaves. No effect "
+        "in Character mode, where every unit is one character already.");
+    p->setDefault(false);
     addParam(page, p);
   }
   {
@@ -1610,6 +1677,28 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setRange(-45.0, 45.0);
       p->setDisplayRange(-30.0, 30.0);
       p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::StringParamDescriptor* p = desc.defineStringParam("mergeAt");
+      p->setLabels("Merge At", "Merge At", "Merge At Character");
+      p->setHint(
+          "Character indices to join to whatever precedes them, e.g. \"9, 14\". Show Detection "
+          "prints the index of each unit's first character; merging at that number folds the "
+          "unit into the one before it. Numbers never shift, so corrections can be made one at "
+          "a time.");
+      p->setDefault("");
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::StringParamDescriptor* p = desc.defineStringParam("splitBefore");
+      p->setLabels("Split Before", "Split", "Split Before Character");
+      p->setHint(
+          "Character indices that must start a new unit, e.g. \"12, 30\". Set Group Mode to "
+          "Character to read the index of any letter, then switch back.");
+      p->setDefault("");
       p->setParent(*g);
       addParam(page, p);
     }

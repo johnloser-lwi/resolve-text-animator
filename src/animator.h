@@ -39,6 +39,12 @@ struct StageSettings {
   double duration = 12.0;  // frames, per group
   double stagger = 2.0;    // frames between consecutive groups
 
+  // Spend the stagger per CHARACTER rather than per group, so a long word holds
+  // the stage longer before the next one starts. This is how Resolve's own
+  // Follower behaves, and it is what most people expect from a word-by-word
+  // reveal. Off means every group waits the same stagger regardless of length.
+  bool staggerByLength = false;
+
   double slideDistance = 40.0;  // pixels, already resolution-scaled by caller
   double slideAngle = 90.0;     // degrees; 90 == rises from below
   double startScale = 1.0;
@@ -96,8 +102,21 @@ struct GroupTransform {
 std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
                              const StageSettings& s);
 
+// Delay of each group, in STAGGER UNITS, indexed by group.
+//
+// Uniform this is just the reveal rank. By length it is the number of characters
+// that precede the group in reveal order, so the wait before a group is set by
+// how much text came before it rather than by how many groups did.
+std::vector<double> revealDelays(const std::vector<Group>& groups, const std::vector<int>& rank,
+                                 const StageSettings& s);
+
+// Largest value in a delay list, or 0 for an empty one.
+double maxDelay(const std::vector<double>& delays);
+
 // Frames from the first group starting to the last one finishing.
-double stageSpan(size_t groupCount, const StageSettings& s);
+// `maxDelayUnits` is maxDelay() of the stage's delays -- groupCount - 1 when the
+// stagger is uniform.
+double stageSpan(double maxDelayUnits, const StageSettings& s);
 
 // Pose of one group.
 //
@@ -107,7 +126,7 @@ double stageSpan(size_t groupCount, const StageSettings& s);
 // The exit is the entrance played backwards -- eased at (1 - raw) rather than
 // (1 - eased(raw)) -- so a Cubic Out entrance leaves with the mirrored profile
 // instead of an unrelated one.
-GroupTransform transformFor(Stage stage, int revealRank, double frames, double stageStart,
+GroupTransform transformFor(Stage stage, double delayUnits, double frames, double stageStart,
                             const StageSettings& s);
 
 // How many transform samples each group needs this frame. 1 unless motion blur
@@ -137,7 +156,7 @@ int adaptiveTapCount(const std::vector<Group>& groups, const std::vector<GroupTr
 // Sampling the transform itself, rather than smearing the finished pixels along
 // a velocity vector, is what makes rotation and scale blur correctly too --
 // there is no single velocity that describes a spinning glyph.
-void transformTaps(Stage stage, int revealRank, double frames, double stageStart,
+void transformTaps(Stage stage, double delayUnits, double frames, double stageStart,
                    const AnimParams& p, const StageSettings& s, GroupTransform* out);
 
 // Pose with the entrance and exit evaluated together, so they may overlap.
@@ -151,13 +170,13 @@ void transformTaps(Stage stage, int revealRank, double frames, double stageStart
 //
 // Both stages must share a grouping for this: with different group modes the
 // two segmentations have different groups and there is nothing to combine.
-GroupTransform transformCombined(int rankIn, int rankOut, double frames, double inStart,
+GroupTransform transformCombined(double delayIn, double delayOut, double frames, double inStart,
                                  double outStart, const StageSettings& in,
                                  const StageSettings& out, bool enableIn, bool enableOut);
 
-void transformTapsCombined(int rankIn, int rankOut, double frames, double inStart, double outStart,
-                           const AnimParams& p, const StageSettings& in, const StageSettings& out,
-                           GroupTransform* outTaps);
+void transformTapsCombined(double delayIn, double delayOut, double frames, double inStart,
+                           double outStart, const AnimParams& p, const StageSettings& in,
+                           const StageSettings& out, GroupTransform* outTaps);
 
 // Whether each stage has room to finish inside `clipLength` frames.
 struct FitReport {
@@ -168,7 +187,8 @@ struct FitReport {
   bool ok() const { return inFits && outFits; }
 };
 
-FitReport checkFit(size_t groupCount, const AnimParams& p, double clipLength, bool haveLength);
+FitReport checkFit(double maxDelayIn, double maxDelayOut, const AnimParams& p,
+                   double clipLength, bool haveLength);
 
 // Derives the exit settings from the entrance when the two are linked.
 //
@@ -186,6 +206,6 @@ void discOffset(int tap, int taps, float* dx, float* dy);
 float applyEasing(float t, Easing e, const BezierEasing& b);
 
 // Total time from startTime until the last group has settled.
-double totalDuration(size_t groupCount, const AnimParams& p);
+double totalDuration(double maxDelayUnits, const AnimParams& p);
 
 }  // namespace rta
