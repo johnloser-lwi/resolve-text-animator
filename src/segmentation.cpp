@@ -687,6 +687,22 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   // letter spacing is as wide as another's word spacing cannot be separated by
   // any threshold that also suits the rest of the frame.
   if (!params.mergeAt.empty() || !params.splitBefore.empty()) {
+    // An index in both lists cancels. Asking for a boundary to be removed AND
+    // added at the same character says nothing, so the automatic decision stands
+    // -- which is what the pair of edits amounts to anyway.
+    //
+    // Without this the order of application decides, so the two lists would
+    // quietly disagree and the same pair of numbers would mean different things
+    // depending on which pass ran last.
+    std::vector<int> merges, splits;
+    for (int ci : params.mergeAt)
+      if (std::find(params.splitBefore.begin(), params.splitBefore.end(), ci) ==
+          params.splitBefore.end())
+        merges.push_back(ci);
+    for (int ci : params.splitBefore)
+      if (std::find(params.mergeAt.begin(), params.mergeAt.end(), ci) == params.mergeAt.end())
+        splits.push_back(ci);
+
     const size_t nLines = lineGlyphs.size();
     std::vector<std::vector<int>> starts(nLines);
     for (const Group& g : seg.groups)
@@ -704,13 +720,13 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       return false;
     };
 
-    for (int ci : params.mergeAt) {
+    for (int ci : merges) {
       size_t li = 0, gi = 0;
       if (!locate(ci, &li, &gi) || gi == 0) continue;  // a line always starts a unit
       auto& v = starts[li];
       v.erase(std::remove(v.begin(), v.end(), int(gi)), v.end());
     }
-    for (int ci : params.splitBefore) {
+    for (int ci : splits) {
       size_t li = 0, gi = 0;
       if (!locate(ci, &li, &gi) || gi == 0) continue;
       starts[li].push_back(int(gi));

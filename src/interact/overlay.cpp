@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "ofxDrawSuite.h"
 #include "ofxsInteract.h"
@@ -84,6 +85,7 @@ class CurveInteract : public OFX::OverlayInteract {
     drawWarnings(c);
     drawSlant(c);
     drawUnits(c);
+    drawClearButton(c);
 
     if (!showCurve(args.time)) return true;
     _curve.layout(c);
@@ -221,6 +223,62 @@ class CurveInteract : public OFX::OverlayInteract {
     }
   }
 
+  // Where the Clear Overrides button sits. Derived, not stored, so the drawing
+  // and the hit test cannot fall out of step -- a stored rect would be stale on
+  // the first click after a viewer resize.
+  OfxRectD clearButtonRect(const OverlayContext& c) const {
+    const double w = c.sx(190.0), h = c.sy(26.0);
+    const double x = c.rod.x1 + c.sx(24.0);
+    const double y = c.rod.y1 + c.sy(24.0);
+    return OfxRectD{x, y, x + w, y + h};
+  }
+
+  int overrideCount(const OverlayContext& c) const {
+    try {
+      std::string m, sp;
+      c.effect->fetchStringParam("mergeAt")->getValue(m);
+      c.effect->fetchStringParam("splitBefore")->getValue(sp);
+      return int(parseList(m).size() + parseList(sp).size());
+    } catch (...) {
+      return 0;
+    }
+  }
+
+  // Only drawn when there is something to clear: a button that does nothing is
+  // just something else covering the picture.
+  void drawClearButton(const OverlayContext& c) {
+    bool show = false;
+    try {
+      show = _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(c.time);
+    } catch (...) {
+      return;
+    }
+    if (!show) return;
+
+    const int n = overrideCount(c);
+    if (n <= 0) return;
+
+    const OfxRectD r = clearButtonRect(c);
+    Panel(c, r);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "CLEAR OVERRIDES (%d)", n);
+    SetColour(c, Colour{1.0f, 0.55f, 0.35f, 1.0f});
+    Text(c, buf, r.x1 + c.sx(10.0), r.y2 - c.sy(7.0),
+         kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+  }
+
+  bool clearOverrides(const OverlayContext& c) {
+    try {
+      beginEdit(c.effect, "Clear overrides");
+      c.effect->fetchStringParam("mergeAt")->setValue("");
+      c.effect->fetchStringParam("splitBefore")->setValue("");
+      endEdit(c.effect);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
   bool showCurve(double time) {
     try {
       return _effect->fetchBooleanParam("showCurveEditor")->getValueAtTime(time);
@@ -256,15 +314,63 @@ class CurveInteract : public OFX::OverlayInteract {
     return -1;
   }
 
-  void appendParam(const OverlayContext& c, const char* name, const std::string& add,
+  static std::vector<int> parseList(const std::string& in) {
+    std::vector<int> out;
+    int v = 0;
+    bool has = false;
+    for (size_t i = 0; i <= in.size(); ++i) {
+      const char ch = i < in.size() ? in[i] : ',';
+      if (ch >= '0' && ch <= '9') {
+        v = v * 10 + (ch - '0');
+        has = true;
+      } else {
+        if (has) out.push_back(v);
+        v = 0;
+        has = false;
+      }
+    }
+    return out;
+  }
+
+  static std::string formatList(const std::vector<int>& v) {
+    std::string out;
+    char buf[16];
+    for (size_t i = 0; i < v.size(); ++i) {
+      std::snprintf(buf, sizeof(buf), "%d", v[i]);
+      if (i) out += ", ";
+      out += buf;
+    }
+    return out;
+  }
+
+  // Adds `value` to one list -- unless it is already in the OTHER, in which case
+  // the two cancel and it is simply removed from there.
+  //
+  // Merging and splitting at the same character are opposite requests, so
+  // holding both says nothing; the automatic decision is what that pair amounts
+  // to. Cancelling as the edit is made keeps the fields honest, so they never
+  // show two numbers that argue with each other and the same click always
+  // undoes the last one.
+  void toggleIndex(const OverlayContext& c, const char* addTo, const char* other, int value,
                    const char* label) {
     try {
-      OFX::StringParam* sp = c.effect->fetchStringParam(name);
-      std::string cur;
-      sp->getValue(cur);
-      const bool empty = cur.find_first_not_of(" \t") == std::string::npos;
+      OFX::StringParam* pAdd = c.effect->fetchStringParam(addTo);
+      OFX::StringParam* pOther = c.effect->fetchStringParam(other);
+      std::string sAdd, sOther;
+      pAdd->getValue(sAdd);
+      pOther->getValue(sOther);
+
+      std::vector<int> add = parseList(sAdd), opp = parseList(sOther);
+      const auto hit = std::find(opp.begin(), opp.end(), value);
+
       beginEdit(c.effect, label);
-      sp->setValue(empty ? add : cur + ", " + add);
+      if (hit != opp.end()) {
+        opp.erase(hit);
+        pOther->setValue(formatList(opp));
+      } else if (std::find(add.begin(), add.end(), value) == add.end()) {
+        add.push_back(value);
+        pAdd->setValue(formatList(add));
+      }
       endEdit(c.effect);
     } catch (...) {
     }
@@ -273,6 +379,12 @@ class CurveInteract : public OFX::OverlayInteract {
   bool editGrouping(const OverlayContext& c, const OfxPointD& p, bool alt, bool down) {
     const AnalysisState a = analysisState(_effect);
     if (a.units.empty()) return false;
+
+    if (down && overrideCount(c) > 0 && Contains(clearButtonRect(c), p)) {
+      clearOverrides(c);
+      _dragUnit = -1;
+      return true;
+    }
 
     const int hit = unitAt(c, a, p);
     if (down) {
@@ -297,11 +409,8 @@ class CurveInteract : public OFX::OverlayInteract {
             best = j;
           }
         }
-        if (best < u.glyphIndices.size()) {
-          char buf[32];
-          std::snprintf(buf, sizeof(buf), "%d", u.glyphIndices[best]);
-          appendParam(c, "splitBefore", buf, "Split unit");
-        }
+        if (best < u.glyphIndices.size())
+          toggleIndex(c, "splitBefore", "mergeAt", u.glyphIndices[best], "Split unit");
         _dragUnit = -1;
       }
       return true;
@@ -317,14 +426,8 @@ class CurveInteract : public OFX::OverlayInteract {
     // after the first. Those are character indices, which do not move when the
     // merge is applied -- so a second drag on the same line still works.
     const int lo = std::min(from, hit), hi = std::max(from, hit);
-    std::string list;
-    for (int i = lo + 1; i <= hi; ++i) {
-      char buf[16];
-      std::snprintf(buf, sizeof(buf), "%d", a.units[size_t(i)].glyphIndex);
-      if (!list.empty()) list += ", ";
-      list += buf;
-    }
-    if (!list.empty()) appendParam(c, "mergeAt", list, "Merge units");
+    for (int i = lo + 1; i <= hi; ++i)
+      toggleIndex(c, "mergeAt", "splitBefore", a.units[size_t(i)].glyphIndex, "Merge units");
     return true;
   }
 

@@ -33,6 +33,38 @@
 namespace {
 
 // ChoiceParam is the one param type without a return-value getter.
+// Plain integer lists, as the Merge At / Split Before fields hold them.
+// Anything that is not a digit separates, so commas, spaces and a half-typed
+// entry all behave, and a malformed field never throws mid-render.
+std::vector<int> parseIndexList(const std::string& in) {
+  std::vector<int> out;
+  int v = 0;
+  bool has = false;
+  for (size_t i = 0; i <= in.size(); ++i) {
+    const char c = i < in.size() ? in[i] : ',';
+    if (c >= '0' && c <= '9') {
+      v = v * 10 + (c - '0');
+      has = true;
+    } else {
+      if (has) out.push_back(v);
+      v = 0;
+      has = false;
+    }
+  }
+  return out;
+}
+
+std::string formatIndexList(const std::vector<int>& v) {
+  std::string out;
+  char buf[16];
+  for (size_t i = 0; i < v.size(); ++i) {
+    std::snprintf(buf, sizeof(buf), "%d", v[i]);
+    if (i) out += ", ";
+    out += buf;
+  }
+  return out;
+}
+
 int choiceAt(OFX::ChoiceParam* p, double t, int lo, int hi) {
   int v = 0;
   p->getValueAtTime(t, v);
@@ -207,12 +239,16 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _autoSlant = fetchBooleanParam("autoSlant");
     _mergeAt = fetchStringParam("mergeAt");
     _splitBefore = fetchStringParam("splitBefore");
+    _clearOverrides = fetchPushButtonParam("clearOverrides");
     _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
     _maxLetterGap = fetchDoubleParam("characterGap");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");
     updateHostWarning();
+    // Also on load, or a project saved with overrides would open showing no way
+    // to clear them until something else was touched.
+    syncOverrideUI();
   }
 
   ~TextAnimatorPlugin() override {
@@ -323,6 +359,20 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _seenT2 = rawT2;
   }
 
+  // The Clear button is hidden while there is nothing to clear, matching the
+  // overlay's. A control that cannot do anything still invites a click and still
+  // costs a row of the panel.
+  void syncOverrideUI() {
+    try {
+      std::string m, sp;
+      _mergeAt->getValue(m);
+      _splitBefore->getValue(sp);
+      const bool none = parseIndexList(m).empty() && parseIndexList(sp).empty();
+      _clearOverrides->setIsSecret(none);
+    } catch (...) {
+    }
+  }
+
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
     // One value, two sliders. The guard matters because setValue dispatches
     // straight back into changedParam, which would otherwise bounce forever.
@@ -338,6 +388,46 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
         _blurSamples->setValue(v);
       rta::endEdit(this);
       _syncingSamples = false;
+      return;
+    }
+
+    if (name == "clearOverrides") {
+      rta::beginEdit(this, "Clear overrides");
+      _mergeAt->setValue("");
+      _splitBefore->setValue("");
+      rta::endEdit(this);
+      syncOverrideUI();
+      return;
+    }
+
+    // Merge At and Split Before must never hold the same character.
+    //
+    // The two are opposite requests, so a character in both says nothing and the
+    // automatic decision stands. The renderer already treats it that way, but
+    // leaving the numbers in the fields shows an override that is not in force
+    // and cannot be reasoned about -- so the pair is struck from BOTH lists as
+    // soon as it appears, and what is on screen is exactly what is applied.
+    if (!_cleaningLists && (name == "mergeAt" || name == "splitBefore")) {
+      _cleaningLists = true;
+      std::string ms, ss;
+      _mergeAt->getValueAtTime(args.time, ms);
+      _splitBefore->getValueAtTime(args.time, ss);
+
+      std::vector<int> m = parseIndexList(ms), sp = parseIndexList(ss);
+      std::vector<int> keepM, keepS;
+      for (int v : m)
+        if (std::find(sp.begin(), sp.end(), v) == sp.end()) keepM.push_back(v);
+      for (int v : sp)
+        if (std::find(m.begin(), m.end(), v) == m.end()) keepS.push_back(v);
+
+      if (keepM.size() != m.size() || keepS.size() != sp.size()) {
+        rta::beginEdit(this, "Cancel opposing overrides");
+        _mergeAt->setValue(formatIndexList(keepM));
+        _splitBefore->setValue(formatIndexList(keepS));
+        rta::endEdit(this);
+      }
+      _cleaningLists = false;
+      syncOverrideUI();
       return;
     }
 
@@ -432,12 +522,14 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_blurSamples;
   OFX::IntParam* _startBlurSamples;
   bool _syncingSamples = false;
+  bool _cleaningLists = false;
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
   OFX::DoubleParam *_startRotation, *_startBlur, *_shutterAngle;
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant, *_maxLetterGap;
   OFX::BooleanParam* _autoSlant;
   OFX::StringParam *_mergeAt, *_splitBefore;
+  OFX::PushButtonParam* _clearOverrides;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
   OFX::StringParam* _hostWarning;
@@ -569,28 +661,11 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
   {
-    // Both lists are plain integers; anything that is not a digit separates, so
-    // commas, spaces and a half-typed entry all behave.
-    auto parse = [](const std::string& in, std::vector<int>& out) {
-      int v = 0;
-      bool has = false;
-      for (size_t i = 0; i <= in.size(); ++i) {
-        const char c = i < in.size() ? in[i] : ',';
-        if (c >= '0' && c <= '9') {
-          v = v * 10 + (c - '0');
-          has = true;
-        } else {
-          if (has) out.push_back(v);
-          v = 0;
-          has = false;
-        }
-      }
-    };
     std::string m, sp;
     _mergeAt->getValueAtTime(args.time, m);
     _splitBefore->getValueAtTime(args.time, sp);
-    parse(m, det.mergeAt);
-    parse(sp, det.splitBefore);
+    det.mergeAt = parseIndexList(m);
+    det.splitBefore = parseIndexList(sp);
   }
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
@@ -1722,6 +1797,15 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDefault("");
       p->setParent(*g);
       addParam(page, p);
+    }
+    {
+      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("clearOverrides");
+      p->setLabels("Clear Overrides", "Clear", "Clear Overrides");
+      p->setHint("Empties Merge At and Split Before, returning every unit to automatic grouping.");
+      p->setParent(*g);
+      // A push button holds no value, so there is nothing for it to invalidate --
+      // the parameters it writes carry that.
+      addParamUI(page, p);
     }
     {
       OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showDiagnostics");
