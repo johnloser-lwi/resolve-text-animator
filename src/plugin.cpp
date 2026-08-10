@@ -18,7 +18,6 @@
 #include "cuda_compositor.h"
 #include "diagnostics.h"
 #include "interact/overlay.h"
-#include "probe.h"
 #include "segmentation.h"
 #include "warning_state.h"
 
@@ -555,8 +554,6 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   double _seenT1 = 1e300, _seenT2 = 1e300, _seenEarliest = 1e300;
 
   // Carried between the two halves of the diagnostic block only.
-  double _probeRaw[2] = {0.0, 0.0};
-  bool _probeRawOk = false;
 };
 
 void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
@@ -568,31 +565,14 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // which lands the animation at the clip's *previous* start.
   observeRenderTime(args.time);
 
-  // Trace every frame and how it left.
-  //
-  // The other probes sit deep in render(), after a dozen early returns, so a
-  // frame that bailed never appeared in them at all -- the log looked clean
-  // precisely because the broken frames were the ones missing from it. This
-  // logs from a destructor, so it reports no matter which return is taken.
-  struct Trace {
-    double t;
-    const char* why = "BAILED-early";
-    ~Trace() {
-      char b[64];
-      std::snprintf(b, sizeof(b), "t=%.1f %s", t, why);
-      rta::probeOnChange("render", b);
-    }
-  } trace{args.time};
 
   std::unique_ptr<OFX::Image> dst(_dstClip->fetchImage(args.time));
   if (!dst.get()) {
-    trace.why = "no-dst-image";
     return;
   }
 
   if (dst->getPixelDepth() != OFX::eBitDepthFloat ||
       dst->getPixelComponents() != OFX::ePixelComponentRGBA) {
-    trace.why = "bad-dst-format";
     OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
     return;
   }
@@ -633,7 +613,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 
   if (!src.get() || src->getPixelDepth() != OFX::eBitDepthFloat ||
       src->getPixelComponents() != OFX::ePixelComponentRGBA) {
-    trace.why = "no-src-image";
     return;
   }
 
@@ -642,14 +621,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   OfxRectI common{std::max(srcBounds.x1, dstBounds.x1), std::max(srcBounds.y1, dstBounds.y1),
                   std::min(srcBounds.x2, dstBounds.x2), std::min(srcBounds.y2, dstBounds.y2)};
   if (common.x2 <= common.x1 || common.y2 <= common.y1) {
-    trace.why = "empty-common-region";
     return;
   }
 
   const rta::ImageView srcView = makeView(src.get(), common);
   const rta::ImageView dstView = makeView(dst.get(), common);
   if (!srcView.valid() || !dstView.valid()) {
-    trace.why = "invalid-view";
     return;
   }
 
@@ -744,7 +721,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     hash = rta::cudaHashAlpha(srcView.data, srcView.rowStride, srcView.width, srcView.height,
                               det.alphaThreshold, _cache.scratch, args.pCudaStream, &ok);
     if (!ok) {
-      trace.why = "cuda-hash-failed";
       return;
     }
   } else
@@ -777,7 +753,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       if (useCuda) {
         if (!rta::cudaDownload(host, srcView.data, srcView.rowStride, srcView.width,
                                srcView.height)) {
-          trace.why = "cuda-download-failed";
           return;
         }
         const std::ptrdiff_t absStride =
@@ -799,7 +774,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     if (anim.enableOut) segOut = _cache.byMode[int(outMode)];
   }
   if (!segIn || segIn->empty()) {
-    trace.why = "segmentation-empty";
     return;
   }
 
@@ -836,9 +810,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       rawOk = false;
     }
 
-    _probeRaw[0] = rawT1;
-    _probeRaw[1] = rawT2;
-    _probeRawOk = rawOk;
   }
 
   // The exit is anchored to the clip's END, so it needs the clip's length.
@@ -858,17 +829,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     haveLength = true;
   }
 
-  {
-    char buf[380];
-    std::snprintf(buf, sizeof(buf),
-                  "raw=[%.1f,%.1f]%s dur=%.1f anchor=%s origin=%.1f clipLen=%.1f "
-                  "earliestRendered=%.1f | args.time=%.1f -> clipFrame=%.1f",
-                  _probeRaw[0], _probeRaw[1], _probeRawOk ? "" : "(THREW)",
-                  rta::safeEffectDuration(this),
-                  _manualOrigin->getValueAtTime(args.time) ? "manual" : "auto", origin, clipLength,
-                  _seenEarliest, args.time, frames);
-    rta::probeOnChange("cliptime", buf);
-  }
 
   // The entrance and exit are evaluated TOGETHER when they share a grouping, so
   // an exit that begins before the entrance has settled blends with it instead
@@ -911,19 +871,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     stage = anim.enableIn ? rta::Stage::In : rta::Stage::Settled;
   }
 
-  {
-    // The timing mapping being right does not mean the animation is running:
-    // a stale Start offset delays it just as effectively. Log what the animator
-    // is actually being asked to do, so the two cannot be confused again.
-    char buf[320];
-    std::snprintf(buf, sizeof(buf),
-                  "stage=%s in=%d out=%d start=%.1f dur=%.1f stagger=%.1f groups=%zu "
-                  "stageStart=%.1f | clipFrame=%.1f",
-                  stage == rta::Stage::Out ? "OUT" : (stage == rta::Stage::In ? "IN" : "SETTLED"),
-                  anim.enableIn ? 1 : 0, anim.enableOut ? 1 : 0, anim.startTime, useSet->duration,
-                  useSet->stagger, useSeg->groups.size(), stageStart, frames);
-    rta::probeOnChange("anim", buf);
-  }
 
   // Lengths are authored as a ratio so the motion looks identical at 1080p and
   // 4K. renderScale only tracks proxy scale, not timeline resolution, so it
@@ -1064,23 +1011,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   }
 #endif
 
-  if (!transforms.empty()) {
-    // What the animator actually produced for the first group. If the composite
-    // draws nothing while the diagnostics overlay still appears, this is the
-    // only place left that can explain it.
-    const rta::GroupTransform& g0 = transforms[0];
-    int visibleCount = 0;
-    for (size_t i = 0; i < useSeg->groups.size(); ++i)
-      if (transforms[i * size_t(taps)].visible) ++visibleCount;
-    const double t0 = stageStart + double(rank.empty() ? 0 : rank[0]) * useSet->stagger;
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "clipFrame=%.1f g0: rank=%d t0=%.1f raw=%.3f vis=%d op=%.3f | visibleGroups=%d/%zu",
-                  frames, rank.empty() ? -1 : rank[0], t0,
-                  (frames - t0) / std::max(1e-6, useSet->duration), g0.visible ? 1 : 0, g0.opacity,
-                  visibleCount, useSeg->groups.size());
-    rta::probeOnChange("g0", buf);
-  }
 
   const rta::RectI window = toLocal(args.renderWindow, common);
   const bool diagnostics = _showDiagnostics->getValueAtTime(args.time);
@@ -1089,16 +1019,13 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   if (useCuda) {
     std::lock_guard<std::mutex> lock(_cache.mutex);
     if (!_cache.devSegValid) {
-      trace.why = "cuda-devseg-invalid";
       return;
     }
     if (!rta::cudaCompositeGroups(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
                                   dstView.width, dstView.height, _cache.devSeg, useSeg->groups,
                                   transforms, taps, window, _cache.scratch, args.pCudaStream)) {
-      trace.why = "cuda-composite-failed";
       return;
     }
-    trace.why = "ok-cuda";
     return;
   }
 #endif
@@ -1109,7 +1036,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // (interact/overlay.cpp), so it can be left on permanently without reaching
   // render cache, Deliver, or a round trip through Fusion.
   (void)diagnostics;
-  trace.why = "ok-cpu";
 }
 
 // ---------------------------------------------------------------- factory

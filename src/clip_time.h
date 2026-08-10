@@ -70,25 +70,6 @@ inline bool validateClipRange(double t1, double t2, double& outStart, double& ou
 // game away: only the end is anchored to the clip. The first frame that will
 // actually be rendered is therefore max(0, start), and the usable length is
 // measured from there.
-// The effect's own duration, or 0 if the host does not publish one.
-//
-// Not used for timing: Resolve returns the available-media span, not the
-// visible clip length (measured 184 on a clip visibly 150 frames long), so it
-// cannot recover the trimmed start. Kept for the probe log, where seeing it is
-// what ruled it out.
-//
-// Guarded for the same reason the frame rate was: a missing property throws,
-// and thrown out of render that becomes kOfxStatErrMissingHostFeature and fails
-// every single frame.
-inline double safeEffectDuration(OFX::ImageEffect* effect) {
-  if (!effect) return 0.0;
-  try {
-    const double d = effect->getEffectDuration();
-    return d > 0.0 ? d : 0.0;
-  } catch (...) {
-    return 0.0;
-  }
-}
 
 // The raw, validated bounds exactly as the host reports them.
 //
