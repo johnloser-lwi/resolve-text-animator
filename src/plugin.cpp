@@ -12,6 +12,9 @@
 #include "ofxsMultiThread.h"
 
 #include "animator.h"
+#include "param_registry.h"
+#include "preset.h"
+#include "preset_io.h"
 #include "clip_time.h"
 #include "compositor.h"
 #include "edit_block.h"
@@ -99,9 +102,21 @@ int choiceAt(OFX::ChoiceParam* p, double t, int lo, int hi) {
 // once, and MultiTransform ships it without trouble. If loading breaks again,
 // this is the first suspect and the next step is narrowing it to the handful of
 // parameters that genuinely need it.
+// Parameter kind, deduced from the descriptor type so the registry cannot
+// disagree with what was actually defined.
+inline int kindOf(OFX::DoubleParamDescriptor*) { return rta::kPKDouble; }
+inline int kindOf(OFX::IntParamDescriptor*) { return rta::kPKInt; }
+inline int kindOf(OFX::BooleanParamDescriptor*) { return rta::kPKBool; }
+inline int kindOf(OFX::ChoiceParamDescriptor*) { return rta::kPKChoice; }
+inline int kindOf(OFX::RGBAParamDescriptor*) { return rta::kPKRGBA; }
+inline int kindOf(OFX::StringParamDescriptor*) { return rta::kPKString; }
+// Anything else -- groups, pages, push buttons -- holds nothing worth storing.
+inline int kindOf(...) { return rta::kPKNone; }
+
 template <class T>
 void addParam(OFX::PageParamDescriptor* page, T* p) {
   p->setCacheInvalidation(OFX::eCacheInvalidateValueAll);
+  rta::registerParam(p->getName(), kindOf(p));
   page->addChild(*p);
 }
 
@@ -110,6 +125,10 @@ void addParam(OFX::PageParamDescriptor* page, T* p) {
 // the curve editor would be a stall for no reason.
 template <class T>
 void addParamUI(OFX::PageParamDescriptor* page, T* p) {
+  // Registered too: a UI-only control still describes how the effect looks, and
+  // a preset that restored everything except the overlay toggles would be a
+  // surprise. Push buttons deduce to kPKNone and drop out on their own.
+  rta::registerParam(p->getName(), kindOf(p));
   page->addChild(*p);
 }
 
@@ -372,7 +391,124 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     }
   }
 
+  // --- presets -------------------------------------------------------------
+  //
+  // Driven entirely by the registry, so every parameter is covered including
+  // ones added later, and there is no second list to forget to update.
+
+  bool captureParam(const rta::ParamEntry& e, rta::PresetValue* v) const {
+    try {
+      v->kind = e.kind;
+      switch (e.kind) {
+        case rta::kPKDouble:
+          v->n[0] = fetchDoubleParam(e.name)->getValue();
+          v->count = 1;
+          return true;
+        case rta::kPKInt:
+          v->n[0] = double(fetchIntParam(e.name)->getValue());
+          v->count = 1;
+          return true;
+        case rta::kPKChoice: {
+          int c = 0;
+          fetchChoiceParam(e.name)->getValue(c);
+          v->n[0] = double(c);
+          v->count = 1;
+          return true;
+        }
+        case rta::kPKBool:
+          v->b = fetchBooleanParam(e.name)->getValue();
+          return true;
+        case rta::kPKRGBA: {
+          double r = 0, g = 0, b = 0, a = 0;
+          fetchRGBAParam(e.name)->getValue(r, g, b, a);
+          v->n[0] = r; v->n[1] = g; v->n[2] = b; v->n[3] = a;
+          v->count = 4;
+          return true;
+        }
+        case rta::kPKString:
+          fetchStringParam(e.name)->getValue(v->s);
+          return true;
+        default:
+          return false;
+      }
+    } catch (...) {
+      return false;  // a parameter this build no longer has
+    }
+  }
+
+  void applyParam(const rta::ParamEntry& e, const rta::PresetValue& v) {
+    if (v.kind != e.kind) return;  // type changed between builds: leave the default
+    try {
+      switch (e.kind) {
+        case rta::kPKDouble: fetchDoubleParam(e.name)->setValue(v.n[0]); break;
+        case rta::kPKInt: fetchIntParam(e.name)->setValue(int(v.n[0])); break;
+        case rta::kPKChoice: fetchChoiceParam(e.name)->setValue(int(v.n[0])); break;
+        case rta::kPKBool: fetchBooleanParam(e.name)->setValue(v.b); break;
+        case rta::kPKRGBA:
+          if (v.count == 4) fetchRGBAParam(e.name)->setValue(v.n[0], v.n[1], v.n[2], v.n[3]);
+          break;
+        case rta::kPKString: fetchStringParam(e.name)->setValue(v.s); break;
+        default: break;
+      }
+    } catch (...) {
+    }
+  }
+
+  void savePreset() {
+    rta::PresetFile file;
+    file.name = rta::stemOf("");
+    for (const rta::ParamEntry& e : rta::paramRegistry()) {
+      rta::PresetValue v;
+      if (captureParam(e, &v)) file.params[e.name] = v;
+    }
+
+    const std::string path = rta::askSavePath("preset");
+    if (path.empty()) return;  // cancelled, which is not a failure
+    file.name = rta::stemOf(path);
+    rta::writeFile(path, rta::writePreset(file));
+  }
+
+  void loadPreset() {
+    const std::string path = rta::askOpenPath();
+    if (path.empty()) return;
+
+    std::string text;
+    if (!rta::readFile(path, &text)) return;
+
+    rta::PresetFile file;
+    // Strict: a malformed file changes nothing. Half a preset applied is worse
+    // than none, because the half that landed is invisible.
+    if (!rta::readPreset(text, &file)) return;
+
+    // One edit block for the whole preset, so it is a single undo step and the
+    // per-parameter reactions do not fire once per value.
+    _applyingPreset = true;
+    rta::beginEdit(this, "Load preset");
+    for (const rta::ParamEntry& e : rta::paramRegistry()) {
+      const auto it = file.params.find(e.name);
+      // A parameter absent from the file keeps its current value rather than
+      // being reset, so an older preset does not silently clear newer controls.
+      if (it != file.params.end()) applyParam(e, it->second);
+    }
+    rta::endEdit(this);
+    _applyingPreset = false;
+    syncOverrideUI();
+  }
+
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
+    // While a preset is landing, the per-parameter reactions would fire once per
+    // value and fight the values still being written.
+    if (_applyingPreset) return;
+
+    if (name == "savePreset") {
+      savePreset();
+      return;
+    }
+    if (name == "loadPreset") {
+      loadPreset();
+      return;
+    }
+
     // One value, two sliders. The guard matters because setValue dispatches
     // straight back into changedParam, which would otherwise bounce forever.
     if (!_syncingSamples && (name == "blurSamples" || name == "startBlurSamples")) {
@@ -522,6 +658,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::IntParam* _startBlurSamples;
   bool _syncingSamples = false;
   bool _cleaningLists = false;
+  bool _applyingPreset = false;
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
   OFX::DoubleParam *_startRotation, *_startBlur, *_shutterAngle;
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
@@ -1611,6 +1748,29 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setDefault(2.0);
       p->setParent(*g);
       addParam(page, p);
+    }
+  }
+
+  {
+    OFX::GroupParamDescriptor* g = desc.defineGroupParam("presets");
+    g->setLabels("Presets", "Presets", "Presets");
+    g->setOpen(false);
+
+    {
+      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("savePreset");
+      p->setLabels("Save Preset", "Save", "Save Preset");
+      p->setHint("Writes every setting to a .tapreset file.");
+      p->setParent(*g);
+      addParamUI(page, p);
+    }
+    {
+      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("loadPreset");
+      p->setLabels("Load Preset", "Load", "Load Preset");
+      p->setHint(
+          "Applies a .tapreset file. Settings the file does not mention keep their current "
+          "value, and a file that will not parse changes nothing at all.");
+      p->setParent(*g);
+      addParamUI(page, p);
     }
   }
 

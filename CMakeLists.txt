@@ -32,6 +32,8 @@ endif()
 # openfx repo's own CMake drags in OpenGL/CUDA options and example plugins.
 add_library(TextAnimator SHARED
   src/plugin.cpp
+    src/preset.cpp
+    src/preset_io.cpp
   src/interact/overlay.cpp
   src/interact/curve_widget.cpp
   ${OFX_ROOT}/Support/Library/ofxsCore.cpp
