@@ -75,6 +75,10 @@ class CurveInteract : public OFX::OverlayInteract {
       // asks the overlay to redraw, so a wrong string looks like it was accepted
       // until the playhead happens to move.
       addParamToSlaveTo(_effect->fetchStringParam("referenceText"));
+      // The order picker draws from these, so a click has to repaint the numbers
+      // it just changed.
+      addParamToSlaveTo(_effect->fetchBooleanParam("orderPick"));
+      addParamToSlaveTo(_effect->fetchStringParam("manualOrder"));
       addParamToSlaveTo(_effect->fetchDoubleParam("italicSlant"));
     } catch (...) {
     }
@@ -89,6 +93,7 @@ class CurveInteract : public OFX::OverlayInteract {
     drawWarnings(c);
     drawSlant(c);
     drawUnits(c);
+    drawOrderPicker(c);
     drawClearButton(c);
 
     if (!showCurve(args.time)) return true;
@@ -292,6 +297,108 @@ class CurveInteract : public OFX::OverlayInteract {
     }
   }
 
+  // --- picking the reveal order off the picture ----------------------------
+  //
+  // Typing "18, 0" means reading numbers off the viewer, holding them, and
+  // typing them somewhere else. Clicking the elements in the order you want them
+  // is the same statement without the transcription, and it is self-checking:
+  // the number that appears is the position it will actually reveal in.
+
+  bool orderPicking(double time) const {
+    try {
+      return _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(time) &&
+             _effect->fetchBooleanParam("orderPick")->getValueAtTime(time);
+    } catch (...) {
+      return false;
+    }
+  }
+
+  std::vector<int> orderList(const OverlayContext& c) const {
+    try {
+      std::string s;
+      c.effect->fetchStringParam("manualOrder")->getValue(s);
+      return parseList(s);
+    } catch (...) {
+      return {};
+    }
+  }
+
+  OfxRectD orderButtonRect(const OverlayContext& c) const {
+    // Above the overrides button, so the two never sit on top of one another
+    // when both have something to say.
+    const double w = c.sx(190.0), h = c.sy(26.0);
+    const double x = c.rod.x1 + c.sx(24.0);
+    const double y = c.rod.y1 + c.sy(24.0) + h + c.sy(8.0);
+    return OfxRectD{x, y, x + w, y + h};
+  }
+
+  void drawOrderPicker(const OverlayContext& c) {
+    if (!orderPicking(c.time)) return;
+    const AnalysisState a = analysisState(_effect);
+    if (a.units.empty() || a.width <= 0 || a.height <= 0) return;
+
+    const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
+    if (w <= 0.0 || h <= 0.0) return;
+    const std::vector<int> order = orderList(c);
+
+    for (const DetectedUnit& u : a.units) {
+      const auto it = std::find(order.begin(), order.end(), u.glyphIndex);
+      if (it == order.end()) continue;  // unclicked units keep reading order
+      const int pos = int(it - order.begin()) + 1;
+
+      // Centred in the unit and large, because this is the number being chosen,
+      // not the character index which is merely how it is addressed.
+      const double cx = c.rod.x1 + (double(u.x1) + double(u.x2)) * 0.5 / a.width * w;
+      const double cy = c.rod.y2 - (double(u.y1) + double(u.y2)) * 0.5 / a.height * h;
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%d", pos);
+      SetColour(c, Colour{1.0f, 0.85f, 0.2f, 1.0f});
+      Text(c, buf, cx, cy, kOfxDrawTextAlignmentCenterH | kOfxDrawTextAlignmentCenterV);
+    }
+
+    const OfxRectD r = orderButtonRect(c);
+    Panel(c, r);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "CLEAR ORDER (%d)", int(order.size()));
+    SetColour(c, Colour{1.0f, 0.85f, 0.2f, 1.0f});
+    Text(c, buf, r.x1 + c.sx(10.0), r.y2 - c.sy(7.0),
+         kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+  }
+
+  // Click a unit to give it the next number; click a numbered one to take it
+  // back out. Toggling rather than only appending means a misclick is undone by
+  // repeating it, which is the same gesture rather than a trip to the Inspector.
+  bool pickOrder(const OverlayContext& c, const OfxPointD& p) {
+    if (Contains(orderButtonRect(c), p)) {
+      try {
+        beginEdit(c.effect, "Clear order");
+        c.effect->fetchStringParam("manualOrder")->setValue("");
+        endEdit(c.effect);
+      } catch (...) {
+      }
+      return true;
+    }
+
+    const AnalysisState a = analysisState(_effect);
+    const int hit = unitAt(c, a, p);
+    if (hit < 0) return false;
+    const int ci = a.units[size_t(hit)].glyphIndex;
+
+    std::vector<int> order = orderList(c);
+    const auto it = std::find(order.begin(), order.end(), ci);
+    if (it != order.end())
+      order.erase(it);
+    else
+      order.push_back(ci);
+    try {
+      beginEdit(c.effect, "Set reveal order");
+      c.effect->fetchStringParam("manualOrder")->setValue(formatList(order));
+      endEdit(c.effect);
+    } catch (...) {
+    }
+    return true;
+  }
+
   bool showCurve(double time) {
     try {
       return _effect->fetchBooleanParam("showCurveEditor")->getValueAtTime(time);
@@ -455,7 +562,12 @@ class CurveInteract : public OFX::OverlayInteract {
   bool penDown(const OFX::PenArgs& args) override {
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, nullptr)) return false;
-    if (groupingMode(args.time)) {
+    // Order picking takes the click first. The two modes both claim a click on a
+    // unit, and while picking an order the last thing wanted is to merge two of
+    // them by accident.
+    if (orderPicking(args.time)) {
+      if (pickOrder(c, args.penPosition)) return true;
+    } else if (groupingMode(args.time)) {
       // Alt is not carried on PenArgs, so it is tracked from key events.
       if (editGrouping(c, args.penPosition, _altDown, /*down*/ true)) return true;
     }

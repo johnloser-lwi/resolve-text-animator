@@ -208,6 +208,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _manualOrder = fetchStringParam("manualOrder");
     _revealStart = fetchIntParam("revealStart");
     _revealEnd = fetchIntParam("revealEnd");
+    _singleElement = fetchBooleanParam("singleElement");
+    _orderPick = fetchBooleanParam("orderPick");
+    syncRangeUI();
     _lineOrder = fetchChoiceParam("lineOrder");
     _randomSeed = fetchIntParam("randomSeed");
     _startTime = fetchDoubleParam("startTime");
@@ -544,6 +547,21 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
       return;
     }
 
+    if (name == "singleElement") {
+      syncRangeUI();
+      return;
+    }
+    if (name == "orderPick") {
+      // Picking an order that nothing reads would look broken, so switching the
+      // mode on switches Order to Manual with it.
+      if (_orderPick->getValue()) {
+        rta::beginEdit(this, "Set order by clicking");
+        _order->setValue(int(rta::Order::Manual));
+        rta::endEdit(this);
+      }
+      return;
+    }
+
     if (name == "clearOverrides") {
       rta::beginEdit(this, "Clear overrides");
       _mergeAt->setValue("");
@@ -619,6 +637,15 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   //
   // Written to the LABEL, not the value: Resolve draws only the label of a
   // string parameter, so a message left in the value would be invisible.
+  // End At only means something when the clip introduces a run of elements. With
+  // one per clip it is Start At, so showing it invites the two to disagree.
+  void syncRangeUI() {
+    try {
+      _revealEnd->setIsSecret(_singleElement->getValue());
+    } catch (...) {
+    }
+  }
+
   void updateHostWarning() {
     double t1 = 0.0, t2 = 0.0;
     bool ok = true;
@@ -687,6 +714,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::BooleanParam* _autoSlant;
   OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder;
   OFX::IntParam *_revealStart, *_revealEnd;
+  OFX::BooleanParam *_singleElement, *_orderPick;
   OFX::PushButtonParam* _clearOverrides;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
@@ -1193,7 +1221,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // including a hand-written one.
   {
     const int first = std::max(1, _revealStart->getValueAtTime(args.time));
-    const int last = std::max(0, _revealEnd->getValueAtTime(args.time));
+    const int last = _singleElement->getValueAtTime(args.time)
+                         ? first
+                         : std::max(0, _revealEnd->getValueAtTime(args.time));
     rta::applyRevealRange(useSeg->groups, useSeg->lineCount, anim.in.lineOrder, first, last, taps,
                           &transforms);
   }
@@ -1395,6 +1425,18 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     addParam(page, p);
   }
   {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("orderPick");
+    p->setLabels("Set Order By Clicking", "Pick Order", "Set Order By Clicking");
+    p->setHint(
+        "Turns the viewer into an order picker: click the elements in the sequence you want "
+        "them to reveal, and each one takes the next number. Click a numbered element again "
+        "to take it back out. Needs Show Detection on, and switches Order to Manual for you. "
+        "Anything you never click follows in normal reading order, so a sequence usually "
+        "means clicking one or two things rather than all of them.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
     OFX::IntParamDescriptor* p = desc.defineIntParam("revealStart");
     p->setLabels("Start At Element", "Start At", "Start At Element");
     p->setHint(
@@ -1405,6 +1447,16 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(1, 10000);
     p->setDisplayRange(1, 40);
     p->setDefault(1);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("singleElement");
+    p->setLabels("One Element Per Clip", "One Per Clip", "One Element Per Clip");
+    p->setHint(
+        "Introduce exactly one element on this clip, the one named by Start At. End At "
+        "follows it and is hidden, so stepping through a build is one number per cut instead "
+        "of two kept in step by hand.");
+    p->setDefault(false);
     addParam(page, p);
   }
   {
