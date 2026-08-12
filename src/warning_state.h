@@ -13,6 +13,7 @@
 
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace rta {
@@ -23,8 +24,14 @@ struct WarningState {
   bool sourceOffset = false;
   // An animation does not have room to finish inside the clip.
   bool clipTooShort = false;
+  // The reference text could not be reconciled with the pixels, so automatic
+  // detection was used instead. A warning rather than a status line because the
+  // fallback is invisible otherwise -- the result would simply look like the
+  // string had been ignored.
+  bool referenceMismatch = false;
+  std::string referenceMessage;
 
-  bool any() const { return sourceOffset || clipTooShort; }
+  bool any() const { return sourceOffset || clipTooShort || referenceMismatch; }
 };
 
 namespace detail {

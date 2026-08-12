@@ -255,11 +255,14 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _minBlobArea = fetchIntParam("minBlobArea");
     _wordGapSensitivity = fetchDoubleParam("wordGapSensitivity");
     _autoSlant = fetchBooleanParam("autoSlant");
+    _referenceText = fetchStringParam("referenceText");
     _mergeAt = fetchStringParam("mergeAt");
     _splitBefore = fetchStringParam("splitBefore");
     _clearOverrides = fetchPushButtonParam("clearOverrides");
     _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
+    _charPadding = fetchDoubleParam("charPadding");
+    _minMarkArea = fetchDoubleParam("minMarkArea");
     _maxLetterGap = fetchDoubleParam("characterGap");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");
@@ -663,8 +666,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_startRotation, *_startBlur, *_shutterAngle;
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant, *_maxLetterGap;
+  OFX::DoubleParam *_charPadding, *_minMarkArea;
   OFX::BooleanParam* _autoSlant;
-  OFX::StringParam *_mergeAt, *_splitBefore;
+  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText;
   OFX::PushButtonParam* _clearOverrides;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
@@ -780,10 +784,13 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     _splitBefore->getValueAtTime(args.time, sp);
     det.mergeAt = parseIndexList(m);
     det.splitBefore = parseIndexList(sp);
+    _referenceText->getValueAtTime(args.time, det.referenceText);
   }
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
   det.bridgeRadius = std::max(0, _bridgeRadius->getValueAtTime(args.time));
+  det.charPadding = float(std::max(0.0, _charPadding->getValueAtTime(args.time)));
+  det.minMarkArea = float(std::max(0.0, _minMarkArea->getValueAtTime(args.time)));
   det.maxLetterGap = float(std::max(0.0, _maxLetterGap->getValueAtTime(args.time)));
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
@@ -1110,6 +1117,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     rta::WarningState w;
     w.sourceOffset = wok && wt1 < 0.0;
     w.clipTooShort = !fit.ok();
+    w.referenceMismatch = useSeg->refStatus == rta::RefStatus::Failed;
+    w.referenceMessage = useSeg->refMessage;
     rta::setWarningState(this, w);
 
     // Publish what detection measured, so the overlay can show it and ticking
@@ -1826,14 +1835,48 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       addParam(page, p);
     }
     {
-      OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("charPadding");
       p->setLabels("Character Padding", "Char Padding", "Character Padding");
       p->setHint(
-          "Grows every mark by this many pixels before the characters are found, so strokes "
-          "that nearly touch become one character. For script faces whose hairline joins "
-          "break a cursive word into fragments. Note this FUSES what it joins, so pushing it "
+          "Grows every mark before the characters are found, so strokes that nearly touch "
+          "become one character. For script faces whose hairline joins break a cursive word "
+          "into fragments. Measured as a FRACTION OF LETTER HEIGHT, so it means the same "
+          "thing in proxy as at full resolution -- a pixel value does not, and half "
+          "resolution regroups the whole frame. Note this FUSES what it joins, so pushing it "
           "far enough to weld whole words also destroys the characters inside them -- use "
           "Character Gap for word grouping instead.");
+      p->setRange(0.0, 1.0);
+      p->setDisplayRange(0.0, 0.3);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("minMarkArea");
+      p->setLabels("Min Mark Size", "Min Mark", "Minimum Mark Size");
+      p->setHint(
+          "Discards specks smaller than this share of a letter's area -- the relative "
+          "counterpart of Min Blob Area, so the same setting throws away the same specks "
+          "whatever the render resolution. Whichever of the two is stricter wins. 0 leaves "
+          "despeckling to Min Blob Area alone.");
+      p->setRange(0.0, 0.2);
+      p->setDisplayRange(0.0, 0.02);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      // Kept and still honoured: a project saved before Character Padding became
+      // relative carries a pixel value, and OFX gives no way to tell that save
+      // from a fresh instance -- an absent parameter restores to its default
+      // either way. The two are added, so an old comp opens unchanged while new
+      // work uses the relative control above.
+      OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
+      p->setLabels("Character Padding (px)", "Char Pad px", "Character Padding, pixels");
+      p->setHint(
+          "The older pixel-based Character Padding, kept so existing projects keep the "
+          "grouping they were saved with. It is ADDED to Character Padding above. Pixels do "
+          "not survive a change of resolution, so leave this at 0 for new work.");
       p->setRange(0, 128);
       p->setDisplayRange(0, 40);
       p->setDefault(0);
@@ -1859,6 +1902,23 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->setRange(-45.0, 45.0);
       p->setDisplayRange(-30.0, 30.0);
       p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::StringParamDescriptor* p = desc.defineStringParam("referenceText");
+      p->setLabels("Reference Text", "Ref Text", "Reference Text");
+      p->setHint(
+          "The words the title actually says. Leave EMPTY for automatic detection -- nothing "
+          "about detection changes while it is. Filled in, it takes over: characters that "
+          "broke into several marks (a quote mark is the usual one) are joined back together "
+          "until the count matches, and words are cut at the spaces you typed instead of by "
+          "measured gaps. Type the text as it appears; line breaks are found from the picture, "
+          "so spaces are all that is needed. Punctuation counts as characters. If the text and "
+          "the picture disagree, a warning appears over the viewer and automatic detection is "
+          "used -- this happens when letters RUN TOGETHER, since an 'ff' ligature or a script "
+          "face is a single mark that cannot be told apart, and no count can undo that.");
+      p->setDefault("");
       p->setParent(*g);
       addParam(page, p);
     }

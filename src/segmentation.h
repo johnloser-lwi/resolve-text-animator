@@ -1,12 +1,17 @@
 // Recovers text structure from rendered pixels alone.
 //
 // The pipeline is: alpha mask -> connected components -> glyphs -> lines ->
-// words. No text metadata is involved anywhere; every grouping decision comes
-// from measuring pixel distances, which is what makes this work on any title
-// generator that produces an alpha channel.
+// words. By default no text metadata is involved anywhere; every grouping
+// decision comes from measuring pixel distances, which is what makes this work
+// on any title generator that produces an alpha channel.
+//
+// The one exception is opt-in: supply DetectParams::referenceText and the string
+// decides the character and word boundaries instead of the gap statistics. Left
+// empty -- which it is by default -- the pipeline is exactly as described above.
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -20,6 +25,31 @@ struct DetectParams {
   float alphaThreshold = 0.15f;
   int minBlobArea = 4;           // in pixels, at analysis resolution
   float wordGapSensitivity = 1.0f;
+
+  // Despeckling and bridging, as FRACTIONS OF LETTER HEIGHT.
+  //
+  // The pixel-denominated pair below them means something different at every
+  // resolution: the same Character Padding of 3px gave 9 units at full res and 4
+  // at half on the same title, so a proxy render regrouped the whole frame. Every
+  // other threshold here is already relative for exactly this reason; these two
+  // were the last absolute ones.
+  //
+  // The yardstick is the median LINE height, measured from the ink profile before
+  // anything is labelled -- so it is available before bridging, which has to
+  // happen first, and it tracks proxy scale, timeline resolution and point size
+  // together the way letter height does.
+  //
+  // charPadding is a radius, so it scales with height; minMarkArea is an area, so
+  // it scales with height SQUARED.
+  float charPadding = 0.0f;
+  float minMarkArea = 0.0f;
+
+  // Legacy pixel controls. Kept, and ADDED to the relative pair above, because a
+  // project saved before the change carries a pixel value and no host signal says
+  // it is old -- OFX restores an absent parameter to its default, so a version
+  // flag cannot tell a fresh instance from an old save. Leaving these live means
+  // an existing comp opens grouping exactly as it did, while new work uses the
+  // relative controls and survives proxy.
   int bridgeRadius = 0;          // dilate before labeling, to join script fonts
 
   // The widest gap that still counts as being INSIDE a word, as a FRACTION OF
@@ -66,15 +96,33 @@ struct DetectParams {
   std::vector<int> mergeAt;
   std::vector<int> splitBefore;
 
+  // The text the title actually says. Empty means automatic detection, and with
+  // it empty NOT ONE branch of the pipeline behaves differently -- this is an
+  // extra layer of protection over a detector that is already good, never a
+  // replacement for it.
+  //
+  // Supplied, it is AUTHORITATIVE rather than advisory. The marks on each line
+  // are merged down until their count equals that line's character count, and
+  // the word cuts come from the string's spaces; no gap statistic decides
+  // anything. Advisory was tried first -- the string supplied word counts while
+  // the gaps still placed the cuts -- and improved nothing.
+  //
+  // Whitespace only separates words. Line breaks come from the PIXELS: text
+  // wraps at word boundaries, so words pack onto the detected lines in reading
+  // order, and a newline in the string means no more than a space.
+  std::string referenceText;
+
   bool autoSlant = true;         // measure the slant from the image
   float italicSlant = 0.0f;      // degrees, used when autoSlant is off
 
   bool operator==(const DetectParams& o) const {
     return alphaThreshold == o.alphaThreshold && minBlobArea == o.minBlobArea &&
-           wordGapSensitivity == o.wordGapSensitivity &&
+           wordGapSensitivity == o.wordGapSensitivity && charPadding == o.charPadding &&
+           minMarkArea == o.minMarkArea &&
            bridgeRadius == o.bridgeRadius && maxLetterGap == o.maxLetterGap && mode == o.mode &&
            autoSlant == o.autoSlant && italicSlant == o.italicSlant &&
-           mergeAt == o.mergeAt && splitBefore == o.splitBefore;
+           mergeAt == o.mergeAt && splitBefore == o.splitBefore &&
+           referenceText == o.referenceText;
   }
   bool operator!=(const DetectParams& o) const { return !(*this == o); }
 };
@@ -116,6 +164,13 @@ struct Group {
   std::vector<int> labels;  // component labels belonging to this group
 };
 
+// What the reference text did, if anything.
+//
+// Failed matters as much as Applied: the pixels and the string disagreed, the
+// automatic result is what came out, and the user has to be TOLD that -- a
+// silent fallback would look like the string was honoured.
+enum class RefStatus { NotUsed = 0, Applied, Failed };
+
 struct Segmentation {
   int width = 0;
   int height = 0;
@@ -131,6 +186,11 @@ struct Segmentation {
   // to disagree. Shear at row y is (y - height/2) * slantTan.
   float slantDegrees = 0.0f;
   float slantTan = 0.0f;
+
+  RefStatus refStatus = RefStatus::NotUsed;
+  // Why it failed, in the user's terms -- which line, and the two counts that
+  // disagreed. Empty unless refStatus is Failed.
+  std::string refMessage;
 
   bool empty() const { return groups.empty(); }
 };

@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <numeric>
+#include <string>
 
 namespace rta {
 namespace {
@@ -186,6 +188,154 @@ bool sameGlyph(const Component& a, const Component& b) {
          yOverlapRatio(a.bbox, b.bbox) <= 0.2f;
 }
 
+// ------------------------------------------------------------ reference text
+
+// What a character is allowed to be made of: how many marks, and in what
+// arrangement.
+//
+// This is what makes the string worth more than its length. Knowing that
+// character 27 is a quote says the two strokes there belong together; knowing
+// only that the line holds 28 characters does not, and gap size alone gets it
+// wrong -- an 'r' kerns tighter against a following quote than the quote's own
+// two strokes are spaced, so "merge the closest pair" fuses the r to half the
+// quote and leaves the other half stranded.
+//
+// The SHAPE matters as much as the count, and leaving it out was a bug worth
+// recording. Allowing 'i' two marks unconditionally is true -- a dotted i is a
+// dot and a stem -- but §7 has almost always joined those already, so the spare
+// allowance had nothing of its own left to claim and was spent swallowing the
+// NEXT LETTER instead, at no cost. Which merge won then came down to gap size
+// again, and a trailing full stop was enough to tip it: an 8px full stop drags
+// down the median glyph height that normalises gaps nearby, the closing quote's
+// own gap normalises larger, and the bogus merge became the cheaper reading.
+//
+// So each character says how its marks must SIT relative to one another, and a
+// run that does not look like that is not the character, whatever the count.
+enum class MarkShape {
+  Single,       // one mark; nothing to check
+  SideBySide,   // strokes in the same vertical band -- a quote, an ellipsis
+  Stacked,      // one part clear above the other -- a dot, a diacritic, a colon
+};
+
+struct CharSpec {
+  int allow = 1;
+  MarkShape shape = MarkShape::Single;
+};
+
+CharSpec expectedMarks(uint32_t cp) {
+  switch (cp) {
+    // Side by side. These are the ones §7 CANNOT join: the strokes share a
+    // vertical band, so the diacritic rule's demand for vertical separation
+    // never fires, and no amount of tuning it would help.
+    case 0x0022:  // "
+    case 0x201C:  // “
+    case 0x201D:  // ”
+    case 0x201E:  // „
+    case 0x201F:
+    case 0x2033:  // ″
+    case 0x00AB:  // «
+    case 0x00BB:  // »
+    case 0x2039:  // ‹
+    case 0x203A:  // ›
+      return {2, MarkShape::SideBySide};
+    case 0x2034:  // ‴
+    case 0x2026:  // …
+    case 0x0025:  // %
+      return {3, MarkShape::SideBySide};
+    case 0x2030:  // ‰
+      return {4, MarkShape::SideBySide};
+
+    // Stacked. §7 normally joins these already, so the allowance is a safety net
+    // for a face where it misses -- and, because the shape is checked, a net that
+    // cannot be spent on a neighbouring letter.
+    case 0x00A8:  // ¨
+    case 0x003D:  // =
+    case 0x003A:  // :
+    case 0x003B:  // ;
+    case 0x0021:  // !
+    case 0x003F:  // ?
+    case 0x0069:  // i
+    case 0x006A:  // j
+      return {2, MarkShape::Stacked};
+
+    default:
+      // Accented Latin and beyond: the mark may or may not have been folded into
+      // its base already, so allow the pair without insisting on it.
+      return cp >= 0x00C0u ? CharSpec{2, MarkShape::Stacked} : CharSpec{1, MarkShape::Single};
+  }
+}
+
+// Do two marks sit the way this character's parts have to sit?
+//
+// SideBySide wants the same vertical band AND similar heights. The band alone is
+// not enough: a quote stroke lies entirely within the vertical span of the letter
+// beside it, so it "overlaps" that letter completely -- it is the height that
+// tells a 23px stroke from the 66px 't' next to it.
+//
+// Stacked wants them vertically clear of each other, which is the same test §7
+// uses for a dot and its stem.
+bool shapeFits(MarkShape s, const RectI& a, const RectI& b) {
+  const float yo = yOverlapRatio(a, b);
+  if (s == MarkShape::Stacked) return yo <= 0.3f;
+  const float ha = float(std::max(1, a.height())), hb = float(std::max(1, b.height()));
+  return yo >= 0.5f && std::min(ha, hb) / std::max(ha, hb) >= 0.6f;
+}
+
+// The reference string as words, each word a list of PER-CHARACTER specs -- so a
+// word's length is its character count and its contents say which of those
+// characters may legitimately be several marks, and how those marks must sit.
+//
+// Read in CODEPOINTS, not bytes: a two-byte 'a-umlaut' is one letter on screen
+// and has to be one here. A combining mark is not a character of its own --
+// glyph assembly folds a diacritic into its base -- so it does not add to the
+// count; it raises the allowance of the character it modifies instead, which is
+// what a decomposed 'a' + U+0308 actually costs in marks. Punctuation is an
+// ordinary character throughout: a full stop counts here exactly as it counts in
+// the picture, which is what keeps the two sides of the sum honest.
+std::vector<std::vector<CharSpec>> referenceWords(const std::string& s) {
+  std::vector<std::vector<CharSpec>> words;
+  std::vector<CharSpec> cur;
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char b = uint8_t(s[i]);
+    // Everything below the space is a separator -- spaces, tabs, newlines. UTF-8
+    // never puts a byte this low inside a multi-byte sequence, so this cannot
+    // cut one in half.
+    if (b <= ' ') {
+      if (!cur.empty()) words.push_back(std::move(cur));
+      cur.clear();
+      ++i;
+      continue;
+    }
+
+    uint32_t cp = b;
+    size_t len = 1;
+    if ((b & 0xE0u) == 0xC0u) {
+      cp = b & 0x1Fu;
+      len = 2;
+    } else if ((b & 0xF0u) == 0xE0u) {
+      cp = b & 0x0Fu;
+      len = 3;
+    } else if ((b & 0xF8u) == 0xF0u) {
+      cp = b & 0x07u;
+      len = 4;
+    }
+    for (size_t k = 1; k < len && i + k < s.size(); ++k)
+      cp = (cp << 6) | (uint8_t(s[i + k]) & 0x3Fu);
+    i += len;
+
+    if (cp >= 0x0300u && cp <= 0x036Fu) {  // combining mark: part of its base
+      if (!cur.empty()) {
+        ++cur.back().allow;
+        cur.back().shape = MarkShape::Stacked;  // a diacritic sits above its base
+      }
+      continue;
+    }
+    cur.push_back(expectedMarks(cp));
+  }
+  if (!cur.empty()) words.push_back(std::move(cur));
+  return words;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -230,11 +380,56 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   }
   if (!any) return seg;
 
+  // 1b. Letter height, in pixels, for the relative controls.
+  //
+  // Taken from the INK PROFILE rather than from glyphs, because bridging happens
+  // next and needs the answer before anything has been labelled. Rows carrying
+  // ink form bands; the median band height is the line height, which tracks proxy
+  // scale, timeline resolution and point size exactly as letter height does.
+  //
+  // Median over bands, so a stray one-line caption beside a large title does not
+  // set the scale for both.
+  float letterHeight = 0.0f;
+  {
+    std::vector<uint8_t> rowInk(size_t(h), 0);
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* row = &mask[size_t(y) * w];
+      for (int x = 0; x < w; ++x) {
+        if (row[x]) {
+          rowInk[size_t(y)] = 1;
+          break;
+        }
+      }
+    }
+    std::vector<int> bands;
+    for (int y = 0; y < h;) {
+      if (!rowInk[size_t(y)]) {
+        ++y;
+        continue;
+      }
+      const int start = y;
+      while (y < h && rowInk[size_t(y)]) ++y;
+      bands.push_back(y - start);
+    }
+    if (!bands.empty()) {
+      std::nth_element(bands.begin(), bands.begin() + bands.size() / 2, bands.end());
+      letterHeight = float(bands[bands.size() / 2]);
+    }
+  }
+
+  // Relative settings resolved to pixels, ADDED to the legacy pixel ones so an
+  // older project keeps the grouping it was saved with.
+  const int bridgePx =
+      params.bridgeRadius + int(std::lround(double(params.charPadding) * double(letterHeight)));
+  const int minArea = std::max(
+      params.minBlobArea,
+      int(std::lround(double(params.minMarkArea) * double(letterHeight) * double(letterHeight))));
+
   // 2. Optional bridge dilation. Labels are computed on the dilated mask but
   //    written back only onto true text pixels, so bboxes stay accurate.
   std::vector<uint8_t> dilated;
-  if (params.bridgeRadius > 0) dilated = dilate(mask, w, h, params.bridgeRadius);
-  const std::vector<uint8_t>& labelMask = params.bridgeRadius > 0 ? dilated : mask;
+  if (bridgePx > 0) dilated = dilate(mask, w, h, bridgePx);
+  const std::vector<uint8_t>& labelMask = bridgePx > 0 ? dilated : mask;
 
   // 3. Connected components, 8-connectivity, two-pass with union-find.
   std::vector<int32_t> prov(size_t(w) * h, 0);
@@ -314,7 +509,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   }
 
   // 5. Despeckle: antialiasing debris and stray dots are not glyphs.
-  for (int l = 1; l <= labelCount; ++l) comps[l].alive = comps[l].area >= params.minBlobArea;
+  for (int l = 1; l <= labelCount; ++l) comps[l].alive = comps[l].area >= minArea;
   for (size_t p = 0; p < seg.labelImage.size(); ++p) {
     const int32_t l = seg.labelImage[p];
     if (l != 0 && !comps[l].alive) seg.labelImage[p] = 0;
@@ -519,6 +714,327 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     }
   }
 
+  // 8b. Reference text reconciliation.
+  //
+  // OPT-IN, and inert when the string is empty: everything below this block is
+  // reached unchanged in that case. This is a layer over a detector that already
+  // works, not a replacement for it.
+  //
+  // Two things happen, in this order:
+  //
+  //   MERGE. A character can render as several disconnected marks that the glyph
+  //   rule cannot rejoin -- a '"' is two marks SIDE BY SIDE, so they share a
+  //   vertical band and the diacritic rule (x-overlap plus vertical separation,
+  //   which handles 'i' and umlauts) never fires. The marks of each line are
+  //   aligned against the CHARACTERS of the string, so the merge lands where the
+  //   text says a multi-stroke character is -- not merely where the pixels happen
+  //   to be closest. Closest-first is not good enough: an 'r' kerns tighter
+  //   against a following quote than the quote's own strokes are spaced, which
+  //   fuses the 'r' to half the quote and strands the other half.
+  //
+  //   CUT. Word boundaries then come from the string's spaces. No gap statistic
+  //   is consulted -- not Otsu, not Word Gap, not Character Gap.
+  //
+  // Merging fixes OVER-splitting only. Two characters that touched and labelled
+  // as one mark cannot be recovered this way, and guessing a split position
+  // inside a mark would be inventing data, so that case reports and falls back.
+  std::vector<std::vector<int>> refWordStarts;  // per line, first glyph of each word
+  bool refApplied = false;
+  if (!params.referenceText.empty()) {
+    // Each word is a list of per-character mark allowances, so a word's size is
+    // its character count and its contents drive the alignment below.
+    const std::vector<std::vector<CharSpec>> words = referenceWords(params.referenceText);
+
+    // Lines that actually carry marks. A line span always has ink when it is
+    // found, but a line whose every component was despeckled away has none, and
+    // it must not claim a word.
+    std::vector<size_t> rows;
+    for (size_t li = 0; li < lineGlyphs.size(); ++li)
+      if (!lineGlyphs[li].empty()) rows.push_back(li);
+
+    const size_t K = rows.size(), N = words.size();
+    std::vector<int> marks(K, 0);
+    long long totalMarks = 0, totalChars = 0;
+    for (size_t i = 0; i < K; ++i) {
+      marks[i] = int(lineGlyphs[rows[i]].size());
+      totalMarks += marks[i];
+    }
+    for (const auto& wd : words) totalChars += int(wd.size());
+
+    // Prefix sums, so a chunk's character count is one subtraction.
+    std::vector<long long> pre(N + 1, 0);
+    for (size_t j = 0; j < N; ++j) pre[j + 1] = pre[j] + int(words[j].size());
+
+    std::string fail;
+    if (N == 0) {
+      fail = "the reference text has no words";
+    } else if (N < K) {
+      fail = "the reference text has " + std::to_string(N) + " word" + (N == 1 ? "" : "s") +
+             " for " + std::to_string(K) + " detected lines";
+    } else if (totalChars > totalMarks) {
+      // Say WHY, because the count alone leaves nothing to act on. Marks falling
+      // short of characters always means letters ran together: an 'ff' ligature,
+      // a script face, or tracking tight enough to close the gap.
+      fail = "the text has " + std::to_string(totalChars) + " characters but " +
+             std::to_string(totalMarks) +
+             " marks were found - joined letters (a ligature, or a script face) count as one";
+    }
+
+    // Words pack onto lines in reading order: a wrapped line breaks at a word
+    // boundary, so each line takes a contiguous run of words. Marks can only ever
+    // EXCEED characters, never fall short, so a line's run must fit within its
+    // mark count -- and every line must take at least one word, since a detected
+    // line has ink in it.
+    //
+    // feasible[i][j] asks whether lines i.. can consume words j.. . Built
+    // backwards, it turns the search into a walk that can never enter a dead end.
+    std::vector<std::vector<char>> feasible;
+    if (fail.empty()) {
+      feasible.assign(K + 1, std::vector<char>(N + 1, 0));
+      feasible[K][N] = 1;
+      for (size_t i = K; i-- > 0;) {
+        for (size_t j = 0; j < N; ++j) {
+          for (size_t e = j + 1; e <= N; ++e) {
+            if (pre[e] - pre[j] > marks[i]) break;  // only grows from here
+            if (feasible[i + 1][e]) {
+              feasible[i][j] = 1;
+              break;
+            }
+          }
+        }
+      }
+      if (!feasible[0][0]) {
+        // Name where it dies rather than restating the totals. Forward
+        // reachability ignoring feasibility: the deepest line any packing can
+        // reach at all is the one that could not be satisfied.
+        std::vector<char> reach(N + 1, 0);
+        reach[0] = 1;
+        size_t at = 0;
+        for (; at < K; ++at) {
+          std::vector<char> next(N + 1, 0);
+          bool advanced = false;
+          for (size_t j = 0; j < N; ++j) {
+            if (!reach[j]) continue;
+            for (size_t e = j + 1; e <= N && pre[e] - pre[j] <= marks[at]; ++e) {
+              next[e] = 1;
+              advanced = true;
+            }
+          }
+          if (!advanced) break;
+          reach.swap(next);
+        }
+        const size_t line = std::min(at, K - 1);
+        fail = "line " + std::to_string(line + 1) + " has " + std::to_string(marks[line]) +
+               " marks, too few for the words the text puts on it";
+      }
+    }
+
+    // The characters a packing puts on one line, flattened out of its words.
+    auto lineChars = [&](size_t from, size_t to) {
+      std::vector<CharSpec> spec;
+      for (size_t wi = from; wi < to; ++wi)
+        spec.insert(spec.end(), words[wi].begin(), words[wi].end());
+      return spec;
+    };
+
+    // Aligning one line's MARKS against its CHARACTERS, left to right.
+    //
+    // Every character takes at least one mark, and takes several only where the
+    // string says it may -- a quote is allowed two strokes, an ordinary letter is
+    // not. That is the whole point of being handed the text: the merge lands on
+    // the character that is genuinely made of two pieces, instead of wherever the
+    // pixels happen to sit closest. An 'r' followed by a closing quote is exactly
+    // where closest-first goes wrong, because the kern is tighter than the gap
+    // inside the quote itself.
+    //
+    // A character takes several marks only when the count AND the arrangement
+    // both fit -- a quote's two strokes stand side by side at matching heights, a
+    // dot sits clear above its stem. Without the arrangement test the allowance
+    // gets spent on whatever happens to be adjacent, which is how a trailing full
+    // stop was able to move the merges to the wrong place entirely.
+    //
+    // Unexpected merges are not forbidden, only made expensive: a face that
+    // shatters a letter no different from any other still reconciles, it simply
+    // loses to any reading that does not have to. Among readings of equal cost
+    // the narrower gaps win, which is the old behaviour and the right tie-break.
+    //
+    // Returns the first mark of each character, and the cost of the reading;
+    // `starts` is left empty when the line cannot be read at all.
+    struct Reading {
+      std::vector<int> starts;
+      double cost = 0.0;
+    };
+    auto alignLine = [&](size_t li, const std::vector<CharSpec>& spec) {
+      const size_t M = lineGlyphs[li].size(), C = spec.size();
+      Reading out;
+      if (C == 0 || C > M) return out;
+
+      // Cost of a character taking a mark it was never entitled to, or taking one
+      // that does not sit the way its parts do. Normalised gaps live below ~2, so
+      // this cannot be outweighed by any sum of them.
+      const double kUnexpected = 1000.0;
+      const size_t slack = M - C;  // no character can take more than this extra
+
+      const double kInf = std::numeric_limits<double>::infinity();
+      std::vector<double> cost((C + 1) * (M + 1), kInf);
+      std::vector<int> take((C + 1) * (M + 1), 0);
+      auto at = [&](size_t j, size_t s) { return j * (M + 1) + s; };
+      cost[at(0, 0)] = 0.0;
+
+      for (size_t j = 0; j < C; ++j) {
+        for (size_t s = 0; s <= M; ++s) {
+          const double base = cost[at(j, s)];
+          if (base == kInf) continue;
+          const size_t maxK = std::min(slack + 1, M - s);
+          double gapSum = 0.0;
+          bool fits = true;  // do the marks so far sit the way this character's do
+          for (size_t k = 1; k <= maxK; ++k) {
+            // Marks [s, s+k) form this character; its internal gaps are the ones
+            // it swallows, and each newly added mark must sit against the one
+            // before it the way this character's parts do.
+            if (k > 1) {
+              gapSum += double(lineNorm[li][s + k - 1]);
+              fits = fits && shapeFits(spec[j].shape, lineGlyphs[li][s + k - 2].bbox,
+                                       lineGlyphs[li][s + k - 1].bbox);
+            }
+            const double extra = (int(k) > spec[j].allow || !fits)
+                                     ? kUnexpected * double(int(k) - 1)
+                                     : 0.0;
+            const double c = base + gapSum + extra;
+            if (c < cost[at(j + 1, s + k)]) {
+              cost[at(j + 1, s + k)] = c;
+              take[at(j + 1, s + k)] = int(k);
+            }
+          }
+        }
+      }
+      if (cost[at(C, M)] == kInf) return out;
+
+      out.cost = cost[at(C, M)];
+      out.starts.assign(C, 0);
+      size_t s = M;
+      for (size_t j = C; j-- > 0;) {
+        s -= size_t(take[at(j + 1, s)]);
+        out.starts[j] = int(s);
+      }
+      return out;
+    };
+
+    // A candidate packing, and how well the pixels agree with it.
+    struct Packing {
+      std::vector<size_t> bounds;  // word index each line starts at, plus N
+      double cost = 0.0;
+    };
+
+    std::vector<Packing> best;
+    if (fail.empty()) {
+      // When nothing over-split, every line must be filled to the character, so
+      // the packing is forced and the search below finds the one answer. Slack
+      // admits a handful more, and the alignment cost breaks the tie -- the
+      // packing whose merges the string actually accounts for.
+      const int kMaxCandidates = 256;
+      int seen = 0;
+
+      auto score = [&](const std::vector<size_t>& bounds) {
+        double total = 0.0;
+        for (size_t i = 0; i < K; ++i) {
+          const Reading r = alignLine(rows[i], lineChars(bounds[i], bounds[i + 1]));
+          if (r.starts.empty()) return std::numeric_limits<double>::infinity();
+          total += r.cost;
+        }
+        return total;
+      };
+
+      std::vector<size_t> bounds(K + 1, 0);
+      bounds[K] = N;
+      std::function<void(size_t, size_t)> walk = [&](size_t i, size_t j) {
+        if (seen >= kMaxCandidates) return;
+        if (i == K) {
+          if (j != N) return;
+          ++seen;
+          Packing p;
+          p.bounds = bounds;
+          p.cost = score(bounds);
+          best.push_back(std::move(p));
+          return;
+        }
+        for (size_t e = j + 1; e <= N && pre[e] - pre[j] <= marks[i]; ++e) {
+          if (!feasible[i + 1][e]) continue;
+          bounds[i + 1] = e;
+          walk(i + 1, e);
+          if (seen >= kMaxCandidates) return;
+        }
+      };
+      bounds[0] = 0;
+      walk(0, 0);
+      if (best.empty()) fail = "the reference text could not be matched to the detected lines";
+    }
+
+    if (fail.empty()) {
+      // Cheapest reading wins; ties go to the packing found first, which is the
+      // one that fills the earlier lines fullest -- what wrapping does.
+      size_t pick = 0;
+      for (size_t i = 1; i < best.size(); ++i)
+        if (best[i].cost < best[pick].cost) pick = i;
+      const std::vector<size_t>& bounds = best[pick].bounds;
+
+      // Commit. Only now is anything mutated, so a failure above leaves the
+      // automatic result exactly as it was.
+      refWordStarts.assign(lineGlyphs.size(), {});
+      for (size_t i = 0; i < K; ++i) {
+        const size_t li = rows[i];
+        const Reading r = alignLine(li, lineChars(bounds[i], bounds[i + 1]));
+
+        // Fuse the run of marks each character claimed -- the same union §7 does
+        // when it joins a dot to its stem.
+        const std::vector<int>& starts = r.starts;
+        if (starts.empty()) continue;  // scoring already proved this reads
+
+        std::vector<Glyph> merged;
+        std::vector<float> nrm, gmin, gaps;
+        merged.reserve(starts.size());
+        for (size_t k = 0; k < starts.size(); ++k) {
+          const size_t from = size_t(starts[k]);
+          const size_t to = k + 1 < starts.size() ? size_t(starts[k + 1]) : lineGlyphs[li].size();
+          Glyph g = lineGlyphs[li][from];
+          for (size_t m = from + 1; m < to; ++m) {
+            g.bbox.unionWith(lineGlyphs[li][m].bbox);
+            g.sx1 = std::min(g.sx1, lineGlyphs[li][m].sx1);
+            g.sx2 = std::max(g.sx2, lineGlyphs[li][m].sx2);
+            g.labels.insert(g.labels.end(), lineGlyphs[li][m].labels.begin(),
+                            lineGlyphs[li][m].labels.end());
+          }
+          merged.push_back(std::move(g));
+          // A surviving boundary keeps the gap it always had; merging never
+          // changes the distance between what is left.
+          const size_t b = k == 0 ? 0 : size_t(starts[k]);
+          nrm.push_back(k == 0 ? 0.0f : lineNorm[li][b]);
+          gmin.push_back(k == 0 ? 0.0f : lineGapMin[li][b]);
+          gaps.push_back(k == 0 ? 0.0f : lineGaps[li][b]);
+        }
+        lineGlyphs[li].swap(merged);
+        lineNorm[li].swap(nrm);
+        lineGapMin[li].swap(gmin);
+        lineGaps[li].swap(gaps);
+
+        // Word cuts, in the merged numbering: the string's spaces, nothing else.
+        std::vector<int>& ws = refWordStarts[li];
+        int at = 0;
+        for (size_t wi = bounds[i]; wi < bounds[i + 1]; ++wi) {
+          ws.push_back(at);
+          at += int(words[wi].size());
+        }
+      }
+      refApplied = true;
+      seg.refStatus = RefStatus::Applied;
+    } else {
+      // Loud, and the automatic detection stands. A silent fallback would look
+      // like the string had been honoured.
+      seg.refStatus = RefStatus::Failed;
+      seg.refMessage = fail;
+    }
+  }
+
   // A typeface sets two kinds of gap -- between letters, and between words --
   // and in normalised units the two clusters land in the same place whatever the
   // face. Otsu's method finds the split between them directly.
@@ -611,6 +1127,29 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       }
 
       case GroupMode::Word: {
+        // With reference text the cuts are already known -- they are the spaces
+        // in the string -- so none of the gap machinery below is consulted.
+        if (refApplied) {
+          const std::vector<int>& ws = refWordStarts[li];
+          for (size_t k = 0; k < ws.size(); ++k) {
+            const size_t from = size_t(ws[k]);
+            const size_t to = k + 1 < ws.size() ? size_t(ws[k + 1]) : glyphs.size();
+            if (from >= glyphs.size() || to <= from) continue;
+            RectI box = glyphs[from].bbox;
+            float lo = glyphs[from].sx1, hi = glyphs[from].sx2;
+            std::vector<int> labels = glyphs[from].labels;
+            for (size_t j = from + 1; j < to && j < glyphs.size(); ++j) {
+              box.unionWith(glyphs[j].bbox);
+              lo = std::min(lo, glyphs[j].sx1);
+              hi = std::max(hi, glyphs[j].sx2);
+              labels.insert(labels.end(), glyphs[j].labels.begin(), glyphs[j].labels.end());
+            }
+            pushGroup(box, lo, hi, int(std::min(to, glyphs.size()) - from), int(li), int(k),
+                      int(from), std::move(labels));
+          }
+          break;
+        }
+
         RectI box = glyphs[0].bbox;
         float lo = glyphs[0].sx1, hi = glyphs[0].sx2;
         std::vector<int> labels = glyphs[0].labels;

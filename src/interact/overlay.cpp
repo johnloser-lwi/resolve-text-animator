@@ -112,6 +112,15 @@ class CurveInteract : public OFX::OverlayInteract {
     if (w.sourceOffset) {
       Text(c, "(!) SOURCE OFFSET - reveal starts late. Lower Start (frames), or work in Fusion.",
            x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+      y -= c.sy(22.0);
+    }
+    if (w.referenceMismatch) {
+      // The reason is worth carrying through -- "does not match" alone leaves
+      // the user counting letters to find out which line and by how much.
+      Text(c,
+           "(!) REFERENCE TEXT DOES NOT MATCH - " + w.referenceMessage +
+               ". Using automatic detection.",
+           x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
     }
   }
 

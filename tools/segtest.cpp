@@ -78,6 +78,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: segtest <in.png> <out.png> [--mode char|word|line]\n"
                  "  detection: --gap N --alpha N --bridge N --minarea N\n"
+                 "             --pad F --minmark F   (relative: fractions of letter height)\n"
+                 "             --reftext \"THE WORDS THE TITLE SAYS\"\n"
                  "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
                  "             --angle DEG --easing 0-4 --order 0-3 --lineorder 0|1\n"
                  "             --rotate DEG --blur PX --mblur 0|1 --shutter DEG --samples N\n"
@@ -128,10 +130,16 @@ int main(int argc, char** argv) {
           if (!*c) break;
         }
       }
+    } else if (!std::strcmp(a, "--reftext")) {
+      p.referenceText = next();
     } else if (!std::strcmp(a, "--maxgap")) {
       p.maxLetterGap = float(std::atof(next()));
     } else if (!std::strcmp(a, "--bridge")) {
       p.bridgeRadius = std::atoi(next());
+    } else if (!std::strcmp(a, "--pad")) {
+      p.charPadding = float(std::atof(next()));
+    } else if (!std::strcmp(a, "--minmark")) {
+      p.minMarkArea = float(std::atof(next()));
     } else if (!std::strcmp(a, "--minarea")) {
       p.minBlobArea = std::atoi(next());
     } else if (!std::strcmp(a, "--strip")) {
@@ -207,6 +215,11 @@ int main(int argc, char** argv) {
 
   std::printf("%dx%d  lines=%d  groups=%zu  slant=%.1fdeg\n", w, h, seg.lineCount,
               seg.groups.size(), seg.slantDegrees);
+  if (seg.refStatus == rta::RefStatus::Applied) {
+    std::printf("reference: APPLIED\n");
+  } else if (seg.refStatus == rta::RefStatus::Failed) {
+    std::printf("reference: FAILED - %s\n", seg.refMessage.c_str());
+  }
   for (size_t i = 0; i < seg.groups.size(); ++i) {
     const rta::Group& g = seg.groups[i];
     std::printf("  [%2zu] line=%d idx=%d  x=%d..%d y=%d..%d  (%dx%d) labels=%zu\n", i, g.line,
