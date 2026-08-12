@@ -263,6 +263,14 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _bridgeRadius = fetchIntParam("bridgeRadius");
     _charPadding = fetchDoubleParam("charPadding");
     _minMarkArea = fetchDoubleParam("minMarkArea");
+    // The legacy pixel padding exists to keep old projects grouping the way they
+    // were saved, and for nothing else. Showing it beside the relative control it
+    // replaces just poses a question with no good answer, so it appears only when
+    // a project actually carries a value in it.
+    try {
+      _bridgeRadius->setIsSecret(_bridgeRadius->getValue() == 0);
+    } catch (...) {
+    }
     _maxLetterGap = fetchDoubleParam("characterGap");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");

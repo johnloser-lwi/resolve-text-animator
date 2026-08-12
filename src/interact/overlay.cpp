@@ -71,6 +71,10 @@ class CurveInteract : public OFX::OverlayInteract {
       // angle would leave the lines behind until something else forced a redraw.
       addParamToSlaveTo(_effect->fetchBooleanParam("showDiagnostics"));
       addParamToSlaveTo(_effect->fetchBooleanParam("autoSlant"));
+      // Without this the mismatch warning is written during render but nothing
+      // asks the overlay to redraw, so a wrong string looks like it was accepted
+      // until the playhead happens to move.
+      addParamToSlaveTo(_effect->fetchStringParam("referenceText"));
       addParamToSlaveTo(_effect->fetchDoubleParam("italicSlant"));
     } catch (...) {
     }

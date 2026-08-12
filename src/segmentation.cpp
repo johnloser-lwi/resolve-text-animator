@@ -970,12 +970,84 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       if (best.empty()) fail = "the reference text could not be matched to the detected lines";
     }
 
+    // Cheapest reading wins; ties go to the packing found first, which is the
+    // one that fills the earlier lines fullest -- what wrapping does.
+    size_t pick = 0;
+    for (size_t i = 1; i < best.size(); ++i)
+      if (best[i].cost < best[pick].cost) pick = i;
+
+    // Does the reading actually DESCRIBE THIS PICTURE?
+    //
+    // Everything above only asks whether the words FIT: enough of them for the
+    // lines, no more characters than marks, each line's run short enough. That is
+    // arithmetic, and arithmetic is happy with any text of roughly the right
+    // length -- so a completely wrong string was accepted in silence and the
+    // words were cut wherever it said. Fitting is not matching.
+    //
+    // What a wrong string cannot fake is WHERE ITS SPACES LAND. A space in the
+    // string claims a gap in the picture, and gaps are not interchangeable: the
+    // ones between words are plainly wider than the ones between letters, or a
+    // reader could not tell the words apart either. Text that does not belong to
+    // this picture scatters its claims over ordinary letter gaps.
     if (fail.empty()) {
-      // Cheapest reading wins; ties go to the packing found first, which is the
-      // one that fills the earlier lines fullest -- what wrapping does.
-      size_t pick = 0;
-      for (size_t i = 1; i < best.size(); ++i)
-        if (best[i].cost < best[pick].cost) pick = i;
+      const std::vector<size_t>& b0 = best[pick].bounds;
+      for (size_t i = 0; i < K && fail.empty(); ++i) {
+        const size_t li = rows[i];
+        const Reading r = alignLine(li, lineChars(b0[i], b0[i + 1]));
+        if (r.starts.empty()) continue;
+
+        // Which character indices start a word, per the string.
+        std::vector<char> startsWord(r.starts.size(), 0);
+        {
+          size_t c = 0;
+          for (size_t wi = b0[i]; wi < b0[i + 1]; ++wi) {
+            if (c < startsWord.size()) startsWord[c] = 1;
+            c += words[wi].size();
+          }
+        }
+
+        std::vector<float> cutGaps, innerGaps;
+        for (size_t j = 1; j < r.starts.size(); ++j) {
+          const size_t bnd = size_t(r.starts[j]);
+          if (bnd == 0 || bnd >= lineGlyphs[li].size()) continue;
+          if (startsWord[j]) {
+            // A word break needs a blank column to sit in. If the two marks
+            // overlap once the italic lean is taken out, there is none -- no
+            // space was ever set there, whatever the string says. Geometry, not
+            // statistics, so this one is decisive.
+            if (lineGlyphs[li][bnd].sx1 - lineGlyphs[li][bnd - 1].sx2 <= 0.0f) {
+              fail = "line " + std::to_string(i + 1) +
+                     ": the text puts a word break where two letters touch";
+              break;
+            }
+            cutGaps.push_back(lineNorm[li][bnd]);
+          } else {
+            innerGaps.push_back(lineNorm[li][bnd]);
+          }
+        }
+        if (!fail.empty()) break;
+
+        // Compared as MEDIANS, and only with enough of both to mean anything. A
+        // single odd gap -- after a full stop, or across a font change -- should
+        // not condemn a string that is otherwise plainly right.
+        if (cutGaps.size() >= 2 && innerGaps.size() >= 3) {
+          auto median = [](std::vector<float>& v) {
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            return v[v.size() / 2];
+          };
+          const float cut = median(cutGaps), inner = median(innerGaps);
+          // Generous on purpose. Correcting a face whose word spaces are unusually
+          // tight is one of the reasons to type the text in at all, so the bar is
+          // "wider than a letter gap", not "as wide as a typical word space".
+          if (cut < 1.5f * inner) {
+            fail = "the word breaks in the text do not line up with the spaces in "
+                   "the picture";
+          }
+        }
+      }
+    }
+
+    if (fail.empty()) {
       const std::vector<size_t>& bounds = best[pick].bounds;
 
       // Commit. Only now is anything mutated, so a failure above leaves the
