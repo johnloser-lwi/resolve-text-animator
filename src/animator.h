@@ -10,7 +10,7 @@ namespace rta {
 
 enum class Animation { Fade = 0, SlideFade = 1 };
 enum class Easing { Linear = 0, Smoothstep = 1, CubicOut = 2, BackOut = 3, Custom = 4 };
-enum class Order { Forward = 0, Reverse = 1, CenterOut = 2, Random = 3 };
+enum class Order { Forward = 0, Reverse = 1, CenterOut = 2, Random = 3, Manual = 4 };
 enum class LineOrder { TopToBottom = 0, BottomToTop = 1 };
 
 // Control points of the Custom easing curve, as a CSS-style cubic bezier from
@@ -31,6 +31,23 @@ struct StageSettings {
   Order order = Order::Forward;
   LineOrder lineOrder = LineOrder::TopToBottom;
   int randomSeed = 0;
+
+  // The reveal sequence, written out by hand, for Order::Manual.
+  //
+  // Entries are CHARACTER INDICES -- the numbers Show Detection paints -- and
+  // not positions in some list of units. Unit numbers would shift the moment the
+  // grouping changed, so a sequence written for words would mean something else
+  // the instant one of them merged; character indices never move. It is also the
+  // same currency Merge At and Split Before speak, so there is one set of
+  // numbers to read off the screen rather than two.
+  //
+  // Naming ANY character of a unit selects that unit, so a word can be called by
+  // whichever of its letters is easiest to read off the overlay.
+  //
+  // The list does not have to be complete. What is named goes first, in the
+  // order given; everything else follows in ordinary reading order. So revealing
+  // one element ahead of an otherwise normal sequence is a list of one.
+  std::vector<int> manualOrder;
 
   // Timing is in FRAMES. Frames rather than seconds because compositing is
   // authored in frames, and because it removes the need to ask the host for a
@@ -157,6 +174,27 @@ void applySpacing(const Segmentation& unitSeg, const Segmentation& groupSeg,
                   const std::vector<int>& unitToGroup, const std::vector<float>& offsets,
                   const std::vector<GroupTransform>& groupTaps, int taps,
                   std::vector<GroupTransform>* outTaps, std::vector<float>* outPivots);
+
+// Groups in reading order, honouring lineOrder. The sequence every "which
+// element is this" question is answered against, so ordering and the range
+// below cannot disagree about what element number three is.
+std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount,
+                                 LineOrder lineOrder);
+
+// Restricts the reveal to elements `first`..`last`, counting from ONE in reading
+// order -- characters, words or lines, whichever the current mode groups by.
+//
+// Built for assembling a graphic across cuts: set 1..1 on the first clip, 2..2
+// on the next, and each clip carries on where the last left off. So everything
+// before `first` is already settled and on screen, and everything after `last`
+// has not appeared yet. Applied to the finished transforms, after the animation
+// has had its say, because it is a statement about what EXISTS on this clip
+// rather than about how anything moves.
+//
+// first <= 1 and last <= 0 mean "from the beginning" and "to the end", so the
+// defaults cover the whole frame.
+void applyRevealRange(const std::vector<Group>& groups, int lineCount, LineOrder lineOrder,
+                      int first, int last, int taps, std::vector<GroupTransform>* transforms);
 
 // Reveal position of each group, indexed by group.
 //

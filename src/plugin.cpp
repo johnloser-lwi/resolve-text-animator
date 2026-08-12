@@ -205,6 +205,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _animation = fetchChoiceParam("animation");
     _easing = fetchChoiceParam("easing");
     _order = fetchChoiceParam("order");
+    _manualOrder = fetchStringParam("manualOrder");
+    _revealStart = fetchIntParam("revealStart");
+    _revealEnd = fetchIntParam("revealEnd");
     _lineOrder = fetchChoiceParam("lineOrder");
     _randomSeed = fetchIntParam("randomSeed");
     _startTime = fetchDoubleParam("startTime");
@@ -682,7 +685,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_tracking, *_lineSpacing;
   OFX::ChoiceParam *_trackAnchor, *_lineAnchor;
   OFX::BooleanParam* _autoSlant;
-  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText;
+  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder;
+  OFX::IntParam *_revealStart, *_revealEnd;
   OFX::PushButtonParam* _clearOverrides;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
@@ -836,7 +840,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   in.bezier.y1 = float(_easeY1->getValueAtTime(args.time));
   in.bezier.x2 = float(_easeX2->getValueAtTime(args.time));
   in.bezier.y2 = float(_easeY2->getValueAtTime(args.time));
-  in.order = rta::Order(choiceAt(_order, args.time, 0, 3));
+  in.order = rta::Order(choiceAt(_order, args.time, 0, 4));
+  {
+    std::string mo;
+    _manualOrder->getValueAtTime(args.time, mo);
+    in.manualOrder = parseIndexList(mo);
+  }
   in.lineOrder = rta::LineOrder(choiceAt(_lineOrder, args.time, 0, 1));
   in.randomSeed = _randomSeed->getValueAtTime(args.time);
   in.duration = _duration->getValueAtTime(args.time);
@@ -867,7 +876,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     o.animation = rta::Animation(choiceAt(_outAnimation, args.time, 0, 1));
     o.easing = rta::Easing(choiceAt(_outEasing, args.time, 0, 4));
     o.bezier = in.bezier;  // the curve editor shapes a single custom curve
-    o.order = rta::Order(choiceAt(_outOrder, args.time, 0, 3));
+    o.order = rta::Order(choiceAt(_outOrder, args.time, 0, 4));
+    o.manualOrder = in.manualOrder;  // one written sequence serves both stages
     o.lineOrder = rta::LineOrder(choiceAt(_outLineOrder, args.time, 0, 1));
     o.randomSeed = _outRandomSeed->getValueAtTime(args.time);
     o.duration = _outDuration->getValueAtTime(args.time);
@@ -1175,6 +1185,19 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     rta::setAnalysisState(this, a);
   }
 
+  // --------------------------------------------------------- reveal range
+  //
+  // Which elements this clip introduces at all. Applied to the finished
+  // transforms, after the animation has had its say, because it says what EXISTS
+  // here rather than how anything moves -- so it composes with any Order,
+  // including a hand-written one.
+  {
+    const int first = std::max(1, _revealStart->getValueAtTime(args.time));
+    const int last = std::max(0, _revealEnd->getValueAtTime(args.time));
+    rta::applyRevealRange(useSeg->groups, useSeg->lineCount, anim.in.lineOrder, first, last, taps,
+                          &transforms);
+  }
+
   // ------------------------------------------------------------- spacing
   //
   // The units the compositor draws are the animated groups as before, unless
@@ -1351,10 +1374,47 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("order");
     p->setLabels("Order", "Order", "Order");
+    p->setHint("The sequence elements reveal in. Manual reads it from Manual Order below.");
     p->appendOption("Forward");
     p->appendOption("Reverse");
     p->appendOption("Center Out");
     p->appendOption("Random");
+    p->appendOption("Manual");
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("manualOrder");
+    p->setLabels("Manual Order", "Manual Order", "Manual Reveal Order");
+    p->setHint(
+        "The reveal sequence written out, e.g. \"12, 0, 30\". Only used when Order is Manual. "
+        "The numbers are the ones Show Detection paints, so naming any character of a word "
+        "selects that word. The list need not be complete: what you name goes first, in the "
+        "order you name it, and everything else follows in normal reading order.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("revealStart");
+    p->setLabels("Start At Element", "Start At", "Start At Element");
+    p->setHint(
+        "The first element this clip introduces, counting from 1 in reading order -- "
+        "characters, words or lines, whichever Animate By is set to. Everything before it is "
+        "already on screen and still, so you can cut and carry on: 1 and 1 on the first clip, "
+        "2 and 2 on the next, and the graphic builds up one element per cut.");
+    p->setRange(1, 10000);
+    p->setDisplayRange(1, 40);
+    p->setDefault(1);
+    addParam(page, p);
+  }
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("revealEnd");
+    p->setLabels("End At Element", "End At", "End At Element");
+    p->setHint(
+        "The last element this clip introduces. Anything after it has not appeared yet. "
+        "0 means carry on to the end, which is what you want until you start cutting.");
+    p->setRange(0, 10000);
+    p->setDisplayRange(0, 40);
     p->setDefault(0);
     addParam(page, p);
   }
@@ -1675,6 +1735,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->appendOption("Reverse");
       p->appendOption("Center Out");
       p->appendOption("Random");
+      p->appendOption("Manual");
       p->setDefault(0);
       p->setParent(*g);
       addParam(page, p);

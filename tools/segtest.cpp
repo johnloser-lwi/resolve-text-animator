@@ -29,7 +29,8 @@ namespace {
 std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentation& seg,
                                const rta::AnimParams& anim, rta::Stage stage, int count,
                                double atFraction, double step, int& outW, int& outH,
-                               const rta::SpacingParams& sp, const rta::Segmentation* charSeg) {
+                               const rta::SpacingParams& sp, const rta::Segmentation* charSeg,
+                               int revealFirst, int revealLast) {
   rta::RectI area;
   for (const auto& g : seg.groups) area.unionWith(g.bbox);
   area.grow(int(anim.in.slideDistance) + 16);
@@ -61,6 +62,8 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
       rta::transformTaps(stage, delays[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
+    rta::applyRevealRange(seg.groups, seg.lineCount, s.lineOrder, revealFirst, revealLast, taps,
+                          &xf);
 
     // Units are characters when tracking has to move letters inside a word, and
     // the animated groups themselves otherwise -- which keeps the default path
@@ -93,7 +96,8 @@ int main(int argc, char** argv) {
                  "             --pad F --minmark F   (relative: fractions of letter height)\n"
                  "             --reftext \"THE WORDS THE TITLE SAYS\"\n"
                  "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
-                 "             --angle DEG --easing 0-4 --order 0-3 --lineorder 0|1\n"
+                 "             --angle DEG --easing 0-4 --order 0-4 --lineorder 0|1\n"
+                 "             --manual \"3,0,7\"  --from N --to N\n"
                  "             --rotate DEG --blur PX --mblur 0|1 --shutter DEG --samples N\n"
                  "             --bez x1,y1,x2,y2\n"
                  "  (--stagger and --dur are in FRAMES, matching the plugin)\n");
@@ -103,6 +107,7 @@ int main(int argc, char** argv) {
   rta::DetectParams p;
   rta::AnimParams anim;
   rta::SpacingParams sp;
+  int revealFirst = 1, revealLast = 0;
   int strip = 0;
   double atFraction = -1.0;
   double step = 0.0;
@@ -177,6 +182,26 @@ int main(int argc, char** argv) {
       anim.in.easing = rta::Easing(std::atoi(next()));
     } else if (!std::strcmp(a, "--order")) {
       anim.in.order = rta::Order(std::atoi(next()));
+    } else if (!std::strcmp(a, "--manual")) {
+      anim.in.order = rta::Order::Manual;
+      const char* list = next();
+      int v = 0;
+      bool has = false;
+      for (const char* c = list;; ++c) {
+        if (*c >= '0' && *c <= '9') {
+          v = v * 10 + (*c - '0');
+          has = true;
+        } else {
+          if (has) anim.in.manualOrder.push_back(v);
+          v = 0;
+          has = false;
+          if (!*c) break;
+        }
+      }
+    } else if (!std::strcmp(a, "--from")) {
+      revealFirst = std::atoi(next());
+    } else if (!std::strcmp(a, "--to")) {
+      revealLast = std::atoi(next());
     } else if (!std::strcmp(a, "--lineorder")) {
       anim.in.lineOrder = rta::LineOrder(std::atoi(next()));
     } else if (!std::strcmp(a, "--rotate")) {
@@ -262,7 +287,8 @@ int main(int argc, char** argv) {
       charSeg = rta::segment(view, cp);
     }
     strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, step, ow, oh, sp,
-                              sp.needsPerCharacter() ? &charSeg : nullptr);
+                              sp.needsPerCharacter() ? &charSeg : nullptr, revealFirst,
+                              revealLast);
     result = strippedBuf.data();
     const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
     std::printf("strip: %d samples of the %s stage over %.1f frames\n", strip,

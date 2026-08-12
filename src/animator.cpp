@@ -79,6 +79,52 @@ float applyEasing(float t, Easing e, const BezierEasing& b) {
   return t;
 }
 
+std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount,
+                                 LineOrder lineOrder) {
+  std::vector<int> seq(groups.size());
+  std::iota(seq.begin(), seq.end(), 0);
+  std::stable_sort(seq.begin(), seq.end(), [&](int a, int b) {
+    const int la =
+        lineOrder == LineOrder::BottomToTop ? lineCount - 1 - groups[a].line : groups[a].line;
+    const int lb =
+        lineOrder == LineOrder::BottomToTop ? lineCount - 1 - groups[b].line : groups[b].line;
+    if (la != lb) return la < lb;
+    return groups[a].indexInLine < groups[b].indexInLine;
+  });
+  return seq;
+}
+
+void applyRevealRange(const std::vector<Group>& groups, int lineCount, LineOrder lineOrder,
+                      int first, int last, int taps,
+                      std::vector<GroupTransform>* transforms) {
+  taps = std::max(1, taps);
+  if (!transforms || transforms->size() != groups.size() * size_t(taps)) return;
+  // 1 and 0 are "from the beginning" and "to the end", so the untouched defaults
+  // cover the whole frame and cost nothing.
+  if (first <= 1 && last <= 0) return;
+
+  const std::vector<int> seq = readingSequence(groups, lineCount, lineOrder);
+  for (size_t pos = 0; pos < seq.size(); ++pos) {
+    const size_t g = size_t(seq[pos]);
+    const int n = int(pos) + 1;  // the numbers on screen count from one
+
+    if (n < first) {
+      // Already introduced on an earlier clip, so it simply sits there. Settled
+      // is a pose, not a stage: identity transform, fully opaque.
+      for (int k = 0; k < taps; ++k) {
+        GroupTransform t;
+        t.visible = true;
+        (*transforms)[g * size_t(taps) + size_t(k)] = t;
+      }
+    } else if (last > 0 && n > last) {
+      // Not introduced yet. Hidden rather than transparent, so it costs nothing
+      // to draw and cannot leave a faint edge behind.
+      for (int k = 0; k < taps; ++k)
+        (*transforms)[g * size_t(taps) + size_t(k)].visible = false;
+    }
+  }
+}
+
 std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
                              const StageSettings& p) {
   const size_t n = groups.size();
@@ -86,16 +132,7 @@ std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
   if (n == 0) return rank;
 
   // 1. Reading order, with the line axis optionally flipped.
-  std::vector<int> seq(n);
-  std::iota(seq.begin(), seq.end(), 0);
-  std::stable_sort(seq.begin(), seq.end(), [&](int a, int b) {
-    const int la = p.lineOrder == LineOrder::BottomToTop ? lineCount - 1 - groups[a].line
-                                                         : groups[a].line;
-    const int lb = p.lineOrder == LineOrder::BottomToTop ? lineCount - 1 - groups[b].line
-                                                         : groups[b].line;
-    if (la != lb) return la < lb;
-    return groups[a].indexInLine < groups[b].indexInLine;
-  });
+  const std::vector<int> seq = readingSequence(groups, lineCount, p.lineOrder);
 
   // 2. Permute that sequence.
   switch (p.order) {
@@ -115,6 +152,33 @@ std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
         return std::fabs(a - mid) < std::fabs(b - mid);
       });
       for (size_t r = 0; r < n; ++r) rank[seq[byDist[r]]] = int(r);
+      break;
+    }
+
+    case Order::Manual: {
+      // Named units first, in the order named; everything else keeps reading
+      // order behind them. Partial lists are the point -- pulling one element to
+      // the front should not mean writing out the whole sequence.
+      std::vector<char> placed(n, 0);
+      int next = 0;
+      for (int ci : p.manualOrder) {
+        for (size_t g = 0; g < n; ++g) {
+          if (placed[g]) continue;
+          const std::vector<int>& idx = groups[g].glyphIndices;
+          if (std::find(idx.begin(), idx.end(), ci) == idx.end()) continue;
+          rank[g] = next++;
+          placed[g] = 1;
+          break;  // a number names one unit; repeating it does nothing
+        }
+      }
+      // seq already honours lineOrder, so the remainder reads the way the rest
+      // of the plugin means by "in order".
+      for (size_t r = 0; r < n; ++r) {
+        const int g = seq[r];
+        if (placed[size_t(g)]) continue;
+        rank[g] = next++;
+        placed[size_t(g)] = 1;
+      }
       break;
     }
 
