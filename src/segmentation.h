@@ -195,6 +195,11 @@ struct Segmentation {
   float slantDegrees = 0.0f;
   float slantTan = 0.0f;
 
+  // Median line-band height, in pixels. The yardstick every relative setting is
+  // measured against, published so the render side can convert one without
+  // measuring the type a second time and disagreeing about the answer.
+  float letterHeight = 0.0f;
+
   RefStatus refStatus = RefStatus::NotUsed;
   // Why it failed, in the user's terms -- which line, and the two counts that
   // disagreed. Empty unless refStatus is Failed.

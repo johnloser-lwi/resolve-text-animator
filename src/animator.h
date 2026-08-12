@@ -83,6 +83,50 @@ struct AnimParams {
   double pixelsPerSample = 2.0;  // larger is cheaper and coarser
 };
 
+// Where the text SITS, as opposed to how it moves.
+//
+// Detection wants the letters apart; the design often wants them closer. Opening
+// the tracking in the title tool so the letters can be told apart, and taking
+// the same amount back here, separates the two: the pixels that get measured
+// stay easy to measure, and the picture returns to the spacing that was wanted.
+// This is the only cure for letters that RUN TOGETHER, which no amount of
+// counting can undo -- a mark that is two characters cannot be split.
+//
+// Tracking is a uniform advance, which is exactly what a title tool's tracking
+// control is, so subtracting what was added restores the original metrics --
+// kerning pairs included, since tracking adds to every pair alike. Ligatures are
+// the exception: once broken apart they stay apart.
+//
+// Both are FRACTIONS OF LETTER HEIGHT, like every other relative setting here.
+// Negative closes up, positive opens out.
+enum class TrackAnchor { Left = 0, Centre = 1, Right = 2 };
+enum class LineAnchor { Top = 0, Middle = 1, Bottom = 2 };
+
+struct SpacingParams {
+  float tracking = 0.0f;
+  float lineSpacing = 0.0f;
+  // What stays put. Tracking anchors WITHIN EACH LINE, so a centred title stays
+  // centred and a left-aligned one keeps its left edge; line spacing anchors on
+  // the text block as a whole.
+  TrackAnchor trackAnchor = TrackAnchor::Centre;
+  LineAnchor lineAnchor = LineAnchor::Middle;
+
+  // Tracking is the expensive one: it moves letters WITHIN a word, so the
+  // compositor has to work per character rather than per animated group. Line
+  // spacing moves whole lines, and a group never spans one, so it rides the
+  // existing per-group transform for free.
+  bool needsPerCharacter() const { return tracking != 0.0f; }
+  bool any() const { return tracking != 0.0f || lineSpacing != 0.0f; }
+};
+
+// Static offset of each unit of `seg`, in pixels, laid out x,y per group.
+//
+// Reads indexInLine and line, so it means "per character" when handed a
+// character-mode segmentation and "per animated group" otherwise -- which is
+// exactly the difference between the two paths above.
+std::vector<float> spacingOffsets(const Segmentation& seg, const SpacingParams& sp);
+
+
 struct GroupTransform {
   float offsetX = 0.0f;
   float offsetY = 0.0f;
@@ -92,6 +136,27 @@ struct GroupTransform {
   float opacity = 1.0f;
   bool visible = false;
 };
+
+// Which animated group each compositing unit belongs to.
+//
+// Matched on CHARACTER INDEX, the one number two segmentations of the same title
+// agree on however each was grouped -- bbox overlap would not, since a character
+// sits inside its word's box and so matches by accident as easily as by right.
+std::vector<int> mapUnitsToGroups(const Segmentation& unitSeg, const Segmentation& groupSeg);
+
+// Spreads per-group transforms onto the compositing units and folds in the
+// static spacing offset, producing what compositeGroups() wants.
+//
+// The offset is applied in the SETTLED text, so the animation acts on the
+// spacing you asked for rather than beside it: a group that scales up scales the
+// closed-up spacing with it. Since the transform is affine, moving a unit by d
+// before transforming is the same as moving it by R*scale*d afterwards, which is
+// all this does -- and the pivot is the group's centre AFTER the offset, so a
+// word turns about where it now sits rather than where it was detected.
+void applySpacing(const Segmentation& unitSeg, const Segmentation& groupSeg,
+                  const std::vector<int>& unitToGroup, const std::vector<float>& offsets,
+                  const std::vector<GroupTransform>& groupTaps, int taps,
+                  std::vector<GroupTransform>* outTaps, std::vector<float>* outPivots);
 
 // Reveal position of each group, indexed by group.
 //

@@ -262,6 +262,10 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _italicSlant = fetchDoubleParam("italicSlant");
     _bridgeRadius = fetchIntParam("bridgeRadius");
     _charPadding = fetchDoubleParam("charPadding");
+    _tracking = fetchDoubleParam("tracking");
+    _lineSpacing = fetchDoubleParam("lineSpacing");
+    _trackAnchor = fetchChoiceParam("trackAnchor");
+    _lineAnchor = fetchChoiceParam("lineAnchor");
     _minMarkArea = fetchDoubleParam("minMarkArea");
     // The legacy pixel padding exists to keep old projects grouping the way they
     // were saved, and for nothing else. Showing it beside the relative control it
@@ -675,6 +679,8 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_easeX1, *_easeY1, *_easeX2, *_easeY2;
   OFX::DoubleParam *_alphaThreshold, *_wordGapSensitivity, *_italicSlant, *_maxLetterGap;
   OFX::DoubleParam *_charPadding, *_minMarkArea;
+  OFX::DoubleParam *_tracking, *_lineSpacing;
+  OFX::ChoiceParam *_trackAnchor, *_lineAnchor;
   OFX::BooleanParam* _autoSlant;
   OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText;
   OFX::PushButtonParam* _clearOverrides;
@@ -804,6 +810,14 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.maxLetterGap = float(std::max(0.0, _maxLetterGap->getValueAtTime(args.time)));
   det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
 
+  // Where the text sits. Deliberately NOT part of DetectParams: it changes the
+  // picture, never the measurement, so it must not invalidate the analysis.
+  rta::SpacingParams spacing;
+  spacing.tracking = float(_tracking->getValueAtTime(args.time));
+  spacing.lineSpacing = float(_lineSpacing->getValueAtTime(args.time));
+  spacing.trackAnchor = rta::TrackAnchor(choiceAt(_trackAnchor, args.time, 0, 2));
+  spacing.lineAnchor = rta::LineAnchor(choiceAt(_lineAnchor, args.time, 0, 2));
+
   rta::AnimParams anim;
   anim.enableIn = _enableIn->getValueAtTime(args.time);
   anim.enableOut = _enableOut->getValueAtTime(args.time);
@@ -883,7 +897,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     hash = rta::hashAlpha(srcView, det.alphaThreshold);
   }
 
-  std::shared_ptr<const rta::Segmentation> segIn, segOut;
+  std::shared_ptr<const rta::Segmentation> segIn, segOut, segChar;
   {
     std::lock_guard<std::mutex> lock(_cache.mutex);
     if (_cache.hash != hash || _cache.width != srcView.width ||
@@ -897,8 +911,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 
     const bool needIn = !_cache.byMode[int(det.mode)];
     const bool needOut = anim.enableOut && !_cache.byMode[int(outMode)];
+    // Closing up tracking moves letters WITHIN a word, so the compositor needs
+    // characters even when the animation groups by word.
+    const bool needChar =
+        spacing.needsPerCharacter() && !_cache.byMode[int(rta::GroupMode::Character)];
 
-    if (needIn || needOut) {
+    if (needIn || needOut || needChar) {
       // One readback serves both modes. This is the only full-frame transfer in
       // the plugin, and it happens per title change rather than per frame.
       std::vector<float> host;
@@ -922,10 +940,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       };
       if (needIn) build(det.mode);
       if (needOut) build(outMode);
+      if (needChar) build(rta::GroupMode::Character);
     }
 
     segIn = _cache.byMode[int(det.mode)];
     if (anim.enableOut) segOut = _cache.byMode[int(outMode)];
+    if (spacing.needsPerCharacter()) segChar = _cache.byMode[int(rta::GroupMode::Character)];
   }
   if (!segIn || segIn->empty()) {
     return;
@@ -1155,14 +1175,47 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     rta::setAnalysisState(this, a);
   }
 
+  // ------------------------------------------------------------- spacing
+  //
+  // The units the compositor draws are the animated groups as before, unless
+  // tracking has to move letters inside a word -- then they are characters, each
+  // still turning about its GROUP's centre so a word cannot burst apart.
+  //
+  // Leaving the default path on whole groups is not just thrift: a group is
+  // sampled as one sprite, so the antialiased edges where its letters meet still
+  // blend into each other. Split into characters, each samples only its own
+  // pixels and those inner edges change. Worth it when the letters are moving
+  // anyway, not worth paying for when nothing asked them to.
+  const rta::Segmentation* unitSeg = useSeg;
+  int unitMode = int(useMode);
+  const float* pivotData = nullptr;
+  std::vector<rta::GroupTransform> unitTaps;
+  std::vector<float> pivots;
+  std::vector<rta::GroupTransform> spacedTaps;
+
+  if (spacing.any()) {
+    if (spacing.needsPerCharacter() && segChar && !segChar->empty()) {
+      unitSeg = segChar.get();
+      unitMode = int(rta::GroupMode::Character);
+    }
+    const std::vector<int> unitToGroup = rta::mapUnitsToGroups(*unitSeg, *useSeg);
+    const std::vector<float> offsets = rta::spacingOffsets(*unitSeg, spacing);
+    rta::applySpacing(*unitSeg, *useSeg, unitToGroup, offsets, transforms, taps, &spacedTaps,
+                      &pivots);
+    unitTaps.swap(spacedTaps);
+    pivotData = pivots.data();
+  }
+  const std::vector<rta::GroupTransform>& compTaps = spacing.any() ? unitTaps : transforms;
+
 #if RTA_WITH_CUDA
   if (useCuda) {
     // Keep the device stencil in step with whichever segmentation this frame
-    // uses; the two stages may group differently.
+    // draws -- the two stages may group differently, and spacing may swap the
+    // whole thing for characters.
     std::lock_guard<std::mutex> lock(_cache.mutex);
-    if (_cache.devSegMode != int(useMode)) {
-      _cache.devSegValid = _cache.devSeg.upload(*useSeg);
-      _cache.devSegMode = _cache.devSegValid ? int(useMode) : -1;
+    if (_cache.devSegMode != unitMode) {
+      _cache.devSegValid = _cache.devSeg.upload(*unitSeg);
+      _cache.devSegMode = _cache.devSegValid ? unitMode : -1;
     }
   }
 #endif
@@ -1178,15 +1231,16 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       return;
     }
     if (!rta::cudaCompositeGroups(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
-                                  dstView.width, dstView.height, _cache.devSeg, useSeg->groups,
-                                  transforms, taps, window, _cache.scratch, args.pCudaStream)) {
+                                  dstView.width, dstView.height, _cache.devSeg, unitSeg->groups,
+                                  compTaps, taps, window, _cache.scratch, args.pCudaStream,
+                                  pivotData)) {
       return;
     }
     return;
   }
 #endif
 
-  rta::compositeGroups(dstView, srcView, *useSeg, transforms, taps, window);
+  rta::compositeGroups(dstView, srcView, *unitSeg, compTaps, taps, window, pivotData);
 
   // Show Detection deliberately draws NOTHING here. It is a viewer overlay
   // (interact/overlay.cpp), so it can be left on permanently without reaching
@@ -1966,6 +2020,59 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       // A push button holds no value, so there is nothing for it to invalidate --
       // the parameters it writes carry that.
       addParamUI(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("tracking");
+      p->setLabels("Tracking Offset", "Tracking", "Tracking Offset");
+      p->setHint(
+          "Moves every letter closer together or further apart, as a fraction of letter "
+          "height. Detection needs the letters separated; open the tracking in your title "
+          "tool until they are, then take the same amount back here and the picture returns "
+          "to the spacing you wanted while the pixels being measured stay easy to measure. "
+          "This is the only cure for letters that RUN TOGETHER, which no setting can undo -- "
+          "one mark cannot be split into two characters. Negative closes up.");
+      p->setRange(-1.0, 1.0);
+      p->setDisplayRange(-0.3, 0.3);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("trackAnchor");
+      p->setLabels("Tracking Anchor", "Track Anchor", "Tracking Anchor");
+      p->setHint(
+          "What stays put as the letters close up, WITHIN EACH LINE -- so a centred title "
+          "stays centred and a left-aligned one keeps its left edge.");
+      p->appendOption("Left");
+      p->appendOption("Centre");
+      p->appendOption("Right");
+      p->setDefault(1);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("lineSpacing");
+      p->setLabels("Line Spacing Offset", "Line Spacing", "Line Spacing Offset");
+      p->setHint(
+          "Moves whole lines closer together or further apart, as a fraction of letter "
+          "height. The vertical counterpart of Tracking Offset, for when opening the leading "
+          "was what made the lines detect cleanly. Negative closes up.");
+      p->setRange(-2.0, 2.0);
+      p->setDisplayRange(-0.5, 0.5);
+      p->setDefault(0.0);
+      p->setParent(*g);
+      addParam(page, p);
+    }
+    {
+      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineAnchor");
+      p->setLabels("Line Anchor", "Line Anchor", "Line Spacing Anchor");
+      p->setHint("Which line stays put as the lines close up, across the text block.");
+      p->appendOption("Top");
+      p->appendOption("Middle");
+      p->appendOption("Bottom");
+      p->setDefault(1);
+      p->setParent(*g);
+      addParam(page, p);
     }
     {
       OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showDiagnostics");

@@ -403,7 +403,8 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
                          std::ptrdiff_t srcStride, int width, int height,
                          const CudaSegmentation& devSeg, const std::vector<Group>& groups,
                          const std::vector<GroupTransform>& transforms, int taps,
-                         const RectI& window, CudaScratch& scratch, void* stream) {
+                         const RectI& window, CudaScratch& scratch, void* stream,
+                         const float* pivots) {
   taps = std::max(1, taps);
   if (!dstDev || !devSeg.valid() || transforms.size() != groups.size() * size_t(taps))
     return false;
@@ -434,8 +435,10 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
     const GroupTransform* tg = &transforms[gi * size_t(taps)];
 
     const RectI& b = groups[gi].bbox;
-    const float cx = 0.5f * float(b.x1 + b.x2);
-    const float cy = 0.5f * float(b.y1 + b.y2);
+    // Same rule as the CPU path: a supplied pivot wins, so characters drawn
+    // separately still turn about the word they belong to.
+    const float cx = pivots ? pivots[gi * 2 + 0] : 0.5f * float(b.x1 + b.x2);
+    const float cy = pivots ? pivots[gi * 2 + 1] : 0.5f * float(b.y1 + b.y2);
 
     // Union over all taps, so a spinning or fast-moving group is not clipped
     // to where it happens to sit at the frame's midpoint.

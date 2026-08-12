@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   rta::DetectParams p;
+  rta::SpacingParams sp;
   int frameCount = 24;
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
@@ -49,6 +50,10 @@ int main(int argc, char** argv) {
                                          : rta::GroupMode::Word;
     } else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) {
       frameCount = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--track") && i + 1 < argc) {
+      sp.tracking = float(std::atof(argv[++i]));
+    } else if (!std::strcmp(argv[i], "--linespace") && i + 1 < argc) {
+      sp.lineSpacing = float(std::atof(argv[++i]));
     }
   }
 
@@ -70,6 +75,20 @@ int main(int argc, char** argv) {
 
   rta::ImageView srcView{src.data(), w, h, std::ptrdiff_t(w) * 4};
   const rta::Segmentation seg = rta::segment(srcView, p);
+
+  // Spacing puts the compositor on characters and hands it explicit pivots --
+  // the one path where the two implementations could disagree about what a group
+  // turns about, so it is worth a parity run of its own.
+  rta::Segmentation charSeg;
+  if (sp.needsPerCharacter()) {
+    rta::DetectParams cp = p;
+    cp.mode = rta::GroupMode::Character;
+    charSeg = rta::segment(srcView, cp);
+  }
+  const rta::Segmentation& unitSeg = sp.needsPerCharacter() ? charSeg : seg;
+  const std::vector<int> unitToGroup = rta::mapUnitsToGroups(unitSeg, seg);
+  const std::vector<float> offsets = rta::spacingOffsets(unitSeg, sp);
+
   std::printf("%dx%d groups=%zu\n", w, h, seg.groups.size());
   if (seg.empty()) return 1;
 
@@ -78,7 +97,7 @@ int main(int argc, char** argv) {
 
   rta::CudaSegmentation devSeg;
   rta::CudaScratch scratch;
-  if (!devSeg.upload(seg)) {
+  if (!devSeg.upload(unitSeg)) {
     std::fprintf(stderr, "devSeg upload failed\n");
     return 1;
   }
@@ -107,12 +126,21 @@ int main(int argc, char** argv) {
       rta::transformTaps(rta::Stage::In, delays[g], t, anim.startTime, anim, anim.in,
                          &xf[g * size_t(taps)]);
 
-    rta::compositeGroups(cpuView, srcView, seg, xf, taps, window);
+    std::vector<rta::GroupTransform> uxf;
+    std::vector<float> pivots;
+    const float* pivotData = nullptr;
+    if (sp.any()) {
+      rta::applySpacing(unitSeg, seg, unitToGroup, offsets, xf, taps, &uxf, &pivots);
+      pivotData = pivots.data();
+    }
+    const std::vector<rta::GroupTransform>& ct = sp.any() ? uxf : xf;
+
+    rta::compositeGroups(cpuView, srcView, unitSeg, ct, taps, window, pivotData);
 
     const std::ptrdiff_t srcStrideF = std::ptrdiff_t(srcPitch / sizeof(float));
     const std::ptrdiff_t dstStrideF = std::ptrdiff_t(dstPitch / sizeof(float));
-    if (!rta::cudaCompositeGroups(dDst, dstStrideF, dSrc, srcStrideF, w, h, devSeg, seg.groups, xf,
-                                  taps, window, scratch, nullptr)) {
+    if (!rta::cudaCompositeGroups(dDst, dstStrideF, dSrc, srcStrideF, w, h, devSeg,
+                                  unitSeg.groups, ct, taps, window, scratch, nullptr, pivotData)) {
       std::printf("frame %2d: cudaCompositeGroups FAILED\n", f);
       ++failures;
       continue;

@@ -101,7 +101,8 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStrideFloats, const fl
                          std::ptrdiff_t srcStrideFloats, int width, int height,
                          const CudaSegmentation& devSeg, const std::vector<Group>& groups,
                          const std::vector<GroupTransform>& transforms, int taps,
-                         const RectI& window, CudaScratch& scratch, void* stream);
+                         const RectI& window, CudaScratch& scratch, void* stream,
+                         const float* pivots = nullptr);
 
 // Dims the source into dst and draws a coloured box per group, matching the
 // CPU diagnostics overlay.

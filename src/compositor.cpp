@@ -57,7 +57,7 @@ inline void sampleMasked(const ImageView& src, const Segmentation& seg, int grou
 
 void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentation& seg,
                      const std::vector<GroupTransform>& transforms, int taps,
-                     const RectI& renderWindow) {
+                     const RectI& renderWindow, const float* pivots) {
   if (!dst.valid()) return;
 
   const RectI dstRect{0, 0, dst.width, dst.height};
@@ -79,8 +79,8 @@ void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentat
     const GroupTransform* tg = &transforms[gi * size_t(taps)];
 
     const RectI& b = seg.groups[gi].bbox;
-    const float cx = 0.5f * float(b.x1 + b.x2);
-    const float cy = 0.5f * float(b.y1 + b.y2);
+    const float cx = pivots ? pivots[gi * 2 + 0] : 0.5f * float(b.x1 + b.x2);
+    const float cy = pivots ? pivots[gi * 2 + 1] : 0.5f * float(b.y1 + b.y2);
 
     // Union of every tap's footprint, so a fast-moving or spinning group is
     // never clipped to where it happens to be at the frame's midpoint.

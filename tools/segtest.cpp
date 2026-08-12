@@ -28,7 +28,8 @@ namespace {
 // compositor without a host in the loop.
 std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentation& seg,
                                const rta::AnimParams& anim, rta::Stage stage, int count,
-                               double atFraction, double step, int& outW, int& outH) {
+                               double atFraction, double step, int& outW, int& outH,
+                               const rta::SpacingParams& sp, const rta::Segmentation* charSeg) {
   rta::RectI area;
   for (const auto& g : seg.groups) area.unionWith(g.bbox);
   area.grow(int(anim.in.slideDistance) + 16);
@@ -60,7 +61,18 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
       rta::transformTaps(stage, delays[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
-    rta::compositeGroups(fv, src, seg, xf, taps, rta::RectI{0, 0, src.width, src.height});
+
+    // Units are characters when tracking has to move letters inside a word, and
+    // the animated groups themselves otherwise -- which keeps the default path
+    // sampling a whole word as one sprite, so its inner glyph edges still blend.
+    const rta::Segmentation& unitSeg = charSeg ? *charSeg : seg;
+    const std::vector<int> unitToGroup = rta::mapUnitsToGroups(unitSeg, seg);
+    const std::vector<float> offsets = rta::spacingOffsets(unitSeg, sp);
+    std::vector<rta::GroupTransform> uxf;
+    std::vector<float> pivots;
+    rta::applySpacing(unitSeg, seg, unitToGroup, offsets, xf, taps, &uxf, &pivots);
+    rta::compositeGroups(fv, src, unitSeg, uxf, taps, rta::RectI{0, 0, src.width, src.height},
+                         pivots.data());
 
     for (int y = 0; y < th; ++y) {
       const float* s = fv.at(area.x1, area.y1 + y);
@@ -90,6 +102,7 @@ int main(int argc, char** argv) {
 
   rta::DetectParams p;
   rta::AnimParams anim;
+  rta::SpacingParams sp;
   int strip = 0;
   double atFraction = -1.0;
   double step = 0.0;
@@ -138,6 +151,14 @@ int main(int argc, char** argv) {
       p.bridgeRadius = std::atoi(next());
     } else if (!std::strcmp(a, "--pad")) {
       p.charPadding = float(std::atof(next()));
+    } else if (!std::strcmp(a, "--track")) {
+      sp.tracking = float(std::atof(next()));
+    } else if (!std::strcmp(a, "--linespace")) {
+      sp.lineSpacing = float(std::atof(next()));
+    } else if (!std::strcmp(a, "--trackanchor")) {
+      sp.trackAnchor = rta::TrackAnchor(std::atoi(next()));
+    } else if (!std::strcmp(a, "--lineanchor")) {
+      sp.lineAnchor = rta::LineAnchor(std::atoi(next()));
     } else if (!std::strcmp(a, "--minmark")) {
       p.minMarkArea = float(std::atof(next()));
     } else if (!std::strcmp(a, "--strip")) {
@@ -233,7 +254,15 @@ int main(int argc, char** argv) {
   anim.out = rta::mirrorStage(anim.in, mirror);
 
   if (strip > 1) {
-    strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, step, ow, oh);
+    // Tracking moves letters within a word, so the compositor needs characters.
+    rta::Segmentation charSeg;
+    if (sp.needsPerCharacter()) {
+      rta::DetectParams cp = p;
+      cp.mode = rta::GroupMode::Character;
+      charSeg = rta::segment(view, cp);
+    }
+    strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, step, ow, oh, sp,
+                              sp.needsPerCharacter() ? &charSeg : nullptr);
     result = strippedBuf.data();
     const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
     std::printf("strip: %d samples of the %s stage over %.1f frames\n", strip,

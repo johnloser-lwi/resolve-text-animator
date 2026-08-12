@@ -428,6 +428,8 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     }
   }
 
+  seg.letterHeight = letterHeight;
+
   // Relative settings resolved to pixels, ADDED to the legacy pixel ones so an
   // older project keeps the grouping it was saved with.
   const int bridgePx =

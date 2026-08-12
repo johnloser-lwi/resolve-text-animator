@@ -480,4 +480,121 @@ double totalDuration(double maxDelayUnits, const AnimParams& p) {
   return p.startTime + stageSpan(maxDelayUnits, p.in);
 }
 
+std::vector<float> spacingOffsets(const Segmentation& seg, const SpacingParams& sp) {
+  std::vector<float> d(seg.groups.size() * 2, 0.0f);
+  // Letter height is what makes these settings survive a change of resolution;
+  // without a measurement there is nothing to be a fraction OF, so do nothing
+  // rather than guess a pixel count.
+  if (!sp.any() || seg.letterHeight <= 0.0f) return d;
+  const float h = seg.letterHeight;
+  const int lines = std::max(1, seg.lineCount);
+
+  // How many units each line holds, so an anchor can be named as a position
+  // within the line instead of as a pixel.
+  std::vector<int> perLine(size_t(lines), 0);
+  for (const Group& g : seg.groups)
+    if (g.line >= 0 && size_t(g.line) < perLine.size())
+      perLine[size_t(g.line)] = std::max(perLine[size_t(g.line)], g.indexInLine + 1);
+
+  float lineRef = 0.5f * float(lines - 1);
+  if (sp.lineAnchor == LineAnchor::Top) lineRef = 0.0f;
+  if (sp.lineAnchor == LineAnchor::Bottom) lineRef = float(lines - 1);
+
+  for (size_t i = 0; i < seg.groups.size(); ++i) {
+    const Group& g = seg.groups[i];
+    const int n =
+        (g.line >= 0 && size_t(g.line) < perLine.size()) ? std::max(1, perLine[size_t(g.line)]) : 1;
+
+    // The unit that stays put. Everything else moves away from it in proportion
+    // to how many units separate them -- which is what tracking IS, a constant
+    // added to every advance.
+    float ref = 0.5f * float(n - 1);
+    if (sp.trackAnchor == TrackAnchor::Left) ref = 0.0f;
+    if (sp.trackAnchor == TrackAnchor::Right) ref = float(n - 1);
+
+    d[i * 2 + 0] = (float(g.indexInLine) - ref) * sp.tracking * h;
+    d[i * 2 + 1] = (float(g.line) - lineRef) * sp.lineSpacing * h;
+  }
+  return d;
+}
+
+std::vector<int> mapUnitsToGroups(const Segmentation& unitSeg, const Segmentation& groupSeg) {
+  std::vector<int> out(unitSeg.groups.size(), 0);
+  if (groupSeg.groups.empty()) return out;
+
+  int maxIndex = 0;
+  for (const Group& g : groupSeg.groups)
+    for (int ci : g.glyphIndices) maxIndex = std::max(maxIndex, ci);
+  for (const Group& g : unitSeg.groups)
+    for (int ci : g.glyphIndices) maxIndex = std::max(maxIndex, ci);
+
+  std::vector<int> byChar(size_t(maxIndex) + 1, -1);
+  for (size_t gi = 0; gi < groupSeg.groups.size(); ++gi)
+    for (int ci : groupSeg.groups[gi].glyphIndices)
+      if (ci >= 0 && size_t(ci) < byChar.size()) byChar[size_t(ci)] = int(gi);
+
+  for (size_t u = 0; u < unitSeg.groups.size(); ++u) {
+    const Group& g = unitSeg.groups[u];
+    int found = -1;
+    for (int ci : g.glyphIndices) {
+      if (ci >= 0 && size_t(ci) < byChar.size() && byChar[size_t(ci)] >= 0) {
+        found = byChar[size_t(ci)];
+        break;
+      }
+    }
+    // A unit whose characters are in no group cannot be animated by one; parking
+    // it on the first group keeps it on screen rather than dropping it silently.
+    out[u] = found >= 0 ? found : 0;
+  }
+  return out;
+}
+
+void applySpacing(const Segmentation& unitSeg, const Segmentation& groupSeg,
+                  const std::vector<int>& unitToGroup, const std::vector<float>& offsets,
+                  const std::vector<GroupTransform>& groupTaps, int taps,
+                  std::vector<GroupTransform>* outTaps, std::vector<float>* outPivots) {
+  taps = std::max(1, taps);
+  const size_t nUnits = unitSeg.groups.size(), nGroups = groupSeg.groups.size();
+  outTaps->assign(nUnits * size_t(taps), GroupTransform{});
+  outPivots->assign(nUnits * 2, 0.0f);
+  if (nUnits == 0 || nGroups == 0) return;
+
+  // Each group's centre once the offsets have moved its units. Averaged over the
+  // units, which for an unmoved group is exactly its old bbox centre.
+  std::vector<float> sum(nGroups * 2, 0.0f);
+  std::vector<int> count(nGroups, 0);
+  for (size_t u = 0; u < nUnits; ++u) {
+    const size_t g = size_t(unitToGroup[u]);
+    if (g >= nGroups) continue;
+    sum[g * 2 + 0] += offsets.size() > u * 2 + 1 ? offsets[u * 2 + 0] : 0.0f;
+    sum[g * 2 + 1] += offsets.size() > u * 2 + 1 ? offsets[u * 2 + 1] : 0.0f;
+    ++count[g];
+  }
+  std::vector<float> pivot(nGroups * 2, 0.0f);
+  for (size_t g = 0; g < nGroups; ++g) {
+    const RectI& b = groupSeg.groups[g].bbox;
+    const float n = float(std::max(1, count[g]));
+    pivot[g * 2 + 0] = 0.5f * float(b.x1 + b.x2) + sum[g * 2 + 0] / n;
+    pivot[g * 2 + 1] = 0.5f * float(b.y1 + b.y2) + sum[g * 2 + 1] / n;
+  }
+
+  for (size_t u = 0; u < nUnits; ++u) {
+    const size_t g = size_t(unitToGroup[u]);
+    if (g >= nGroups) continue;
+    const float dx = offsets.size() > u * 2 + 1 ? offsets[u * 2 + 0] : 0.0f;
+    const float dy = offsets.size() > u * 2 + 1 ? offsets[u * 2 + 1] : 0.0f;
+    (*outPivots)[u * 2 + 0] = pivot[g * 2 + 0];
+    (*outPivots)[u * 2 + 1] = pivot[g * 2 + 1];
+
+    for (int k = 0; k < taps; ++k) {
+      GroupTransform t = groupTaps[g * size_t(taps) + size_t(k)];
+      const float c = std::cos(t.rotation) * t.scale;
+      const float s = std::sin(t.rotation) * t.scale;
+      t.offsetX += c * dx - s * dy;
+      t.offsetY += s * dx + c * dy;
+      (*outTaps)[u * size_t(taps) + size_t(k)] = t;
+    }
+  }
+}
+
 }  // namespace rta
