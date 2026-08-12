@@ -19,7 +19,18 @@
 
 namespace rta {
 
-enum class GroupMode { Character = 0, Word = 1, Line = 2 };
+// What counts as one animatable unit.
+//
+// Object is the odd one out: the other three read the picture as TYPE, and it
+// reads the picture as SHAPES. One connected region of alpha is one element,
+// with none of the typography on top -- no glyph assembly joining a dot to its
+// stem, no slant estimate, no word-gap statistics, no reference text. A house
+// icon has no baseline and no letters, and every one of those rules would be
+// answering a question nobody asked of it.
+//
+// Character Padding is the control that matters here: it is what decides whether
+// two nearly-touching parts of a drawing are one object or two.
+enum class GroupMode { Character = 0, Word = 1, Line = 2, Object = 3 };
 
 struct DetectParams {
   float alphaThreshold = 0.15f;

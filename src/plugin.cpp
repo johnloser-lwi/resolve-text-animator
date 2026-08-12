@@ -168,7 +168,7 @@ struct AnalysisCache {
 
   // One segmentation per grouping mode, because the entrance and the exit may
   // group differently -- words in, characters out. At most two are ever filled.
-  std::shared_ptr<const rta::Segmentation> byMode[3];
+  std::shared_ptr<const rta::Segmentation> byMode[4];
 
   void invalidate() {
     for (auto& s : byMode) s.reset();
@@ -841,7 +841,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   det.charPadding = float(std::max(0.0, _charPadding->getValueAtTime(args.time)));
   det.minMarkArea = float(std::max(0.0, _minMarkArea->getValueAtTime(args.time)));
   det.maxLetterGap = float(std::max(0.0, _maxLetterGap->getValueAtTime(args.time)));
-  det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 2));
+  det.mode = rta::GroupMode(choiceAt(_groupMode, args.time, 0, 3));
 
   // Where the text sits. Deliberately NOT part of DetectParams: it changes the
   // picture, never the measurement, so it must not invalidate the analysis.
@@ -901,7 +901,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     anim.out = rta::mirrorStage(in, mirrorOut);
   } else {
     rta::StageSettings& o = anim.out;
-    outMode = rta::GroupMode(choiceAt(_outGroupMode, args.time, 0, 2));
+    outMode = rta::GroupMode(choiceAt(_outGroupMode, args.time, 0, 3));
     o.animation = rta::Animation(choiceAt(_outAnimation, args.time, 0, 1));
     o.easing = rta::Easing(choiceAt(_outEasing, args.time, 0, 4));
     o.bezier = in.bezier;  // the curve editor shapes a single custom curve
@@ -952,8 +952,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     const bool needOut = anim.enableOut && !_cache.byMode[int(outMode)];
     // Closing up tracking moves letters WITHIN a word, so the compositor needs
     // characters even when the animation groups by word.
-    const bool needChar =
-        spacing.needsPerCharacter() && !_cache.byMode[int(rta::GroupMode::Character)];
+    // Object mode is already one unit per connected region -- the finest there
+    // is -- so it needs no second segmentation, and asking for the character one
+    // would be worse than useless: its units are numbered against a different
+    // glyph assembly, so the two would not agree about which element is which.
+    const bool needChar = spacing.needsPerCharacter() && det.mode != rta::GroupMode::Object &&
+                          !_cache.byMode[int(rta::GroupMode::Character)];
 
     if (needIn || needOut || needChar) {
       // One readback serves both modes. This is the only full-frame transfer in
@@ -984,7 +988,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 
     segIn = _cache.byMode[int(det.mode)];
     if (anim.enableOut) segOut = _cache.byMode[int(outMode)];
-    if (spacing.needsPerCharacter()) segChar = _cache.byMode[int(rta::GroupMode::Character)];
+    if (spacing.needsPerCharacter() && det.mode != rta::GroupMode::Object)
+      segChar = _cache.byMode[int(rta::GroupMode::Character)];
   }
   if (!segIn || segIn->empty()) {
     return;
@@ -1389,10 +1394,16 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("groupMode");
     p->setLabels("Animate By", "Animate By", "Animate By");
-    p->setHint("What counts as one animated unit, detected from pixel gaps.");
+    p->setHint(
+        "What counts as one animated unit, detected from pixel gaps. Object reads the frame "
+        "as SHAPES rather than as type: one connected region of alpha is one element, with "
+        "no letters, words or lines assumed anywhere. Use it for logos, icons and any PNG of "
+        "loose parts -- and reach for Character Padding when two nearly-touching parts should "
+        "move as one.");
     p->appendOption("Character");
     p->appendOption("Word");
     p->appendOption("Line");
+    p->appendOption("Object");
     p->setDefault(1);
     addParam(page, p);
   }
@@ -1769,6 +1780,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       p->appendOption("Character");
       p->appendOption("Word");
       p->appendOption("Line");
+      p->appendOption("Object");
       p->setDefault(1);
       p->setParent(*g);
       addParam(page, p);

@@ -489,8 +489,13 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   // lean right, the way a normal italic does. Internally the shear that undoes
   // that lean is the negative of it, which is what slantTan holds.
   constexpr float kPi = 3.14159265358979323846f;
-  const float slantTan = params.autoSlant ? detectSlant(mask, w, h)
-                                          : -std::tan(params.italicSlant * kPi / 180.0f);
+  // Objects stand upright by definition: there is no baseline to lean off, and a
+  // slant measured from a drawing is noise that would only scramble the order
+  // things are read in.
+  const bool typeMode = params.mode != GroupMode::Object;
+  const float slantTan = !typeMode              ? 0.0f
+                         : params.autoSlant     ? detectSlant(mask, w, h)
+                                                : -std::tan(params.italicSlant * kPi / 180.0f);
   const int yMid = h / 2;
   seg.slantDegrees = -std::atan(slantTan) * 180.0f / kPi;
   seg.slantTan = slantTan;
@@ -587,9 +592,14 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
 
     UnionFind guf;
     for (size_t i = 0; i < ids.size(); ++i) guf.add();
-    for (size_t i = 0; i < ids.size(); ++i) {
-      for (size_t j = i + 1; j < ids.size(); ++j) {
-        if (sameGlyph(comps[ids[i]], comps[ids[j]])) guf.unite(int(i), int(j));
+    // Object mode joins nothing. The rule below exists to put a dot back on its
+    // i, and a drawing has no dots -- applied to shapes it would swallow a
+    // window into the wall above it purely for sitting under it.
+    if (typeMode) {
+      for (size_t i = 0; i < ids.size(); ++i) {
+        for (size_t j = i + 1; j < ids.size(); ++j) {
+          if (sameGlyph(comps[ids[i]], comps[ids[j]])) guf.unite(int(i), int(j));
+        }
       }
     }
     std::vector<int> rootToGlyph(ids.size(), -1);
@@ -755,7 +765,7 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   // inside a mark would be inventing data, so that case reports and falls back.
   std::vector<std::vector<int>> refWordStarts;  // per line, first glyph of each word
   bool refApplied = false;
-  if (!params.referenceText.empty()) {
+  if (!params.referenceText.empty() && typeMode) {
     // Each word is a list of per-character mark allowances, so a word's size is
     // its character count and its contents drive the alignment below.
     const std::vector<std::vector<CharSpec>> words = referenceWords(params.referenceText);
@@ -1193,6 +1203,9 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     const float breakAt = params.wordGapSensitivity * breakNorm;
 
     switch (params.mode) {
+      // One connected region, one element. Identical emission to Character mode;
+      // what makes it Object mode happened above, where nothing was joined.
+      case GroupMode::Object:
       case GroupMode::Character:
         for (size_t i = 0; i < glyphs.size(); ++i)
           pushGroup(glyphs[i].bbox, glyphs[i].sx1, glyphs[i].sx2, 1, int(li), int(i), int(i),

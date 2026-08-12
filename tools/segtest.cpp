@@ -90,7 +90,7 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
-                 "usage: segtest <in.png> <out.png> [--mode char|word|line]\n"
+                 "usage: segtest <in.png> <out.png> [--mode char|word|line|object]\n"
                  "  detection: --gap N --alpha N --bridge N\n"
                  "             --pad F --minmark F   (relative: fractions of letter height)\n"
                  "             --reftext \"THE WORDS THE TITLE SAYS\"\n"
@@ -118,9 +118,10 @@ int main(int argc, char** argv) {
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : "0"; };
     if (!std::strcmp(a, "--mode")) {
       const char* m = next();
-      p.mode = !std::strcmp(m, "char")   ? rta::GroupMode::Character
-               : !std::strcmp(m, "line") ? rta::GroupMode::Line
-                                         : rta::GroupMode::Word;
+      p.mode = !std::strcmp(m, "char")     ? rta::GroupMode::Character
+               : !std::strcmp(m, "line")   ? rta::GroupMode::Line
+               : !std::strcmp(m, "object") ? rta::GroupMode::Object
+                                           : rta::GroupMode::Word;
     } else if (!std::strcmp(a, "--gap")) {
       p.wordGapSensitivity = float(std::atof(next()));
     } else if (!std::strcmp(a, "--alpha")) {
