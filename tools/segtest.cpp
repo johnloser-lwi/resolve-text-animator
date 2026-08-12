@@ -62,8 +62,7 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
       rta::transformTaps(stage, delays[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
-    rta::applyRevealRange(seg.groups, seg.lineCount, s.lineOrder, revealFirst, revealLast, taps,
-                          &xf);
+    rta::applyRevealRange(rank, revealFirst, revealLast, taps, &xf);
 
     // Units are characters when tracking has to move letters inside a word, and
     // the animated groups themselves otherwise -- which keeps the default path

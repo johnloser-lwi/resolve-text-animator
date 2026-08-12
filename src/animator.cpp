@@ -94,19 +94,16 @@ std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount
   return seq;
 }
 
-void applyRevealRange(const std::vector<Group>& groups, int lineCount, LineOrder lineOrder,
-                      int first, int last, int taps,
+void applyRevealRange(const std::vector<int>& rank, int first, int last, int taps,
                       std::vector<GroupTransform>* transforms) {
   taps = std::max(1, taps);
-  if (!transforms || transforms->size() != groups.size() * size_t(taps)) return;
+  if (!transforms || transforms->size() != rank.size() * size_t(taps)) return;
   // 1 and 0 are "from the beginning" and "to the end", so the untouched defaults
   // cover the whole frame and cost nothing.
   if (first <= 1 && last <= 0) return;
 
-  const std::vector<int> seq = readingSequence(groups, lineCount, lineOrder);
-  for (size_t pos = 0; pos < seq.size(); ++pos) {
-    const size_t g = size_t(seq[pos]);
-    const int n = int(pos) + 1;  // the numbers on screen count from one
+  for (size_t g = 0; g < rank.size(); ++g) {
+    const int n = rank[g] + 1;  // the numbers count from one
 
     if (n < first) {
       // Already introduced on an earlier clip, so it simply sits there. Settled

@@ -1224,8 +1224,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     const int last = _singleElement->getValueAtTime(args.time)
                          ? first
                          : std::max(0, _revealEnd->getValueAtTime(args.time));
-    rta::applyRevealRange(useSeg->groups, useSeg->lineCount, anim.in.lineOrder, first, last, taps,
-                          &transforms);
+    // `rank` is the entrance order, so the numbers here mean the same thing the
+    // reveal does -- including a hand-picked sequence.
+    rta::applyRevealRange(rank, first, last, taps, &transforms);
   }
 
   // ------------------------------------------------------------- spacing

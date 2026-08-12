@@ -175,14 +175,19 @@ void applySpacing(const Segmentation& unitSeg, const Segmentation& groupSeg,
                   const std::vector<GroupTransform>& groupTaps, int taps,
                   std::vector<GroupTransform>* outTaps, std::vector<float>* outPivots);
 
-// Groups in reading order, honouring lineOrder. The sequence every "which
-// element is this" question is answered against, so ordering and the range
-// below cannot disagree about what element number three is.
+// Groups in reading order, honouring lineOrder. The sequence the Order modes
+// permute -- what "forward" means before anything reorders it.
 std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount,
                                  LineOrder lineOrder);
 
-// Restricts the reveal to elements `first`..`last`, counting from ONE in reading
-// order -- characters, words or lines, whichever the current mode groups by.
+// Restricts the reveal to elements `first`..`last`, counting from ONE.
+//
+// Counted in REVEAL ORDER, which is why this takes the rank rather than the
+// groups: "the next element" has to mean the next one to appear. Numbering by
+// reading position instead looks identical under Forward and silently disagrees
+// under every other Order -- set a manual sequence and element one would be the
+// leftmost rather than the one chosen to go first, so stepping a build would
+// step through an order nobody asked for.
 //
 // Built for assembling a graphic across cuts: set 1..1 on the first clip, 2..2
 // on the next, and each clip carries on where the last left off. So everything
@@ -193,8 +198,8 @@ std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount
 //
 // first <= 1 and last <= 0 mean "from the beginning" and "to the end", so the
 // defaults cover the whole frame.
-void applyRevealRange(const std::vector<Group>& groups, int lineCount, LineOrder lineOrder,
-                      int first, int last, int taps, std::vector<GroupTransform>* transforms);
+void applyRevealRange(const std::vector<int>& rank, int first, int last, int taps,
+                      std::vector<GroupTransform>* transforms);
 
 // Reveal position of each group, indexed by group.
 //
