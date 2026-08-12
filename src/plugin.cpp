@@ -209,6 +209,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _revealStart = fetchIntParam("revealStart");
     _revealEnd = fetchIntParam("revealEnd");
     _singleElement = fetchBooleanParam("singleElement");
+    _isolate = fetchBooleanParam("isolate");
     _orderPick = fetchBooleanParam("orderPick");
     syncRangeUI();
     _lineOrder = fetchChoiceParam("lineOrder");
@@ -714,7 +715,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::BooleanParam* _autoSlant;
   OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder;
   OFX::IntParam *_revealStart, *_revealEnd;
-  OFX::BooleanParam *_singleElement, *_orderPick;
+  OFX::BooleanParam *_singleElement, *_orderPick, *_isolate;
   OFX::PushButtonParam* _clearOverrides;
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
@@ -1226,7 +1227,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
                          : std::max(0, _revealEnd->getValueAtTime(args.time));
     // `rank` is the entrance order, so the numbers here mean the same thing the
     // reveal does -- including a hand-picked sequence.
-    rta::applyRevealRange(rank, first, last, taps, &transforms);
+    rta::applyRevealRange(rank, first, last, _isolate->getValueAtTime(args.time), taps,
+                          &transforms);
   }
 
   // ------------------------------------------------------------- spacing
@@ -1457,6 +1459,17 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "Introduce exactly one element on this clip, the one named by Start At. End At "
         "follows it and is hidden, so stepping through a build is one number per cut instead "
         "of two kept in step by hand.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("isolate");
+    p->setLabels("Isolate", "Isolate", "Isolate Range");
+    p->setHint(
+        "Shows only the elements in the range, hiding the earlier ones instead of leaving "
+        "them settled on screen. For judging one element's animation on its own -- turn it "
+        "off to build a graphic up across cuts, where the point is that the elements from "
+        "earlier clips are still standing there.");
     p->setDefault(false);
     addParam(page, p);
   }

@@ -94,7 +94,7 @@ std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount
   return seq;
 }
 
-void applyRevealRange(const std::vector<int>& rank, int first, int last, int taps,
+void applyRevealRange(const std::vector<int>& rank, int first, int last, bool isolate, int taps,
                       std::vector<GroupTransform>* transforms) {
   taps = std::max(1, taps);
   if (!transforms || transforms->size() != rank.size() * size_t(taps)) return;
@@ -106,6 +106,12 @@ void applyRevealRange(const std::vector<int>& rank, int first, int last, int tap
     const int n = rank[g] + 1;  // the numbers count from one
 
     if (n < first) {
+      if (isolate) {
+        // Nothing but the range, so the element can be judged on its own.
+        for (int k = 0; k < taps; ++k)
+          (*transforms)[g * size_t(taps) + size_t(k)].visible = false;
+        continue;
+      }
       // Already introduced on an earlier clip, so it simply sits there. Settled
       // is a pose, not a stage: identity transform, fully opaque.
       for (int k = 0; k < taps; ++k) {

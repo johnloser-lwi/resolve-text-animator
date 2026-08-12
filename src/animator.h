@@ -196,9 +196,14 @@ std::vector<int> readingSequence(const std::vector<Group>& groups, int lineCount
 // has had its say, because it is a statement about what EXISTS on this clip
 // rather than about how anything moves.
 //
+// `isolate` drops the "already on screen" half: everything outside the range is
+// hidden, earlier elements included. Assembling a graphic and inspecting one
+// element are different jobs -- a build wants the previous clips' elements still
+// standing there, and a look at one element's animation wants them gone.
+//
 // first <= 1 and last <= 0 mean "from the beginning" and "to the end", so the
-// defaults cover the whole frame.
-void applyRevealRange(const std::vector<int>& rank, int first, int last, int taps,
+// defaults cover the whole frame either way.
+void applyRevealRange(const std::vector<int>& rank, int first, int last, bool isolate, int taps,
                       std::vector<GroupTransform>* transforms);
 
 // Reveal position of each group, indexed by group.
