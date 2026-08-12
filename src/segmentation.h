@@ -23,7 +23,6 @@ enum class GroupMode { Character = 0, Word = 1, Line = 2 };
 
 struct DetectParams {
   float alphaThreshold = 0.15f;
-  int minBlobArea = 4;           // in pixels, at analysis resolution
   float wordGapSensitivity = 1.0f;
 
   // Despeckling and bridging, as FRACTIONS OF LETTER HEIGHT.
@@ -41,15 +40,24 @@ struct DetectParams {
   //
   // charPadding is a radius, so it scales with height; minMarkArea is an area, so
   // it scales with height SQUARED.
+  //
+  // minMarkArea's default is what the old 4-pixel despeckle came to on a title of
+  // ordinary size, so nothing changes at the resolution it was tuned at -- it now
+  // simply follows the type everywhere else, which the pixel value never did.
   float charPadding = 0.0f;
-  float minMarkArea = 0.0f;
+  float minMarkArea = 0.0005f;
 
-  // Legacy pixel controls. Kept, and ADDED to the relative pair above, because a
-  // project saved before the change carries a pixel value and no host signal says
-  // it is old -- OFX restores an absent parameter to its default, so a version
-  // flag cannot tell a fresh instance from an old save. Leaving these live means
-  // an existing comp opens grouping exactly as it did, while new work uses the
-  // relative controls and survives proxy.
+  // Legacy pixel padding. Kept, and ADDED to charPadding, because a project saved
+  // before the change carries a pixel value and no host signal says it is old --
+  // OFX restores an absent parameter to its default, so a version flag cannot
+  // tell a fresh instance from an old save. Its default was zero, so preserving
+  // it costs nothing: almost no project has one, and the few that do open
+  // grouping exactly as they did.
+  //
+  // The old pixel DESPECKLE is not kept the same way, and deliberately. Its
+  // default was 4, so every existing project carries a value -- honouring them
+  // would leave the pixel dependency in place for everyone, which is the whole
+  // thing being removed here.
   int bridgeRadius = 0;          // dilate before labeling, to join script fonts
 
   // The widest gap that still counts as being INSIDE a word, as a FRACTION OF
@@ -116,7 +124,7 @@ struct DetectParams {
   float italicSlant = 0.0f;      // degrees, used when autoSlant is off
 
   bool operator==(const DetectParams& o) const {
-    return alphaThreshold == o.alphaThreshold && minBlobArea == o.minBlobArea &&
+    return alphaThreshold == o.alphaThreshold &&
            wordGapSensitivity == o.wordGapSensitivity && charPadding == o.charPadding &&
            minMarkArea == o.minMarkArea &&
            bridgeRadius == o.bridgeRadius && maxLetterGap == o.maxLetterGap && mode == o.mode &&

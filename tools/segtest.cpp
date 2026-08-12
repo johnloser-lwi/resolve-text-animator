@@ -1,7 +1,7 @@
 // Standalone segmentation harness.
 //
 //   segtest <in.png> <out.png> [--mode char|word|line] [--gap N] [--alpha N]
-//           [--bridge N] [--minarea N]
+//           [--bridge N] [--minmark F]
 //
 // Runs the exact segmentation code the plugin uses and writes a diagnostic PNG.
 // Tuning here takes seconds; tuning inside Resolve takes a relaunch each time.
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
                  "usage: segtest <in.png> <out.png> [--mode char|word|line]\n"
-                 "  detection: --gap N --alpha N --bridge N --minarea N\n"
+                 "  detection: --gap N --alpha N --bridge N\n"
                  "             --pad F --minmark F   (relative: fractions of letter height)\n"
                  "             --reftext \"THE WORDS THE TITLE SAYS\"\n"
                  "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
@@ -140,8 +140,6 @@ int main(int argc, char** argv) {
       p.charPadding = float(std::atof(next()));
     } else if (!std::strcmp(a, "--minmark")) {
       p.minMarkArea = float(std::atof(next()));
-    } else if (!std::strcmp(a, "--minarea")) {
-      p.minBlobArea = std::atoi(next());
     } else if (!std::strcmp(a, "--strip")) {
       strip = std::atoi(next());
     } else if (!std::strcmp(a, "--bylength")) {

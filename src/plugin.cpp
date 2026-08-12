@@ -782,7 +782,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // ------------------------------------------------------------ parameters
   rta::DetectParams det;
   det.alphaThreshold = float(_alphaThreshold->getValueAtTime(args.time));
-  det.minBlobArea = std::max(1, _minBlobArea->getValueAtTime(args.time));
+  // minBlobArea is retired -- despeckling is Min Mark Size, relative to letter
+  // size. Deliberately not read, so the pixel value an existing project carries
+  // cannot keep the old resolution dependence alive.
   det.wordGapSensitivity = float(_wordGapSensitivity->getValueAtTime(args.time));
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
@@ -1807,12 +1809,16 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       addParam(page, p);
     }
     {
+      // Retired in favour of Min Mark Size, and no longer read. Still defined so
+      // a project saved with it loads without complaint; hidden so it cannot be
+      // mistaken for a live control.
       OFX::IntParamDescriptor* p = desc.defineIntParam("minBlobArea");
-      p->setLabels("Min Blob Area", "Min Area", "Min Blob Area");
-      p->setHint("Discards specks smaller than this many pixels.");
+      p->setLabels("Min Blob Area", "Min Area", "Min Blob Area (retired)");
+      p->setHint("Retired. Despeckling is now Min Mark Size, measured against letter size.");
       p->setRange(1, 10000);
       p->setDisplayRange(1, 64);
       p->setDefault(4);
+      p->setIsSecret(true);
       p->setParent(*g);
       addParam(page, p);
     }
@@ -1863,13 +1869,13 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
       OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("minMarkArea");
       p->setLabels("Min Mark Size", "Min Mark", "Minimum Mark Size");
       p->setHint(
-          "Discards specks smaller than this share of a letter's area -- the relative "
-          "counterpart of Min Blob Area, so the same setting throws away the same specks "
-          "whatever the render resolution. Whichever of the two is stricter wins. 0 leaves "
-          "despeckling to Min Blob Area alone.");
+          "Discards specks smaller than this share of a letter's area, so the same setting "
+          "throws away the same specks at any render resolution -- a pixel count does not, "
+          "and proxy renders lose marks the full-resolution frame keeps. The default matches "
+          "what the old 4-pixel despeckle came to on a title of ordinary size.");
       p->setRange(0.0, 0.2);
-      p->setDisplayRange(0.0, 0.02);
-      p->setDefault(0.0);
+      p->setDisplayRange(0.0, 0.004);
+      p->setDefault(0.0005);
       p->setParent(*g);
       addParam(page, p);
     }

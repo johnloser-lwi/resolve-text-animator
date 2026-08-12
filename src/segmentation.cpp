@@ -105,9 +105,17 @@ float detectSlant(const std::vector<uint8_t>& mask, int w, int h) {
   // shear, so all the ink falls in half the bins and the score doubles, while any
   // real shear scatters samples across both parities and scores lower. Zero then
   // wins every time and a 20-degree italic reads as upright.
+  //
+  // The row stride is a FRACTION OF FRAME HEIGHT, not a fixed 3. Fixed, it takes
+  // half as many samples from a half-resolution render of the same title, so the
+  // estimate quietly weakens in proxy and can fall under the floor below and
+  // report upright -- which regroups the whole line. Scaling the stride keeps the
+  // sample density constant at any resolution, and lands on exactly 3 at 1080p,
+  // where it was tuned.
+  const int rowStride = std::max(1, h / 360);
   std::vector<int> px, py;
   px.reserve(size_t(w) * h / 16);
-  for (int y = 0; y < h; y += 3) {
+  for (int y = 0; y < h; y += rowStride) {
     const uint8_t* row = &mask[size_t(y) * w];
     for (int x = 0; x < w; ++x) {
       if (!row[x]) continue;
@@ -115,6 +123,9 @@ float detectSlant(const std::vector<uint8_t>& mask, int w, int h) {
       py.push_back(y);
     }
   }
+  // Absolute on purpose, and stable now that the density is: this asks whether
+  // there is enough DATA to fit a slant, which is a question about sample count,
+  // not about scale.
   if (px.size() < 64) return 0.0f;  // too little ink to say anything
 
   const int yMid = h / 2;
@@ -421,8 +432,10 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
   // older project keeps the grouping it was saved with.
   const int bridgePx =
       params.bridgeRadius + int(std::lround(double(params.charPadding) * double(letterHeight)));
+  // At least 1: a despeckle that discards nothing still has to discard nothing,
+  // not everything, if the frame turns out to hold no measurable type.
   const int minArea = std::max(
-      params.minBlobArea,
+      1,
       int(std::lround(double(params.minMarkArea) * double(letterHeight) * double(letterHeight))));
 
   // 2. Optional bridge dilation. Labels are computed on the dilated mask but
