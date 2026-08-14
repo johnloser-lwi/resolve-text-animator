@@ -531,22 +531,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
       return;
     }
 
-    // One value, two sliders. The guard matters because setValue dispatches
-    // straight back into changedParam, which would otherwise bounce forever.
-    if (!_syncingSamples && (name == "blurSamples" || name == "startBlurSamples")) {
-      _syncingSamples = true;
-      const bool fromMotion = name == "blurSamples";
-      const int v = fromMotion ? _blurSamples->getValueAtTime(args.time)
-                               : _startBlurSamples->getValueAtTime(args.time);
-      rta::beginEdit(this, "Blur samples");
-      if (fromMotion)
-        _startBlurSamples->setValue(v);
-      else
-        _blurSamples->setValue(v);
-      rta::endEdit(this);
-      _syncingSamples = false;
-      return;
-    }
+    // The two sample sliders used to be one value shown twice, because both
+    // blurs were drawn from the same taps. Start Blur no longer samples, so
+    // there is nothing left to keep in step.
 
     if (name == "singleElement") {
       syncRangeUI();
@@ -702,7 +689,6 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::ChoiceParam *_groupMode, *_animation, *_easing, *_order, *_lineOrder, *_distanceUnits;
   OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_blurSamples;
   OFX::IntParam* _startBlurSamples;
-  bool _syncingSamples = false;
   bool _cleaningLists = false;
   bool _applyingPreset = false;
   OFX::DoubleParam *_startTime, *_duration, *_stagger, *_slideDistance, *_slideAngle, *_startScale;
@@ -1696,18 +1682,17 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     addParam(page, p);
   }
   {
-    // Mirrors the Samples in the Motion Blur group -- the two blurs share one
-    // tap budget, and having the control only under Motion Blur made it look
-    // like it did not apply to Start Blur at all. Kept in step by changedParam.
+    // Retired. Start Blur is a separable blur of the finished sprite now, so it
+    // has no taps to spend and no sample count to tune -- its cost does not
+    // depend on the radius at all. Kept defined so an existing project loads,
+    // hidden because there is nothing left for it to do.
     OFX::IntParamDescriptor* p = desc.defineIntParam("startBlurSamples");
-    p->setLabels("Blur Samples", "Samples", "Start Blur Samples");
-    p->setHint(
-        "Taps used for Start Blur. Shared with Motion Blur > Samples -- they are "
-        "one value shown in both places, because both blurs are drawn in the "
-        "same pass.");
+    p->setLabels("Blur Samples", "Samples", "Start Blur Samples (retired)");
+    p->setHint("Retired. Start Blur no longer samples, so it needs no sample count.");
     p->setRange(2, 64);
     p->setDisplayRange(2, 32);
     p->setDefault(8);
+    p->setIsSecret(true);
     addParam(page, p);
   }
 

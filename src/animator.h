@@ -311,9 +311,6 @@ FitReport checkFit(double maxDelayIn, double maxDelayOut, const AnimParams& p,
 // of travel, which is that angle turned through 180 degrees.
 StageSettings mirrorStage(const StageSettings& in, bool mirror);
 
-// Deterministic unit-disc offset for defocus sampling (Vogel spiral).
-void discOffset(int tap, int taps, float* dx, float* dy);
-
 // The easing evaluator. Exposed so the on-screen curve editor plots the exact
 // curve the renderer uses, rather than its own approximation of it.
 float applyEasing(float t, Easing e, const BezierEasing& b);

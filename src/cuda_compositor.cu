@@ -84,12 +84,15 @@ __device__ inline void sampleMaskedDev(const float* src, std::ptrdiff_t srcStrid
   }
 }
 
-// One thread per destination pixel; each thread averages every shutter tap.
-__global__ void compositeKernel(float* dst, std::ptrdiff_t dstStride, const float* src,
-                                std::ptrdiff_t srcStride, const int32_t* labels,
-                                const int32_t* labelToGroup, int labWidth, int imgW, int imgH,
-                                int group, float cx, float cy, const DevTap* taps, int nTaps,
-                                int dx0, int dy0, int dw, int dh) {
+// One thread per tile pixel; each thread averages every shutter tap.
+//
+// Writes the group into its OWN tile rather than straight over the frame,
+// because the defocus that follows has to see the sprite alone -- blurring into
+// the frame would drag whatever is already composited under it into the result.
+__global__ void renderTileKernel(float* tile, const float* src, std::ptrdiff_t srcStride,
+                                 const int32_t* labels, const int32_t* labelToGroup, int labWidth,
+                                 int imgW, int imgH, int group, float cx, float cy,
+                                 const DevTap* taps, int nTaps, int dx0, int dy0, int dw, int dh) {
   const int lx = blockIdx.x * blockDim.x + threadIdx.x;
   const int ly = blockIdx.y * blockDim.y + threadIdx.y;
   if (lx >= dw || ly >= dh) return;
@@ -103,19 +106,12 @@ __global__ void compositeKernel(float* dst, std::ptrdiff_t dstStride, const floa
     const DevTap t = taps[k];
     if (!t.visible || t.opacity <= 0.0f) continue;
 
-    float jx = 0.0f, jy = 0.0f;
-    if (t.blur > 0.0f) {
-      discOffsetDev(k, nTaps, &jx, &jy);
-      jx *= t.blur;
-      jy *= t.blur;
-    }
-
     // Inverse of  p' = centre + R(theta)*scale*(p - centre) + offset
     const float inv = 1.0f / (fabsf(t.scale) < 1e-6f ? 1e-6f : t.scale);
     const float c = __cosf(-t.rotation) * inv;
     const float s = __sinf(-t.rotation) * inv;
-    const float ddx = float(x) + jx + 0.5f - cx - t.offsetX;
-    const float ddy = float(y) + jy + 0.5f - cy - t.offsetY;
+    const float ddx = float(x) + 0.5f - cx - t.offsetX;
+    const float ddy = float(y) + 0.5f - cy - t.offsetY;
     const float fx = c * ddx - s * ddy + cx - 0.5f;
     const float fy = s * ddx + c * ddy + cy - 0.5f;
 
@@ -129,16 +125,58 @@ __global__ void compositeKernel(float* dst, std::ptrdiff_t dstStride, const floa
     acc[3] += smp[3] * t.opacity;
   }
 
-  if (acc[3] <= 0.0f) return;
-
-  // Premultiplied "over".
   const float invTaps = 1.0f / float(nTaps);
-  float* o = dst + dstStride * y + std::ptrdiff_t(x) * 4;
-  const float a = acc[3] * invTaps;
+  float* o = tile + (std::ptrdiff_t(ly) * dw + lx) * 4;
+  o[0] = acc[0] * invTaps;
+  o[1] = acc[1] * invTaps;
+  o[2] = acc[2] * invTaps;
+  o[3] = acc[3] * invTaps;
+}
+
+// One thread per LINE, walking it with a running window. Mirrors the CPU
+// version's arithmetic exactly -- same additions in the same order -- so the two
+// paths cannot drift apart in the last bits.
+__global__ void boxPassKernel(const float* in, float* out, int w, int h, int r, int horizontal) {
+  const int n = horizontal ? w : h;
+  const int lines = horizontal ? h : w;
+  const int l = blockIdx.x * blockDim.x + threadIdx.x;
+  if (l >= lines) return;
+
+  const std::ptrdiff_t step = horizontal ? 4 : std::ptrdiff_t(w) * 4;
+  const std::ptrdiff_t lineStep = horizontal ? std::ptrdiff_t(w) * 4 : 4;
+  const float inv = 1.0f / float(2 * r + 1);
+  const float* ip = in + lineStep * l;
+  float* op = out + lineStep * l;
+
+  float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int i = 0; i <= r && i < n; ++i)
+    for (int c = 0; c < 4; ++c) sum[c] += ip[step * i + c];
+
+  for (int i = 0; i < n; ++i) {
+    for (int c = 0; c < 4; ++c) op[step * i + c] = sum[c] * inv;
+    const int add = i + r + 1, drop = i - r;
+    if (add < n)
+      for (int c = 0; c < 4; ++c) sum[c] += ip[step * add + c];
+    if (drop >= 0)
+      for (int c = 0; c < 4; ++c) sum[c] -= ip[step * drop + c];
+  }
+}
+
+// Premultiplied "over" of the finished tile onto the frame.
+__global__ void blendTileKernel(float* dst, std::ptrdiff_t dstStride, const float* tile, int dx0,
+                                int dy0, int dw, int dh) {
+  const int lx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ly = blockIdx.y * blockDim.y + threadIdx.y;
+  if (lx >= dw || ly >= dh) return;
+
+  const float* in = tile + (std::ptrdiff_t(ly) * dw + lx) * 4;
+  const float a = in[3];
+  if (a <= 0.0f) return;
+  float* o = dst + dstStride * (dy0 + ly) + std::ptrdiff_t(dx0 + lx) * 4;
   const float ia = 1.0f - a;
-  o[0] = acc[0] * invTaps + o[0] * ia;
-  o[1] = acc[1] * invTaps + o[1] * ia;
-  o[2] = acc[2] * invTaps + o[2] * ia;
+  o[0] = in[0] + o[0] * ia;
+  o[1] = in[1] + o[1] * ia;
+  o[2] = in[2] + o[2] * ia;
   o[3] = a + o[3] * ia;
 }
 
@@ -332,8 +370,28 @@ bool cudaDownload(std::vector<float>& out, const float* srcDev, std::ptrdiff_t s
 CudaScratch::~CudaScratch() {
   if (accum_) cudaFree(accum_);
   if (taps_) cudaFree(taps_);
+  for (int i = 0; i < 2; ++i)
+    if (tiles_[i]) cudaFree(tiles_[i]);
   accum_ = nullptr;
   taps_ = nullptr;
+  tiles_[0] = tiles_[1] = nullptr;
+}
+
+void* CudaScratch::tileBuffer(int which, size_t bytes) {
+  if (bytes == 0 || which < 0 || which > 1) return nullptr;
+  if (tiles_[which] && tileBytes_[which] >= bytes) return tiles_[which];
+  if (tiles_[which]) cudaFree(tiles_[which]);
+  tiles_[which] = nullptr;
+  tileBytes_[which] = 0;
+  // Round up, so walking through groups of slightly different sizes does not
+  // reallocate on every one of them.
+  const size_t want = bytes * 2;
+  if (cudaMalloc(&tiles_[which], want) != cudaSuccess) {
+    tiles_[which] = nullptr;
+    return nullptr;
+  }
+  tileBytes_[which] = want;
+  return tiles_[which];
 }
 
 void* CudaScratch::tapBuffer(size_t bytes) {
@@ -444,21 +502,45 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
     // to where it happens to sit at the frame's midpoint.
     RectI dest{};
     int live = 0;
+    float radius = 0.0f;
     for (int k = 0; k < taps; ++k) {
       if (!tg[k].visible || tg[k].opacity <= 0.0f) continue;
       ++live;
+      radius += tg[k].blur;
       dest.unionWith(tapBounds(tg[k], b, cx, cy));
     }
     if (live == 0) continue;
+    radius /= float(live);
 
     dest.grow(2);
     dest = intersect(dest, win);
     if (dest.empty()) continue;
 
-    compositeKernel<<<gridFor(dest.width(), dest.height(), block), block, 0, s>>>(
-        dstDev, dstStride, srcDev, srcStride, devSeg.labels(), devSeg.labelToGroup(),
-        devSeg.width(), width, height, int(gi), cx, cy, devTaps + gi * size_t(taps), taps,
-        dest.x1, dest.y1, dest.width(), dest.height());
+    const int tw = dest.width(), th = dest.height();
+    const size_t tileBytes = size_t(tw) * size_t(th) * 4 * sizeof(float);
+    float* tileA = static_cast<float*>(scratch.tileBuffer(0, tileBytes));
+    if (!tileA) return false;
+
+    renderTileKernel<<<gridFor(tw, th, block), block, 0, s>>>(
+        tileA, srcDev, srcStride, devSeg.labels(), devSeg.labelToGroup(), devSeg.width(), width,
+        height, int(gi), cx, cy, devTaps + gi * size_t(taps), taps, dest.x1, dest.y1, tw, th);
+
+    if (radius > 0.5f) {
+      float* tileB = static_cast<float*>(scratch.tileBuffer(1, tileBytes));
+      if (!tileB) return false;
+      // Same three passes, same radius rule, same order as the CPU path.
+      const int r = std::max(1, int(radius / 3.0f + 0.5f));
+      const int lineBlock = 64;
+      for (int pass = 0; pass < 3; ++pass) {
+        boxPassKernel<<<(th + lineBlock - 1) / lineBlock, lineBlock, 0, s>>>(tileA, tileB, tw, th,
+                                                                            r, 1);
+        boxPassKernel<<<(tw + lineBlock - 1) / lineBlock, lineBlock, 0, s>>>(tileB, tileA, tw, th,
+                                                                            r, 0);
+      }
+    }
+
+    blendTileKernel<<<gridFor(tw, th, block), block, 0, s>>>(dstDev, dstStride, tileA, dest.x1,
+                                                             dest.y1, tw, th);
   }
 
   RTA_CUDA_OK(cudaGetLastError());

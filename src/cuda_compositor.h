@@ -76,10 +76,16 @@ class CudaScratch {
   // Grow-only device buffer for per-frame transform uploads.
   void* tapBuffer(size_t bytes);
 
+  // Two grow-only tiles for the defocus. A separable blur reads one and writes
+  // the other, so it needs somewhere to land that is not what it is reading.
+  void* tileBuffer(int which, size_t bytes);
+
  private:
   unsigned long long* accum_ = nullptr;
   void* taps_ = nullptr;
   size_t tapBytes_ = 0;
+  void* tiles_[2] = {nullptr, nullptr};
+  size_t tileBytes_[2] = {0, 0};
   bool tried_ = false;
 };
 

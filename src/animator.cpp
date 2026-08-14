@@ -441,14 +441,11 @@ int adaptiveTapCount(const std::vector<Group>& groups, const std::vector<GroupTr
   const double perSample = std::max(0.25, pixelsPerSample);
 
   double maxTravel = 0.0;  // pixels a group moves across the shutter
-  double maxBlur = 0.0;    // largest defocus radius, either end
 
   for (size_t g = 0; g < groups.size(); ++g) {
     const GroupTransform& a = ends[g * 2];
     const GroupTransform& b = ends[g * 2 + 1];
     if (!a.visible && !b.visible) continue;
-
-    maxBlur = std::max({maxBlur, double(a.blur), double(b.blur)});
 
     // A fade with no movement still varies across the shutter, so opacity has
     // to count as travel or a cross-fading group would collapse to one tap and
@@ -493,25 +490,20 @@ int adaptiveTapCount(const std::vector<Group>& groups, const std::vector<GroupTr
   // at roughly constant density however fast the group is going.
   int need = int(maxTravel / perSample) + 1;
 
-  // Defocus: the taps tile a disc rather than a line, so the count that holds
-  // the same spacing goes with the AREA. Treating it as linear leaves visible
-  // rings in a large blur.
-  if (maxBlur > 0.0) {
-    const double perAxis = 2.0 * maxBlur / perSample;
-    need = std::max(need, int(perAxis * perAxis * 0.25) + 1);
-    // A disc sampled once is not a blur, it is the image nudged off centre by
-    // the single Vogel offset. Any defocus at all buys at least two taps.
-    need = std::max(need, 2);
-  }
-
+  // Defocus no longer buys taps. It used to demand them by AREA -- the samples
+  // tiled a disc, so holding the spacing meant squaring the count, and a wide
+  // blur alone could eat the whole budget. The compositor blurs the sprite
+  // directly now, so the taps are free to measure only how far things move.
   return std::min(maxTaps, std::max(1, need));
 }
 
 int tapCount(const AnimParams& p) {
-  // Defocus alone still needs multiple taps; only a fully sharp, non-blurred
-  // render can get away with one.
-  const bool needsTaps = p.motionBlur || p.in.startBlur > 0.0 || p.out.startBlur > 0.0;
-  if (!needsTaps) return 1;
+  // Taps are for MOTION only now. Defocus used to need them too -- it was N
+  // jittered copies of the sprite -- so a still, defocused group paid for a
+  // sample count it had no movement to spend it on, and looked like a row of
+  // ghosts for the trouble. The compositor blurs the finished sprite instead,
+  // at a cost that does not depend on the radius.
+  if (!p.motionBlur) return 1;
   return std::min(64, std::max(2, p.blurSamples));
 }
 
@@ -531,16 +523,6 @@ void transformTaps(Stage stage, double delayUnits, double frames, double stageSt
     const double f = (double(k) / double(n - 1)) - 0.5;
     out[k] = transformFor(stage, delayUnits, frames + span * f, stageStart, s);
   }
-}
-
-void discOffset(int tap, int taps, float* dx, float* dy) {
-  // Vogel spiral: even coverage of the disc without an RNG, so the blur is
-  // stable frame to frame instead of shimmering.
-  const float golden = 2.39996322972865332f;
-  const float a = float(tap) * golden;
-  const float r = std::sqrt((float(tap) + 0.5f) / float(std::max(1, taps)));
-  *dx = r * std::cos(a);
-  *dy = r * std::sin(a);
 }
 
 double totalDuration(double maxDelayUnits, const AnimParams& p) {

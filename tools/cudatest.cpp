@@ -42,6 +42,8 @@ int main(int argc, char** argv) {
   rta::DetectParams p;
   rta::SpacingParams sp;
   int frameCount = 24;
+  double startBlur = 0.0;
+  bool motionBlur = false;
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
       const char* m = argv[++i];
@@ -50,6 +52,10 @@ int main(int argc, char** argv) {
                                          : rta::GroupMode::Word;
     } else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) {
       frameCount = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--blur") && i + 1 < argc) {
+      startBlur = std::atof(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--mblur") && i + 1 < argc) {
+      motionBlur = std::atoi(argv[++i]) != 0;
     } else if (!std::strcmp(argv[i], "--track") && i + 1 < argc) {
       sp.tracking = float(std::atof(argv[++i]));
     } else if (!std::strcmp(argv[i], "--linespace") && i + 1 < argc) {
@@ -94,6 +100,11 @@ int main(int argc, char** argv) {
 
   rta::AnimParams anim;  // plugin defaults: dur 12, stagger 2
   anim.in.slideDistance = 45.0;
+  // Defocus is the one path where the two implementations run genuinely
+  // different code -- a separable blur over a tile, launched as its own kernels
+  // on the GPU -- so it has to be exercised here or it is untested.
+  anim.in.startBlur = startBlur;
+  anim.motionBlur = motionBlur;
 
   rta::CudaSegmentation devSeg;
   rta::CudaScratch scratch;

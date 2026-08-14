@@ -53,6 +53,63 @@ inline void sampleMasked(const ImageView& src, const Segmentation& seg, int grou
   }
 }
 
+// Separable box blur, run three times, which is the usual stand-in for a
+// Gaussian and is indistinguishable from one at these radii.
+//
+// Cost does not depend on the radius: each output pixel is one subtraction of
+// two prefix sums. That is the whole reason for the change -- the defocus used
+// to be N jittered copies of the sprite borrowed from the motion-blur taps, so
+// it cost a full resample per tap AND showed every one of them as a distinct
+// ghost until the sample count was pushed high enough to hide them.
+//
+// Runs on PREMULTIPLIED pixels, which is what makes a plain average correct:
+// colour is already weighted by coverage, so a transparent neighbour
+// contributes nothing rather than dragging black in.
+void boxPass(const float* in, float* out, int w, int h, int r, bool horizontal) {
+  const int n = horizontal ? w : h;
+  const int lines = horizontal ? h : w;
+  const std::ptrdiff_t step = horizontal ? 4 : std::ptrdiff_t(w) * 4;
+  const std::ptrdiff_t lineStep = horizontal ? std::ptrdiff_t(w) * 4 : 4;
+  const float inv = 1.0f / float(2 * r + 1);
+
+  // A running window, deliberately, rather than the prefix sums this reads like
+  // it wants: the CUDA path has to produce the same numbers, and the same
+  // additions in the same order is the only way to promise that.
+  for (int l = 0; l < lines; ++l) {
+    const float* ip = in + lineStep * l;
+    float* op = out + lineStep * l;
+
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i <= r && i < n; ++i)
+      for (int ch = 0; ch < 4; ++ch) sum[ch] += ip[step * i + ch];
+
+    for (int i = 0; i < n; ++i) {
+      // Divided by the FULL window even at the ends, where part of it hangs off
+      // the tile. Outside there is nothing, and nothing is transparent -- so the
+      // edge fades out instead of smearing the border pixel outwards.
+      for (int ch = 0; ch < 4; ++ch) op[step * i + ch] = sum[ch] * inv;
+      const int add = i + r + 1, drop = i - r;
+      if (add < n)
+        for (int ch = 0; ch < 4; ++ch) sum[ch] += ip[step * add + ch];
+      if (drop >= 0)
+        for (int ch = 0; ch < 4; ++ch) sum[ch] -= ip[step * drop + ch];
+    }
+  }
+}
+
+// `radius` is the visible spread in pixels, matching what the old disc jitter
+// covered, so a project's Start Blur means roughly the same distance as before
+// even though it now looks like a blur instead of a row of copies.
+void blurTile(std::vector<float>& tile, std::vector<float>& scratch, int w, int h, float radius) {
+  const int r = std::max(1, int(radius / 3.0f + 0.5f));
+  if (w <= 0 || h <= 0) return;
+  scratch.assign(tile.size(), 0.0f);
+  for (int pass = 0; pass < 3; ++pass) {
+    boxPass(tile.data(), scratch.data(), w, h, r, true);
+    boxPass(scratch.data(), tile.data(), w, h, r, false);
+  }
+}
+
 }  // namespace
 
 void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentation& seg,
@@ -74,6 +131,7 @@ void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentat
   if (!src.valid() || seg.empty() || transforms.size() != seg.groups.size() * size_t(taps)) return;
 
   std::vector<TapGeom> geom(taps);
+  std::vector<float> tile, scratch;  // reused across groups
 
   for (size_t gi = 0; gi < seg.groups.size(); ++gi) {
     const GroupTransform* tg = &transforms[gi * size_t(taps)];
@@ -100,26 +158,39 @@ void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentat
 
     const float invTaps = 1.0f / float(taps);
 
-    for (int y = dest.y1; y < dest.y2; ++y) {
-      float* out = dst.at(dest.x1, y);
-      for (int x = dest.x1; x < dest.x2; ++x, out += 4) {
+    // Defocus, averaged over the live taps. It barely moves across one shutter,
+    // and one radius for the group is what lets the blur be a single pass over
+    // the finished sprite rather than something each tap carries.
+    float radius = 0.0f;
+    {
+      int n = 0;
+      for (int k = 0; k < taps; ++k) {
+        const GroupTransform& t = geom[k].t;
+        if (!t.visible || t.opacity <= 0.0f) continue;
+        radius += t.blur;
+        ++n;
+      }
+      if (n > 0) radius /= float(n);
+    }
+
+    // The group is drawn into its own tile first. Blurring wants the sprite
+    // whole and by itself -- blurring straight into the frame would smear it
+    // into whatever was composited under it.
+    const int tw = dest.width(), th = dest.height();
+    tile.assign(size_t(tw) * size_t(th) * 4, 0.0f);
+
+    for (int y = 0; y < th; ++y) {
+      float* out = &tile[size_t(y) * size_t(tw) * 4];
+      for (int x = 0; x < tw; ++x, out += 4) {
+        const float px = float(dest.x1 + x), py = float(dest.y1 + y);
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
         for (int k = 0; k < taps; ++k) {
           const GroupTransform& t = geom[k].t;
           if (!t.visible || t.opacity <= 0.0f) continue;
 
-          // Defocus is a jitter of the destination sample position, which is
-          // equivalent to blurring the composited result.
-          float jx = 0.0f, jy = 0.0f;
-          if (t.blur > 0.0f) {
-            discOffset(k, taps, &jx, &jy);
-            jx *= t.blur;
-            jy *= t.blur;
-          }
-
           float fx, fy;
-          geom[k].inverse(float(x) + jx, float(y) + jy, &fx, &fy);
+          geom[k].inverse(px, py, &fx, &fy);
 
           float smp[4];
           sampleMasked(src, seg, int(gi), fx, fy, smp);
@@ -131,14 +202,25 @@ void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentat
           acc[3] += smp[3] * t.opacity;
         }
 
-        if (acc[3] <= 0.0f) continue;
+        out[0] = acc[0] * invTaps;
+        out[1] = acc[1] * invTaps;
+        out[2] = acc[2] * invTaps;
+        out[3] = acc[3] * invTaps;
+      }
+    }
 
-        // Premultiplied, so fading is a plain scale of all four channels.
-        const float a = acc[3] * invTaps;
+    if (radius > 0.5f) blurTile(tile, scratch, tw, th, radius);
+
+    for (int y = 0; y < th; ++y) {
+      const float* in = &tile[size_t(y) * size_t(tw) * 4];
+      float* out = dst.at(dest.x1, dest.y1 + y);
+      for (int x = 0; x < tw; ++x, in += 4, out += 4) {
+        const float a = in[3];
+        if (a <= 0.0f) continue;
         const float ia = 1.0f - a;
-        out[0] = acc[0] * invTaps + out[0] * ia;
-        out[1] = acc[1] * invTaps + out[1] * ia;
-        out[2] = acc[2] * invTaps + out[2] * ia;
+        out[0] = in[0] + out[0] * ia;
+        out[1] = in[1] + out[1] * ia;
+        out[2] = in[2] + out[2] * ia;
         out[3] = a + out[3] * ia;
       }
     }
