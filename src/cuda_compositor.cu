@@ -136,7 +136,8 @@ __global__ void renderTileKernel(float* tile, const float* src, std::ptrdiff_t s
 // One thread per LINE, walking it with a running window. Mirrors the CPU
 // version's arithmetic exactly -- same additions in the same order -- so the two
 // paths cannot drift apart in the last bits.
-__global__ void boxPassKernel(const float* in, float* out, int w, int h, int r, int horizontal) {
+__global__ void boxPassKernel(const float* in, float* out, int w, int h, float halfWidth,
+                              int horizontal) {
   const int n = horizontal ? w : h;
   const int lines = horizontal ? h : w;
   const int l = blockIdx.x * blockDim.x + threadIdx.x;
@@ -144,7 +145,10 @@ __global__ void boxPassKernel(const float* in, float* out, int w, int h, int r, 
 
   const std::ptrdiff_t step = horizontal ? 4 : std::ptrdiff_t(w) * 4;
   const std::ptrdiff_t lineStep = horizontal ? std::ptrdiff_t(w) * 4 : 4;
-  const float inv = 1.0f / float(2 * r + 1);
+
+  const int r = int(halfWidth);
+  const float f = halfWidth - float(r);
+  const float inv = 1.0f / (2.0f * float(r) + 1.0f + 2.0f * f);
   const float* ip = in + lineStep * l;
   float* op = out + lineStep * l;
 
@@ -153,7 +157,13 @@ __global__ void boxPassKernel(const float* in, float* out, int w, int h, int r, 
     for (int c = 0; c < 4; ++c) sum[c] += ip[step * i + c];
 
   for (int i = 0; i < n; ++i) {
-    for (int c = 0; c < 4; ++c) op[step * i + c] = sum[c] * inv;
+    const int lo = i - r - 1, hi = i + r + 1;
+    for (int c = 0; c < 4; ++c) {
+      float edge = 0.0f;
+      if (lo >= 0) edge += ip[step * lo + c];
+      if (hi < n) edge += ip[step * hi + c];
+      op[step * i + c] = (sum[c] + f * edge) * inv;
+    }
     const int add = i + r + 1, drop = i - r;
     if (add < n)
       for (int c = 0; c < 4; ++c) sum[c] += ip[step * add + c];
@@ -525,17 +535,19 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
         tileA, srcDev, srcStride, devSeg.labels(), devSeg.labelToGroup(), devSeg.width(), width,
         height, int(gi), cx, cy, devTaps + gi * size_t(taps), taps, dest.x1, dest.y1, tw, th);
 
-    if (radius > 0.5f) {
+    // Only skipped where the window is narrow enough to BE the identity, not at
+    // some threshold that would put the snap back.
+    if (radius > 0.003f) {
       float* tileB = static_cast<float*>(scratch.tileBuffer(1, tileBytes));
       if (!tileB) return false;
-      // Same three passes, same radius rule, same order as the CPU path.
-      const int r = std::max(1, int(radius / 3.0f + 0.5f));
+      // Same three passes, same width, same order as the CPU path.
+      const float halfWidth = radius / 3.0f;
       const int lineBlock = 64;
       for (int pass = 0; pass < 3; ++pass) {
         boxPassKernel<<<(th + lineBlock - 1) / lineBlock, lineBlock, 0, s>>>(tileA, tileB, tw, th,
-                                                                            r, 1);
+                                                                            halfWidth, 1);
         boxPassKernel<<<(tw + lineBlock - 1) / lineBlock, lineBlock, 0, s>>>(tileB, tileA, tw, th,
-                                                                            r, 0);
+                                                                            halfWidth, 0);
       }
     }
 

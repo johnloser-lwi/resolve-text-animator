@@ -65,12 +65,28 @@ inline void sampleMasked(const ImageView& src, const Segmentation& seg, int grou
 // Runs on PREMULTIPLIED pixels, which is what makes a plain average correct:
 // colour is already weighted by coverage, so a transparent neighbour
 // contributes nothing rather than dragging black in.
-void boxPass(const float* in, float* out, int w, int h, int r, bool horizontal) {
+// `halfWidth` is REAL, not an integer number of pixels.
+//
+// An integer window quantises the blur, and the quantisation is worst exactly
+// where it shows most. The narrowest box is one pixel either side, so a settling
+// group steps 6px, 3px, 3px, 3px, sharp -- and an ease-out spends most of its
+// frames down at that bottom end, so the last step reads as the blur snapping
+// off rather than fading out.
+//
+// So the window carries the leftover as a WEIGHT on the two samples just past
+// its ends: full pixels within [i-r, i+r], plus f of the pair either side,
+// divided by the width that actually describes. Continuous in halfWidth, and at
+// zero it is exactly the identity, so the blur can reach sharp by arriving
+// rather than by being switched off.
+void boxPass(const float* in, float* out, int w, int h, float halfWidth, bool horizontal) {
   const int n = horizontal ? w : h;
   const int lines = horizontal ? h : w;
   const std::ptrdiff_t step = horizontal ? 4 : std::ptrdiff_t(w) * 4;
   const std::ptrdiff_t lineStep = horizontal ? std::ptrdiff_t(w) * 4 : 4;
-  const float inv = 1.0f / float(2 * r + 1);
+
+  const int r = int(halfWidth);
+  const float f = halfWidth - float(r);
+  const float inv = 1.0f / (2.0f * float(r) + 1.0f + 2.0f * f);
 
   // A running window, deliberately, rather than the prefix sums this reads like
   // it wants: the CUDA path has to produce the same numbers, and the same
@@ -87,7 +103,13 @@ void boxPass(const float* in, float* out, int w, int h, int r, bool horizontal) 
       // Divided by the FULL window even at the ends, where part of it hangs off
       // the tile. Outside there is nothing, and nothing is transparent -- so the
       // edge fades out instead of smearing the border pixel outwards.
-      for (int ch = 0; ch < 4; ++ch) op[step * i + ch] = sum[ch] * inv;
+      const int lo = i - r - 1, hi = i + r + 1;
+      for (int ch = 0; ch < 4; ++ch) {
+        float edge = 0.0f;
+        if (lo >= 0) edge += ip[step * lo + ch];
+        if (hi < n) edge += ip[step * hi + ch];
+        op[step * i + ch] = (sum[ch] + f * edge) * inv;
+      }
       const int add = i + r + 1, drop = i - r;
       if (add < n)
         for (int ch = 0; ch < 4; ++ch) sum[ch] += ip[step * add + ch];
@@ -101,12 +123,12 @@ void boxPass(const float* in, float* out, int w, int h, int r, bool horizontal) 
 // covered, so a project's Start Blur means roughly the same distance as before
 // even though it now looks like a blur instead of a row of copies.
 void blurTile(std::vector<float>& tile, std::vector<float>& scratch, int w, int h, float radius) {
-  const int r = std::max(1, int(radius / 3.0f + 0.5f));
   if (w <= 0 || h <= 0) return;
+  const float halfWidth = radius / 3.0f;  // three passes make up the spread
   scratch.assign(tile.size(), 0.0f);
   for (int pass = 0; pass < 3; ++pass) {
-    boxPass(tile.data(), scratch.data(), w, h, r, true);
-    boxPass(scratch.data(), tile.data(), w, h, r, false);
+    boxPass(tile.data(), scratch.data(), w, h, halfWidth, true);
+    boxPass(scratch.data(), tile.data(), w, h, halfWidth, false);
   }
 }
 
@@ -209,7 +231,9 @@ void compositeGroups(const ImageView& dst, const ImageView& src, const Segmentat
       }
     }
 
-    if (radius > 0.5f) blurTile(tile, scratch, tw, th, radius);
+    // Only skipped where the window is narrow enough to BE the identity, not at
+    // some threshold that would put the snap back.
+    if (radius > 0.003f) blurTile(tile, scratch, tw, th, radius);
 
     for (int y = 0; y < th; ++y) {
       const float* in = &tile[size_t(y) * size_t(tw) * 4];
