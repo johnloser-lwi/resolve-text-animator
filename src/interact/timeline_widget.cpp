@@ -27,6 +27,48 @@ constexpr Colour kText{0.92f, 0.92f, 0.92f, 1.00f};
 constexpr Colour kTextDim{0.60f, 0.60f, 0.60f, 1.00f};
 constexpr Colour kGrid{1.00f, 1.00f, 1.00f, 0.18f};
 
+// The strip's numbers, assembled here from two sources: what render published
+// (origin, clip length, spans -- things that need the segmentation) and what
+// the overlay can read itself (its own time, Start, End Offset).
+//
+// The split is what keeps the strip moving. Render is only called for frames
+// the host has not cached, so a frame or a bar position published from render
+// freezes the moment the playhead crosses into cached territory -- the stutter
+// Multi Transform never had, because it derives the playhead from the overlay's
+// own time. Same here now.
+struct Timing {
+  bool haveTiming = false;
+  double clipFrame = 0.0;
+  double clipLength = 0.0;
+  bool haveLength = false;
+  bool enableOut = false;
+  bool outUsable = false;
+  double inStart = 0.0, inEnd = 0.0;
+  double outStart = 0.0, outEnd = 0.0;
+};
+
+Timing resolveTiming(const OverlayContext& c) {
+  const AnalysisState a = analysisState(c.effect);
+  Timing t;
+  t.haveTiming = a.haveTiming;
+  t.clipLength = a.clipLength;
+  t.haveLength = a.haveLength;
+  t.enableOut = a.enableOut;
+  t.outUsable = a.outUsable;
+  double start = 0.0, offset = 0.0;
+  try {
+    start = c.effect->fetchDoubleParam("startTime")->getValueAtTime(c.time);
+    offset = c.effect->fetchDoubleParam("outOffset")->getValueAtTime(c.time);
+  } catch (...) {
+  }
+  t.clipFrame = c.time - a.origin;
+  t.inStart = start;
+  t.inEnd = start + a.inSpan;
+  t.outEnd = a.clipLength - offset;
+  t.outStart = t.outEnd - a.outSpan;
+  return t;
+}
+
 }  // namespace
 
 void TimelineWidget::layout(const OverlayContext& c) {
@@ -46,7 +88,7 @@ void TimelineWidget::layout(const OverlayContext& c) {
   _rect.y1 = c.rod.y1 + c.sy(20.0);
   _rect.y2 = _rect.y1 + height;
 
-  const AnalysisState a = analysisState(c.effect);
+  const Timing a = resolveTiming(c);
 
   // The clip is the frame of reference: the ruler runs 0..clip length, so a
   // bar reads as "this far into the clip" rather than as a raw host frame.
@@ -102,7 +144,7 @@ OfxRectD TimelineWidget::laneRect(const OverlayContext& c, int lane) const {
 }
 
 void TimelineWidget::draw(const OverlayContext& c) {
-  const AnalysisState a = analysisState(c.effect);
+  const Timing a = resolveTiming(c);
   Panel(c, _rect);
 
   SetColour(c, kTextDim);
@@ -208,7 +250,7 @@ void TimelineWidget::draw(const OverlayContext& c) {
 
 bool TimelineWidget::penDown(const OverlayContext& c, const OfxPointD& p) {
   if (!Contains(_rect, p)) return false;
-  const AnalysisState a = analysisState(c.effect);
+  const Timing a = resolveTiming(c);
   if (!a.haveTiming) return true;
 
   for (int i = 0; i < 2; ++i) {

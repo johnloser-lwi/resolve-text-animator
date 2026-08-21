@@ -237,8 +237,6 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _linkOut = fetchBooleanParam("linkOut");
     _mirrorOut = fetchBooleanParam("mirrorOut");
     _clipLengthOverride = fetchDoubleParam("clipLengthOverride");
-    _manualOrigin = fetchBooleanParam("manualOrigin");
-    _originFrame = fetchDoubleParam("originFrame");
 
     _outGroupMode = fetchChoiceParam("outGroupMode");
     _outAnimation = fetchChoiceParam("outAnimation");
@@ -324,16 +322,6 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // The animation then begins exactly where the playhead was parked, however
   // the clip is trimmed. This is how MultiTransform sidesteps the same gap.
   double originAt(double) {
-    // A captured anchor wins outright. It is the one answer that is right in
-    // EVERY host, because it was measured in whatever units the render time
-    // arrives in -- Fusion comp frames, Edit-page clip frames, absolute
-    // timeline frames -- and is subtracted from a time in those same units, so
-    // the two cancel whatever they happen to be. Multi Transform does exactly
-    // this, and it is why its button works on both pages.
-    //
-    // Everything below is the automatic guess for when nothing was captured.
-    if (_manualOrigin->getValue()) return _originFrame->getValue();
-
     // The clip BOUNDARY is frame 0, and here it already is.
     //
     // MultiTransform subtracts t1 from the render time because its host hands
@@ -565,30 +553,15 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // blurs were drawn from the same taps. Start Blur no longer samples, so
     // there is nothing left to keep in step.
 
-    // The anchor buttons. They capture args.time -- the playhead, in whatever
-    // units this host uses -- and originAt() subtracts the same thing back, so
-    // they work on the Edit page and in Fusion alike. Wrapped in an edit block
-    // because Fusion ignores plugin-initiated writes that are not.
+    // The playhead buttons write the timing parameters directly -- Start
+    // (frames) and End Offset -- which is what those parameters mean anyway.
+    // args.time is the playhead in whatever units this host uses, and
+    // originAt() is the same conversion render applies, so the frame written
+    // is the frame the renderer will read back. Edit blocks because Fusion
+    // ignores plugin-initiated writes without them.
     if (name == "setStartToPlayhead") {
       rta::beginEdit(this, "Set Start to Playhead");
-      _originFrame->setValue(args.time);
-      _manualOrigin->setValue(true);
-      rta::endEdit(this);
-      return;
-    }
-    if (name == "setStartToClipStart") {
-      // The lowest frame the host has asked for so far, which is the first
-      // frame of the clip once it has been scrubbed. Nothing rendered yet means
-      // the playhead is the best answer there is.
-      double earliest = 0.0;
-      {
-        std::lock_guard<std::mutex> lock(_seenMutex);
-        earliest = _seenEarliest;
-      }
-      if (!(earliest < 1.0e300)) earliest = args.time;
-      rta::beginEdit(this, "Set Start to Clip Start");
-      _originFrame->setValue(earliest);
-      _manualOrigin->setValue(true);
+      _startTime->setValue(args.time - originAt(args.time));
       rta::endEdit(this);
       return;
     }
@@ -780,8 +753,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
 
   // Exit stage.
   OFX::BooleanParam *_enableIn, *_enableOut, *_linkOut, *_mirrorOut;
-  OFX::DoubleParam *_outOffset, *_clipLengthOverride, *_originFrame;
-  OFX::BooleanParam* _manualOrigin;
+  OFX::DoubleParam *_outOffset, *_clipLengthOverride;
   OFX::ChoiceParam *_outGroupMode, *_outAnimation, *_outEasing, *_outOrder, *_outLineOrder;
   OFX::IntParam* _outRandomSeed;
   OFX::DoubleParam *_outDuration, *_outStagger, *_outSlideDistance, *_outSlideAngle;
@@ -1272,18 +1244,19 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       u.glyphIndices = g.glyphIndices;
       a.units.push_back(std::move(u));
     }
-    // Timing, for the overlay's timeline. Published from here so the strip
-    // shows exactly the frames the renderer resolved, playhead origin included.
+    // Timing, for the overlay's timeline. Only what the overlay cannot know
+    // on its own goes here: the origin render subtracts, the clip length, and
+    // the two spans, which depend on the segmentation. Start, End Offset and
+    // the playhead it reads live, so the strip keeps moving on frames the host
+    // has cached and will never ask render for again.
     a.haveTiming = true;
-    a.clipFrame = frames;
+    a.origin = origin;
     a.clipLength = clipLength;
     a.haveLength = haveLength;
     a.enableOut = anim.enableOut;
     a.outUsable = outUsable;
-    a.inStart = anim.startTime;
-    a.inEnd = anim.startTime + inSpan;
-    a.outStart = outSeqStart;
-    a.outEnd = outSeqStart + outSpan;
+    a.inSpan = inSpan;
+    a.outSpan = outSpan;
     rta::setAnalysisState(this, a);
   }
 
@@ -1639,39 +1612,9 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToPlayhead");
     p->setLabels("Set Start to Playhead", "Set Start", "Set Start to Playhead");
     p->setHint(
-        "Park the playhead where the animation should begin and click. The frame is "
-        "captured in the same units the renderer uses, so the two cancel and the "
-        "entrance begins exactly here -- on the Edit page or inside a Fusion comp, "
-        "however the clip is trimmed. Re-click after trimming the head.");
+        "Park the playhead where the entrance should begin and click: Start (frames) is set "
+        "to that frame. Works the same on the Edit page and inside a Fusion comp.");
     addParamUI(page, p);
-  }
-  {
-    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToClipStart");
-    p->setLabels("Set Start to Clip Start", "Clip Start", "Set Start to Clip Start");
-    p->setHint(
-        "Alternative to the above that needs no playhead: scrub across the clip "
-        "once, then click. Captures the earliest frame Resolve actually "
-        "rendered, which is the clip's first frame.");
-    addParamUI(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("manualOrigin");
-    p->setLabels("Use Manual Start", "Manual Start", "Use Manual Start Anchor");
-    p->setHint(
-        "Ticked automatically by the button above. Untick to fall back to the "
-        "host's reported clip start, which is exact only on clips with no head "
-        "handle.");
-    p->setDefault(false);
-    addParam(page, p);
-  }
-  {
-    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("originFrame");
-    p->setLabels("Start Anchor (frame)", "Anchor", "Start Anchor Frame");
-    p->setHint("The captured timeline frame that counts as frame 0. Editable and copyable.");
-    p->setRange(-1000000.0, 1000000.0);
-    p->setDisplayRange(0.0, 10000.0);
-    p->setDefault(0.0);
-    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startTime");

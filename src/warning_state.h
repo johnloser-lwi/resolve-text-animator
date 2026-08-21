@@ -93,20 +93,25 @@ struct AnalysisState {
   int width = 0, height = 0;  // image the units were measured in
   std::vector<DetectedUnit> units;
 
-  // The reveal's timing, in CLIP FRAMES, as the renderer resolved it for the
-  // frame it last drew. Published rather than recomputed by the overlay
-  // because the spans depend on the segmentation -- how many units there are
-  // and in what order -- and the overlay has no business running detection.
-  // Same origin as the renderer too, so the playhead on the timeline lands
-  // where the picture actually is.
+  // What the overlay's timeline cannot work out for itself. The spans depend
+  // on the segmentation -- how many units, in what order -- and the overlay
+  // has no business running detection; the origin is the conversion render
+  // applies to host time, and the strip has to use the same one or its
+  // playhead lands somewhere the picture is not.
+  //
+  // Deliberately NOT the current frame or the bar positions. Render is only
+  // called for frames the host has not cached, so anything published per frame
+  // freezes the moment the playhead crosses into cached territory. The overlay
+  // derives the frame from its own time and the bars from the live parameters,
+  // which keeps both moving however the host schedules render.
   bool haveTiming = false;
-  double clipFrame = 0.0;    // the last rendered frame, clip-relative
+  double origin = 0.0;       // host time of clip frame 0
   double clipLength = 0.0;   // 0 when unknown
   bool haveLength = false;
   bool enableOut = false;
   bool outUsable = false;    // the exit has a clip end to anchor to
-  double inStart = 0.0, inEnd = 0.0;
-  double outStart = 0.0, outEnd = 0.0;
+  double inSpan = 0.0;       // first unit starting to last unit settling
+  double outSpan = 0.0;
 };
 
 namespace detail {
