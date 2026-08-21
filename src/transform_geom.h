@@ -13,6 +13,16 @@
 
 namespace rta {
 
+// Clamp to +-2^24 so float -> int conversion is always defined. Past that a
+// coordinate is millions of pixels outside any frame, so nothing it could have
+// sampled changes. NaN fails both comparisons and lands on the far side, where
+// every edge test fails -- transparent, the only sane answer to NaN.
+inline float boundCoord(float v) {
+  const float lim = 16777216.0f;
+  if (v < lim) return v > -lim ? v : -lim;
+  return lim;  // v >= lim, or NaN
+}
+
 struct TapGeom {
   GroupTransform t;
   float cx = 0.0f, cy = 0.0f;
@@ -60,8 +70,11 @@ inline RectI tapBounds(const GroupTransform& t, const RectI& b, float cx, float 
   // allowed to write, so a negative pad silently crops the group rather than
   // making room for its blur.
   const float pad = std::max(0.0f, t.blur);
-  return RectI{int(std::floor(lox - pad)), int(std::floor(loy - pad)),
-               int(std::ceil(hix + pad)), int(std::ceil(hiy + pad))};
+  // Bounded for the same reason the sampler bounds: this rect is grown and
+  // intersected next, and an INT_MIN from an undefined conversion wraps on the
+  // first grow.
+  return RectI{int(std::floor(boundCoord(lox - pad))), int(std::floor(boundCoord(loy - pad))),
+               int(std::ceil(boundCoord(hix + pad))), int(std::ceil(boundCoord(hiy + pad)))};
 }
 
 }  // namespace rta

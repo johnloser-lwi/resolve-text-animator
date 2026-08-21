@@ -24,6 +24,16 @@ inline void sampleMasked(const ImageView& src, const Segmentation& seg, int grou
                          float fy, float out[4]) {
   out[0] = out[1] = out[2] = out[3] = 0.0f;
 
+  // Bound before converting. float -> int is undefined outside int's range on
+  // the CPU (x86 hands back INT_MIN, and x0 + 1 then wraps), and a coordinate
+  // CAN get there: the inverse scale reaches 1e4 and Slide Distance reaches
+  // 10000% of frame height. Anything past 2^24 is millions of pixels outside
+  // any frame, so clamping it there changes nothing the sampler would return.
+  // NaN fails both comparisons and falls through to the far side, where every
+  // tap is out of bounds -- transparent, which is the only sane answer to NaN.
+  fx = boundCoord(fx);
+  fy = boundCoord(fy);
+
   const int x0 = int(std::floor(fx));
   const int y0 = int(std::floor(fy));
   const float tx = fx - float(x0);

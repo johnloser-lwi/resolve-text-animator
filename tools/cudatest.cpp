@@ -44,6 +44,11 @@ int main(int argc, char** argv) {
   int frameCount = 24;
   double startBlur = 0.0;
   bool motionBlur = false;
+  // Defaults reproduce the run this test always did. --slide and --scale exist
+  // so a coordinate can be driven past int range (or to NaN) on BOTH paths and
+  // the two compared: the bound has to send them to the same answer.
+  double slide = 45.0;
+  double startScale = 1.0;
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
       const char* m = argv[++i];
@@ -52,6 +57,10 @@ int main(int argc, char** argv) {
                                          : rta::GroupMode::Word;
     } else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) {
       frameCount = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--slide") && i + 1 < argc) {
+      slide = std::atof(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--scale") && i + 1 < argc) {
+      startScale = std::atof(argv[++i]);
     } else if (!std::strcmp(argv[i], "--blur") && i + 1 < argc) {
       startBlur = std::atof(argv[++i]);
     } else if (!std::strcmp(argv[i], "--mblur") && i + 1 < argc) {
@@ -99,7 +108,8 @@ int main(int argc, char** argv) {
   if (seg.empty()) return 1;
 
   rta::AnimParams anim;  // plugin defaults: dur 12, stagger 2
-  anim.in.slideDistance = 45.0;
+  anim.in.slideDistance = slide;
+  anim.in.startScale = startScale;
   // Defocus is the one path where the two implementations run genuinely
   // different code -- a separable blur over a tile, launched as its own kernels
   // on the GPU -- so it has to be exercised here or it is untested.

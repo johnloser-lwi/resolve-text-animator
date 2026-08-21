@@ -50,6 +50,14 @@ __device__ inline void discOffsetDev(int tap, int taps, float* dx, float* dy) {
   *dy = r * __sinf(a);
 }
 
+// Clamp to +-2^24 so float -> int conversion is always defined. NaN fails
+// both comparisons and is sent to the far side, where every tap misses.
+__device__ inline float boundCoordDev(float v) {
+  const float lim = 16777216.0f;
+  if (v < lim) return v > -lim ? v : -lim;
+  return lim;  // v >= lim, or NaN
+}
+
 // Label-masked bilinear fetch. Masking before filtering is what keeps
 // antialiased glyph edges intact and stops a moving word dragging in a
 // fragment of its neighbour.
@@ -58,6 +66,11 @@ __device__ inline void sampleMaskedDev(const float* src, std::ptrdiff_t srcStrid
                                        int labWidth, int imgW, int imgH, int group, float fx,
                                        float fy, float* out) {
   out[0] = out[1] = out[2] = out[3] = 0.0f;
+  // Same bound as the CPU sampler, for the same reason. CUDA saturates the
+  // conversion rather than faulting, but x0 + 1 on a saturated INT_MAX still
+  // wraps, and the two paths have to agree on the answer.
+  fx = boundCoordDev(fx);
+  fy = boundCoordDev(fy);
   const int x0 = int(floorf(fx));
   const int y0 = int(floorf(fy));
   const float tx = fx - float(x0);

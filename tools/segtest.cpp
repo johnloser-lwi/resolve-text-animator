@@ -5,6 +5,8 @@
 //
 // Runs the exact segmentation code the plugin uses and writes a diagnostic PNG.
 // Tuning here takes seconds; tuning inside Resolve takes a relaunch each time.
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,7 +35,11 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
                                int revealFirst, int revealLast, bool isolate) {
   rta::RectI area;
   for (const auto& g : seg.groups) area.unionWith(g.bbox);
-  area.grow(int(anim.in.slideDistance) + 16);
+  // Bounded before the int conversion, for the same reason the sampler bounds:
+  // this harness has to survive the coordinates the stress cases throw at the
+  // plugin, or it dies one layer above the code it exists to test. std::min with
+  // the bound first sends NaN to the bound as well.
+  area.grow(int(std::min(1.0e6, std::fabs(anim.in.slideDistance))) + 16);
   area.x1 = std::max(0, area.x1);
   area.y1 = std::max(0, area.y1);
   area.x2 = std::min(src.width, area.x2);
@@ -97,7 +103,7 @@ int main(int argc, char** argv) {
                  "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
                  "             --angle DEG --easing 0-4 --order 0-4 --lineorder 0|1\n"
                  "             --manual \"3,0,7\"  --from N --to N  --isolate\n"
-                 "             --rotate DEG --blur PX --mblur 0|1 --shutter DEG --samples N\n"
+                 "             --rotate DEG --scale F --blur PX --mblur 0|1 --shutter DEG --samples N\n"
                  "             --bez x1,y1,x2,y2\n"
                  "  (--stagger and --dur are in FRAMES, matching the plugin)\n");
     return 2;
@@ -207,6 +213,8 @@ int main(int argc, char** argv) {
       isolate = true;
     } else if (!std::strcmp(a, "--lineorder")) {
       anim.in.lineOrder = rta::LineOrder(std::atoi(next()));
+    } else if (!std::strcmp(a, "--scale")) {
+      anim.in.startScale = std::atof(next());
     } else if (!std::strcmp(a, "--rotate")) {
       anim.in.startRotation = std::atof(next());
     } else if (!std::strcmp(a, "--blur")) {
