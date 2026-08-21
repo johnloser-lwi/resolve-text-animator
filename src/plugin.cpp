@@ -324,6 +324,16 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   // The animation then begins exactly where the playhead was parked, however
   // the clip is trimmed. This is how MultiTransform sidesteps the same gap.
   double originAt(double) {
+    // A captured anchor wins outright. It is the one answer that is right in
+    // EVERY host, because it was measured in whatever units the render time
+    // arrives in -- Fusion comp frames, Edit-page clip frames, absolute
+    // timeline frames -- and is subtracted from a time in those same units, so
+    // the two cancel whatever they happen to be. Multi Transform does exactly
+    // this, and it is why its button works on both pages.
+    //
+    // Everything below is the automatic guess for when nothing was captured.
+    if (_manualOrigin->getValue()) return _originFrame->getValue();
+
     // The clip BOUNDARY is frame 0, and here it already is.
     //
     // MultiTransform subtracts t1 from the render time because its host hands
@@ -357,6 +367,26 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     double start = 0.0, length = 0.0;
     if (rta::getClipRange(this, start, length)) return start;
     return 0.0;
+  }
+
+  // The clip length measured from `origin` to the end the host reports, or
+  // the override when set. One function for render and for the Set End
+  // button, so the two cannot disagree about where the clip ends.
+  bool clipLengthAt(double origin, double time, double* outLength) {
+    double length = 0.0;
+    bool have = false;
+    double b1 = 0.0, b2 = 0.0;
+    if (rta::getClipBounds(this, b1, b2) && b2 > origin) {
+      length = b2 - origin;
+      have = true;
+    }
+    const double lengthOverride = _clipLengthOverride->getValueAtTime(time);
+    if (lengthOverride > 0.0) {
+      length = lengthOverride;
+      have = true;
+    }
+    *outLength = length;
+    return have;
   }
 
 
@@ -534,6 +564,47 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // The two sample sliders used to be one value shown twice, because both
     // blurs were drawn from the same taps. Start Blur no longer samples, so
     // there is nothing left to keep in step.
+
+    // The anchor buttons. They capture args.time -- the playhead, in whatever
+    // units this host uses -- and originAt() subtracts the same thing back, so
+    // they work on the Edit page and in Fusion alike. Wrapped in an edit block
+    // because Fusion ignores plugin-initiated writes that are not.
+    if (name == "setStartToPlayhead") {
+      rta::beginEdit(this, "Set Start to Playhead");
+      _originFrame->setValue(args.time);
+      _manualOrigin->setValue(true);
+      rta::endEdit(this);
+      return;
+    }
+    if (name == "setStartToClipStart") {
+      // The lowest frame the host has asked for so far, which is the first
+      // frame of the clip once it has been scrubbed. Nothing rendered yet means
+      // the playhead is the best answer there is.
+      double earliest = 0.0;
+      {
+        std::lock_guard<std::mutex> lock(_seenMutex);
+        earliest = _seenEarliest;
+      }
+      if (!(earliest < 1.0e300)) earliest = args.time;
+      rta::beginEdit(this, "Set Start to Clip Start");
+      _originFrame->setValue(earliest);
+      _manualOrigin->setValue(true);
+      rta::endEdit(this);
+      return;
+    }
+    if (name == "setOutEndToPlayhead") {
+      // Out Offset counts back from the end of the clip, so the playhead has
+      // to be measured from that end -- which needs the clip length. Negative
+      // is allowed, as the parameter itself allows it: a playhead past the end
+      // is faithfully a negative offset.
+      const double origin = originAt(args.time);
+      double length = 0.0;
+      if (!clipLengthAt(origin, args.time, &length)) return;  // no end to measure from
+      rta::beginEdit(this, "Set End to Playhead");
+      _outOffset->setValue(length - (args.time - origin));
+      rta::endEdit(this);
+      return;
+    }
 
     if (name == "singleElement") {
       syncRangeUI();
@@ -1021,17 +1092,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // held still across trims. The override wins when the host reports nothing
   // usable; without either, the exit is skipped rather than guessed at.
   double clipLength = 0.0;
-  bool haveLength = false;
-  double b1 = 0.0, b2 = 0.0;
-  if (rta::getClipBounds(this, b1, b2) && b2 > origin) {
-    clipLength = b2 - origin;
-    haveLength = true;
-  }
-  const double lengthOverride = _clipLengthOverride->getValueAtTime(args.time);
-  if (lengthOverride > 0.0) {
-    clipLength = lengthOverride;
-    haveLength = true;
-  }
+  const bool haveLength = clipLengthAt(origin, args.time, &clipLength);
 
 
   // The entrance and exit are evaluated TOGETHER when they share a grouping, so
@@ -1048,14 +1109,23 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   double stageStart = anim.startTime;
   double rawSlide = rawSlideIn, rawBlur = rawBlurIn;
 
+  // Each stage's span -- first unit starting to last unit settling -- which is
+  // what the timeline overlay draws. Both are taken from their own grouping
+  // and settings regardless of which stage this frame happens to be in.
+  const double inSpan = rta::stageSpan(
+      rta::maxDelay(rta::revealDelays(
+          segIn->groups, rta::revealOrder(segIn->groups, segIn->lineCount, anim.in), anim.in)),
+      anim.in);
+  double outSpan = 0.0;
+
   double outSeqStart = 0.0;
   bool outUsable = false;
   if (anim.enableOut && haveLength && segOut && !segOut->empty()) {
     {
       const std::vector<int> rOut = rta::revealOrder(segOut->groups, segOut->lineCount, anim.out);
-      outSeqStart = clipLength - anim.outOffset -
-                    rta::stageSpan(rta::maxDelay(rta::revealDelays(segOut->groups, rOut, anim.out)),
-                                   anim.out);
+      outSpan = rta::stageSpan(
+          rta::maxDelay(rta::revealDelays(segOut->groups, rOut, anim.out)), anim.out);
+      outSeqStart = clipLength - anim.outOffset - outSpan;
     }
     outUsable = true;
   }
@@ -1202,6 +1272,18 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       u.glyphIndices = g.glyphIndices;
       a.units.push_back(std::move(u));
     }
+    // Timing, for the overlay's timeline. Published from here so the strip
+    // shows exactly the frames the renderer resolved, playhead origin included.
+    a.haveTiming = true;
+    a.clipFrame = frames;
+    a.clipLength = clipLength;
+    a.haveLength = haveLength;
+    a.enableOut = anim.enableOut;
+    a.outUsable = outUsable;
+    a.inStart = anim.startTime;
+    a.inEnd = anim.startTime + inSpan;
+    a.outStart = outSeqStart;
+    a.outEnd = outSeqStart + outSpan;
     rta::setAnalysisState(this, a);
   }
 
@@ -1520,6 +1602,17 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setDefault(false);
     addParamUI(page, p);
   }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showTimeline");
+    p->setLabels("Show Timeline", "Timeline", "Show Timeline");
+    p->setHint(
+        "Draws the entrance and the exit as two bars on a ruler of the clip, with the "
+        "playhead over them, so an overlap between the two is a band you can see rather "
+        "than four numbers to subtract. Drag a bar to move it: the In bar moves Start, "
+        "the Out bar moves End Offset. Hold Shift for five-frame steps.");
+    p->setDefault(false);
+    addParamUI(page, p);
+  }
 
   // The bezier control points. They are driven by dragging the on-screen
   // handles, but stay visible as numbers so a curve can be typed in or copied
@@ -1546,13 +1639,11 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToPlayhead");
     p->setLabels("Set Start to Playhead", "Set Start", "Set Start to Playhead");
     p->setHint(
-        "Park the playhead where the animation should begin -- normally the "
-        "clip's first frame -- and click. Resolve does not report where a "
-        "trimmed clip visually starts, so this captures the playhead in the "
-        "same units the renderer uses; the two cancel out and the entrance "
-        "begins exactly here however the clip is trimmed. Re-click after "
-        "trimming the head.");
-    // hidden: see originAt -- the boundary is already frame 0
+        "Park the playhead where the animation should begin and click. The frame is "
+        "captured in the same units the renderer uses, so the two cancel and the "
+        "entrance begins exactly here -- on the Edit page or inside a Fusion comp, "
+        "however the clip is trimmed. Re-click after trimming the head.");
+    addParamUI(page, p);
   }
   {
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToClipStart");
@@ -1561,7 +1652,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "Alternative to the above that needs no playhead: scrub across the clip "
         "once, then click. Captures the earliest frame Resolve actually "
         "rendered, which is the clip's first frame.");
-    // hidden: see originAt -- the boundary is already frame 0
+    addParamUI(page, p);
   }
   {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("manualOrigin");
@@ -1571,7 +1662,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "host's reported clip start, which is exact only on clips with no head "
         "handle.");
     p->setDefault(false);
-    // hidden: see originAt -- the boundary is already frame 0
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("originFrame");
@@ -1580,7 +1671,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     p->setRange(-1000000.0, 1000000.0);
     p->setDisplayRange(0.0, 10000.0);
     p->setDefault(0.0);
-    // hidden: see originAt -- the boundary is already frame 0
+    addParam(page, p);
   }
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startTime");

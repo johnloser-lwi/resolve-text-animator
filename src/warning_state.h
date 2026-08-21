@@ -92,6 +92,21 @@ struct AnalysisState {
 
   int width = 0, height = 0;  // image the units were measured in
   std::vector<DetectedUnit> units;
+
+  // The reveal's timing, in CLIP FRAMES, as the renderer resolved it for the
+  // frame it last drew. Published rather than recomputed by the overlay
+  // because the spans depend on the segmentation -- how many units there are
+  // and in what order -- and the overlay has no business running detection.
+  // Same origin as the renderer too, so the playhead on the timeline lands
+  // where the picture actually is.
+  bool haveTiming = false;
+  double clipFrame = 0.0;    // the last rendered frame, clip-relative
+  double clipLength = 0.0;   // 0 when unknown
+  bool haveLength = false;
+  bool enableOut = false;
+  bool outUsable = false;    // the exit has a clip end to anchor to
+  double inStart = 0.0, inEnd = 0.0;
+  double outStart = 0.0, outEnd = 0.0;
 };
 
 namespace detail {

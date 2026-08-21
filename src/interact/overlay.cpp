@@ -12,6 +12,7 @@
 
 #include "clip_time.h"
 #include "curve_widget.h"
+#include "timeline_widget.h"
 #include "draw_utils.h"
 #include "edit_block.h"
 #include "warning_state.h"
@@ -79,6 +80,14 @@ class CurveInteract : public OFX::OverlayInteract {
       // it just changed.
       addParamToSlaveTo(_effect->fetchBooleanParam("orderPick"));
       addParamToSlaveTo(_effect->fetchStringParam("manualOrder"));
+      // The timeline draws from these; a drag on it writes them and has to see
+      // the bar move.
+      addParamToSlaveTo(_effect->fetchBooleanParam("showTimeline"));
+      addParamToSlaveTo(_effect->fetchDoubleParam("startTime"));
+      addParamToSlaveTo(_effect->fetchDoubleParam("outOffset"));
+      addParamToSlaveTo(_effect->fetchDoubleParam("duration"));
+      addParamToSlaveTo(_effect->fetchDoubleParam("stagger"));
+      addParamToSlaveTo(_effect->fetchBooleanParam("enableOut"));
       addParamToSlaveTo(_effect->fetchDoubleParam("italicSlant"));
     } catch (...) {
     }
@@ -95,6 +104,10 @@ class CurveInteract : public OFX::OverlayInteract {
     drawUnits(c);
     drawOrderPicker(c);
     drawClearButton(c);
+    if (showTimeline(args.time)) {
+      _timeline.layout(c);
+      _timeline.draw(c);
+    }
 
     if (!showCurve(args.time)) return true;
     _curve.layout(c);
@@ -399,6 +412,14 @@ class CurveInteract : public OFX::OverlayInteract {
     return true;
   }
 
+  bool showTimeline(double time) {
+    try {
+      return _effect->fetchBooleanParam("showTimeline")->getValueAtTime(time);
+    } catch (...) {
+      return false;
+    }
+  }
+
   bool showCurve(double time) {
     try {
       return _effect->fetchBooleanParam("showCurveEditor")->getValueAtTime(time);
@@ -562,6 +583,14 @@ class CurveInteract : public OFX::OverlayInteract {
   bool penDown(const OFX::PenArgs& args) override {
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+    // The timeline is a panel, so it takes any click inside it before the
+    // picture's own modes get a look.
+    if (showTimeline(args.time)) {
+      c.shiftHeld = _shiftDown;
+      _timeline.layout(c);
+      if (_timeline.penDown(c, args.penPosition)) return true;
+    }
+
     // Order picking takes the click first. The two modes both claim a click on a
     // unit, and while picking an order the last thing wanted is to merge two of
     // them by accident.
@@ -578,15 +607,24 @@ class CurveInteract : public OFX::OverlayInteract {
 
   bool keyDown(const OFX::KeyArgs& args) override {
     if (args.keySymbol == kOfxKey_Alt_L || args.keySymbol == kOfxKey_Alt_R) _altDown = true;
+    if (args.keySymbol == kOfxKey_Shift_L || args.keySymbol == kOfxKey_Shift_R) _shiftDown = true;
     return false;
   }
 
   bool keyUp(const OFX::KeyArgs& args) override {
     if (args.keySymbol == kOfxKey_Alt_L || args.keySymbol == kOfxKey_Alt_R) _altDown = false;
+    if (args.keySymbol == kOfxKey_Shift_L || args.keySymbol == kOfxKey_Shift_R) _shiftDown = false;
     return false;
   }
 
   bool penMotion(const OFX::PenArgs& args) override {
+    if (_timeline.dragging()) {
+      OverlayContext c;
+      if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+      c.shiftHeld = _shiftDown;
+      _timeline.layout(c);
+      return _timeline.penMotion(c, args.penPosition);
+    }
     if (!_curve.dragging()) return false;
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, nullptr) || !showCurve(args.time)) return false;
@@ -597,6 +635,7 @@ class CurveInteract : public OFX::OverlayInteract {
   bool penUp(const OFX::PenArgs& args) override {
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, nullptr)) return false;
+    if (_timeline.dragging()) return _timeline.penUp(c, args.penPosition);
     if (_dragUnit >= 0 && groupingMode(args.time)) {
       if (editGrouping(c, args.penPosition, _altDown, /*down*/ false)) return true;
     }
@@ -608,9 +647,12 @@ class CurveInteract : public OFX::OverlayInteract {
     // never delivers its mouse-up. Without this the edit block it opened stays
     // open for the rest of the session and the host's parameter state is left
     // inconsistent.
-    if (!_curve.dragging()) return;
+    if (!_curve.dragging() && !_timeline.dragging()) return;
     OverlayContext c;
-    if (build(c, args.time, args.pixelScale, nullptr)) _curve.abandon(c);
+    if (build(c, args.time, args.pixelScale, nullptr)) {
+      _curve.abandon(c);
+      _timeline.abandon(c);
+    }
   }
 
  private:
@@ -660,8 +702,10 @@ class CurveInteract : public OFX::OverlayInteract {
 
   OFX::ImageEffect* _effect = nullptr;
   CurveWidget _curve;
+  TimelineWidget _timeline;
   int _dragUnit = -1;   // unit a merge drag started on
   bool _altDown = false;
+  bool _shiftDown = false;
 };
 
 // Wraps the Support library's interact entry so the draw context, which only

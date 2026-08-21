@@ -36,6 +36,7 @@ add_library(TextAnimator SHARED
     src/preset_io.cpp
   src/interact/overlay.cpp
   src/interact/curve_widget.cpp
+  src/interact/timeline_widget.cpp
   ${OFX_ROOT}/Support/Library/ofxsCore.cpp
   ${OFX_ROOT}/Support/Library/ofxsImageEffect.cpp
   ${OFX_ROOT}/Support/Library/ofxsInteract.cpp

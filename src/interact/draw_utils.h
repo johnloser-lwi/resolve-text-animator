@@ -8,6 +8,8 @@
 // as you zoom out.
 #pragma once
 
+#include <cmath>
+#include <cstdio>
 #include <string>
 
 #include "ofxDrawSuite.h"
@@ -48,6 +50,10 @@ struct OverlayContext {
 
   OfxPointD pixelScale{1.0, 1.0};
   OfxRectD rod{0.0, 0.0, 0.0, 0.0};  // image bounds, canonical
+
+  // Shift, tracked from key events because PenArgs does not carry modifiers.
+  // Coarsens a timeline drag to five-frame steps.
+  bool shiftHeld = false;
 
   // The animation exactly as the renderer will see it, read straight from the
   // parameters, so the overlay can never show something different.
@@ -113,6 +119,19 @@ inline void Panel(const OverlayContext& c, const OfxRectD& r) {
   SetColour(c, colours::kPanelEdge);
   SetLineWidth(c, 1.0f);
   StrokeRect(c, r.x1, r.y1, r.x2, r.y2);
+}
+
+// A frame number for display: whole frames, rounded half away from zero so
+// -0.5 reads as -1 and not as 0.
+inline std::string FrameLabel(double frame) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%d", int(frame + (frame < 0.0 ? -0.5 : 0.5)));
+  return buf;
+}
+
+inline double SnapTo(double v, double step) {
+  if (step <= 0.0) return v;
+  return std::floor(v / step + 0.5) * step;
 }
 
 inline bool Contains(const OfxRectD& r, const OfxPointD& p) {
