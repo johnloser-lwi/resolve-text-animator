@@ -80,6 +80,8 @@ class CurveInteract : public OFX::OverlayInteract {
       // it just changed.
       addParamToSlaveTo(_effect->fetchBooleanParam("orderPick"));
       addParamToSlaveTo(_effect->fetchStringParam("manualOrder"));
+      addParamToSlaveTo(_effect->fetchBooleanParam("linkMode"));
+      addParamToSlaveTo(_effect->fetchStringParam("linkGroups"));
       // The timeline draws from these; a drag on it writes them and has to see
       // the bar move.
       addParamToSlaveTo(_effect->fetchBooleanParam("showTimeline"));
@@ -102,6 +104,7 @@ class CurveInteract : public OFX::OverlayInteract {
     drawWarnings(c);
     drawSlant(c);
     drawUnits(c);
+    drawLinks(c);
     drawOrderPicker(c);
     drawClearButton(c);
     if (showTimeline(args.time)) {
@@ -308,6 +311,239 @@ class CurveInteract : public OFX::OverlayInteract {
     } catch (...) {
       return false;
     }
+  }
+
+  // --- linking units into one element ---------------------------------------
+  //
+  // Merge At joins neighbours in reading order, and that is all it can say. A
+  // link is a set: these units, wherever they are, are one element. Clicking
+  // builds the set; the string it writes is readable in the Inspector and the
+  // same one the renderer reads.
+
+  bool linking(double time) const {
+    try {
+      return _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(time) &&
+             _effect->fetchBooleanParam("linkMode")->getValueAtTime(time);
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // Groups of one are kept here, unlike in the renderer's parser: a group that
+  // has had its first click and not its second is a real state to draw.
+  static std::vector<std::vector<int>> parseLinks(const std::string& in) {
+    std::vector<std::vector<int>> out;
+    std::string cur;
+    for (size_t i = 0; i <= in.size(); ++i) {
+      const char ch = i < in.size() ? in[i] : ';';
+      if (ch == ';') {
+        std::vector<int> g = parseList(cur);
+        if (!g.empty()) out.push_back(std::move(g));
+        cur.clear();
+      } else {
+        cur += ch;
+      }
+    }
+    return out;
+  }
+
+  static std::string formatLinks(const std::vector<std::vector<int>>& groups) {
+    std::string out;
+    for (size_t i = 0; i < groups.size(); ++i) {
+      if (i) out += "; ";
+      out += formatList(groups[i]);
+    }
+    return out;
+  }
+
+  std::vector<std::vector<int>> linkList(const OverlayContext& c) const {
+    try {
+      std::string v;
+      c.effect->fetchStringParam("linkGroups")->getValue(v);
+      return parseLinks(v);
+    } catch (...) {
+      return {};
+    }
+  }
+
+  void writeLinks(const OverlayContext& c, const std::vector<std::vector<int>>& groups,
+                  const char* label) {
+    try {
+      beginEdit(c.effect, label);
+      c.effect->fetchStringParam("linkGroups")->setValue(formatLinks(groups));
+      endEdit(c.effect);
+    } catch (...) {
+    }
+  }
+
+  // Which group holds any character of this unit, or -1.
+  static int linkOfUnit(const std::vector<std::vector<int>>& groups, const DetectedUnit& u) {
+    for (size_t k = 0; k < groups.size(); ++k)
+      for (int ci : groups[k])
+        if (std::find(u.glyphIndices.begin(), u.glyphIndices.end(), ci) != u.glyphIndices.end())
+          return int(k);
+    return -1;
+  }
+
+  OfxRectD linkButtonRect(const OverlayContext& c) const {
+    // Third in the stack above the overrides and order buttons.
+    const double w = c.sx(190.0), h = c.sy(26.0);
+    const double x = c.rod.x1 + c.sx(24.0);
+    const double y = c.rod.y1 + c.sy(24.0) + 2.0 * (h + c.sy(8.0));
+    return OfxRectD{x, y, x + w, y + h};
+  }
+
+  // Unit centre in canonical coordinates.
+  static OfxPointD unitCentre(const OverlayContext& c, const AnalysisState& a,
+                              const DetectedUnit& u) {
+    const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
+    OfxPointD p;
+    p.x = c.rod.x1 + (double(u.x1) + double(u.x2)) * 0.5 / a.width * w;
+    p.y = c.rod.y2 - (double(u.y1) + double(u.y2)) * 0.5 / a.height * h;
+    return p;
+  }
+
+  void drawLinks(const OverlayContext& c) {
+    if (!linking(c.time)) return;
+    const AnalysisState a = analysisState(_effect);
+    if (a.units.empty() || a.width <= 0 || a.height <= 0) return;
+    const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
+    if (w <= 0.0 || h <= 0.0) return;
+
+    // Groups from the parameter, not from the published linkGroup tags: the tag
+    // lags a render, and the string is what a click just changed.
+    const std::vector<std::vector<int>> groups = linkList(c);
+
+    // Members of each group in x order, so the chain runs along the line the
+    // dashes make rather than zig-zagging in click order.
+    std::vector<std::vector<const DetectedUnit*>> members(groups.size());
+    for (const DetectedUnit& u : a.units) {
+      const int k = linkOfUnit(groups, u);
+      if (k >= 0) members[size_t(k)].push_back(&u);
+    }
+    for (size_t k = 0; k < members.size(); ++k) {
+      std::sort(members[k].begin(), members[k].end(),
+                [](const DetectedUnit* p, const DetectedUnit* q) { return p->x1 < q->x1; });
+      const Colour col = kUnitPalette[k % 8];
+      const bool active = int(k) == _activeLink;
+      SetColour(c, col);
+      SetLineWidth(c, active ? 3.0f : 2.0f);
+      OfxPointD prev{0.0, 0.0};
+      for (size_t i = 0; i < members[k].size(); ++i) {
+        const DetectedUnit& u = *members[k][i];
+        const double x1 = c.rod.x1 + double(u.x1) / a.width * w;
+        const double x2 = c.rod.x1 + double(u.x2) / a.width * w;
+        const double y1 = c.rod.y2 - double(u.y2) / a.height * h;
+        const double y2 = c.rod.y2 - double(u.y1) / a.height * h;
+        StrokeRect(c, x1, y1, x2, y2);
+        const OfxPointD ctr = unitCentre(c, a, u);
+        if (i > 0) Line(c, prev.x, prev.y, ctr.x, ctr.y);
+        prev = ctr;
+      }
+    }
+
+    if (_marquee) {
+      SetColour(c, Colour{1.0f, 1.0f, 1.0f, 0.8f});
+      SetLineWidth(c, 1.0f);
+      StrokeRect(c, std::min(_marqueeA.x, _marqueeB.x), std::min(_marqueeA.y, _marqueeB.y),
+                 std::max(_marqueeA.x, _marqueeB.x), std::max(_marqueeA.y, _marqueeB.y));
+    }
+
+    const OfxRectD r = linkButtonRect(c);
+    Panel(c, r);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "CLEAR LINKS (%d)", int(groups.size()));
+    SetColour(c, Colour{0.55f, 0.85f, 1.0f, 1.0f});
+    Text(c, buf, r.x1 + c.sx(10.0), r.y2 - c.sy(7.0),
+         kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+  }
+
+  // Adds a unit to the active group, starting one if there is none; a unit
+  // already in a group is taken out instead, so a misclick is undone by
+  // repeating it.
+  void toggleLink(const OverlayContext& c, const DetectedUnit& u) {
+    std::vector<std::vector<int>> groups = linkList(c);
+    const int k = linkOfUnit(groups, u);
+    if (k >= 0) {
+      std::vector<int>& g = groups[size_t(k)];
+      g.erase(std::remove_if(g.begin(), g.end(),
+                             [&](int ci) {
+                               return std::find(u.glyphIndices.begin(), u.glyphIndices.end(),
+                                                ci) != u.glyphIndices.end();
+                             }),
+              g.end());
+      if (g.empty()) {
+        groups.erase(groups.begin() + k);
+        if (_activeLink == k) _activeLink = -1;
+        else if (_activeLink > k) --_activeLink;
+      }
+      writeLinks(c, groups, "Unlink element");
+      return;
+    }
+    if (_activeLink < 0 || size_t(_activeLink) >= groups.size()) {
+      groups.push_back({u.glyphIndex});
+      _activeLink = int(groups.size()) - 1;
+    } else {
+      groups[size_t(_activeLink)].push_back(u.glyphIndex);
+    }
+    writeLinks(c, groups, "Link element");
+  }
+
+  bool linkDown(const OverlayContext& c, const OfxPointD& p) {
+    if (Contains(linkButtonRect(c), p)) {
+      writeLinks(c, {}, "Clear links");
+      _activeLink = -1;
+      return true;
+    }
+    const AnalysisState a = analysisState(_effect);
+    const int hit = unitAt(c, a, p);
+    if (hit >= 0) {
+      toggleLink(c, a.units[size_t(hit)]);
+      return true;
+    }
+    // Empty space: a marquee starts here. Whether it was a drag or a click is
+    // decided on release.
+    _marquee = true;
+    _marqueeA = _marqueeB = p;
+    return true;
+  }
+
+  bool linkMotion(const OfxPointD& p) {
+    if (!_marquee) return false;
+    _marqueeB = p;
+    return true;
+  }
+
+  bool linkUp(const OverlayContext& c, const OfxPointD& p) {
+    if (!_marquee) return false;
+    _marquee = false;
+    _marqueeB = p;
+    const double dx = std::fabs(_marqueeB.x - _marqueeA.x), dy = std::fabs(_marqueeB.y - _marqueeA.y);
+    if (dx < c.sx(4.0) && dy < c.sy(4.0)) {
+      // A click on nothing closes the group, so the next click starts another.
+      _activeLink = -1;
+      return true;
+    }
+    const AnalysisState a = analysisState(_effect);
+    if (a.units.empty() || a.width <= 0 || a.height <= 0) return true;
+    const OfxRectD r{std::min(_marqueeA.x, _marqueeB.x), std::min(_marqueeA.y, _marqueeB.y),
+                     std::max(_marqueeA.x, _marqueeB.x), std::max(_marqueeA.y, _marqueeB.y)};
+    std::vector<std::vector<int>> groups = linkList(c);
+    std::vector<int> add;
+    for (const DetectedUnit& u : a.units) {
+      if (linkOfUnit(groups, u) >= 0) continue;  // already spoken for
+      if (Contains(r, unitCentre(c, a, u))) add.push_back(u.glyphIndex);
+    }
+    if (add.empty()) return true;
+    if (_activeLink < 0 || size_t(_activeLink) >= groups.size()) {
+      groups.push_back(add);
+      _activeLink = int(groups.size()) - 1;
+    } else {
+      std::vector<int>& g = groups[size_t(_activeLink)];
+      g.insert(g.end(), add.begin(), add.end());
+    }
+    writeLinks(c, groups, "Link elements");
+    return true;
   }
 
   // --- picking the reveal order off the picture ----------------------------
@@ -591,10 +827,12 @@ class CurveInteract : public OFX::OverlayInteract {
       if (_timeline.penDown(c, args.penPosition)) return true;
     }
 
-    // Order picking takes the click first. The two modes both claim a click on a
-    // unit, and while picking an order the last thing wanted is to merge two of
-    // them by accident.
-    if (orderPicking(args.time)) {
+    // Linking, then order picking, then grouping. All three claim a click on a
+    // unit, and the one switched on is the one that gets it -- merging two
+    // elements by accident while linking would be the worst of the outcomes.
+    if (linking(args.time)) {
+      if (linkDown(c, args.penPosition)) return true;
+    } else if (orderPicking(args.time)) {
       if (pickOrder(c, args.penPosition)) return true;
     } else if (groupingMode(args.time)) {
       // Alt is not carried on PenArgs, so it is tracked from key events.
@@ -618,6 +856,7 @@ class CurveInteract : public OFX::OverlayInteract {
   }
 
   bool penMotion(const OFX::PenArgs& args) override {
+    if (_marquee) return linkMotion(args.penPosition);
     if (_timeline.dragging()) {
       OverlayContext c;
       if (!build(c, args.time, args.pixelScale, nullptr)) return false;
@@ -636,6 +875,7 @@ class CurveInteract : public OFX::OverlayInteract {
     OverlayContext c;
     if (!build(c, args.time, args.pixelScale, nullptr)) return false;
     if (_timeline.dragging()) return _timeline.penUp(c, args.penPosition);
+    if (_marquee) return linkUp(c, args.penPosition);
     if (_dragUnit >= 0 && groupingMode(args.time)) {
       if (editGrouping(c, args.penPosition, _altDown, /*down*/ false)) return true;
     }
@@ -703,6 +943,9 @@ class CurveInteract : public OFX::OverlayInteract {
   OFX::ImageEffect* _effect = nullptr;
   CurveWidget _curve;
   TimelineWidget _timeline;
+  int _activeLink = -1;  // group the next click adds to, or -1 for a new one
+  bool _marquee = false;
+  OfxPointD _marqueeA{0.0, 0.0}, _marqueeB{0.0, 0.0};
   int _dragUnit = -1;   // unit a merge drag started on
   bool _altDown = false;
   bool _shiftDown = false;

@@ -84,6 +84,9 @@ struct DetectedUnit {
   int glyphIndex = 0;
   std::vector<int> glyphStarts;   // left edge of each letter, image pixels
   std::vector<int> glyphIndices;  // character index of each letter
+  // The link this unit was folded into, or -1. With links present the units
+  // published are the MEMBERS, so a click lands on the dash it is over.
+  int linkGroup = -1;
 };
 
 struct AnalysisState {

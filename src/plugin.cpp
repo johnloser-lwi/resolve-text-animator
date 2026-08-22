@@ -56,6 +56,26 @@ std::vector<int> parseIndexList(const std::string& in) {
   return out;
 }
 
+// Link groups: "3 7 12; 5 9". Each ';' ends a group. A group of one is dropped
+// here -- it names nothing to join -- so the half-typed state the overlay goes
+// through between the first click and the second never reaches detection and
+// never invalidates the analysis cache.
+std::vector<std::vector<int>> parseLinkGroups(const std::string& in) {
+  std::vector<std::vector<int>> out;
+  std::string cur;
+  for (size_t i = 0; i <= in.size(); ++i) {
+    const char c = i < in.size() ? in[i] : ';';
+    if (c == ';') {
+      std::vector<int> g = parseIndexList(cur);
+      if (g.size() >= 2) out.push_back(std::move(g));
+      cur.clear();
+    } else {
+      cur += c;
+    }
+  }
+  return out;
+}
+
 std::string formatIndexList(const std::vector<int>& v) {
   std::string out;
   char buf[16];
@@ -262,6 +282,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _autoSlant = fetchBooleanParam("autoSlant");
     _referenceText = fetchStringParam("referenceText");
     _mergeAt = fetchStringParam("mergeAt");
+    _linkGroups = fetchStringParam("linkGroups");
     _splitBefore = fetchStringParam("splitBefore");
     _clearOverrides = fetchPushButtonParam("clearOverrides");
     _italicSlant = fetchDoubleParam("italicSlant");
@@ -743,7 +764,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_tracking, *_lineSpacing;
   OFX::ChoiceParam *_trackAnchor, *_lineAnchor;
   OFX::BooleanParam* _autoSlant;
-  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder;
+  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder, *_linkGroups;
   OFX::IntParam *_revealStart, *_revealEnd;
   OFX::BooleanParam *_singleElement, *_orderPick, *_isolate;
   OFX::PushButtonParam* _clearOverrides;
@@ -863,6 +884,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     det.mergeAt = parseIndexList(m);
     det.splitBefore = parseIndexList(sp);
     _referenceText->getValueAtTime(args.time, det.referenceText);
+    std::string lk;
+    _linkGroups->getValueAtTime(args.time, lk);
+    det.linkGroups = parseLinkGroups(lk);
   }
   det.autoSlant = _autoSlant->getValueAtTime(args.time);
   det.italicSlant = float(_italicSlant->getValueAtTime(args.time));
@@ -1230,8 +1254,13 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     a.haveSlant = true;
     a.width = useSeg->width;
     a.height = useSeg->height;
-    a.units.reserve(useSeg->groups.size());
-    for (const rta::Group& g : useSeg->groups) {
+    // With links, the overlay gets the MEMBERS -- each dash of a linked dashed
+    // line with its own box -- tagged with the link it is in. Hit-testing a
+    // union box would catch whatever sits between the dashes too.
+    const std::vector<rta::Group>& shown =
+        useSeg->linkMembers.empty() ? useSeg->groups : useSeg->linkMembers;
+    a.units.reserve(shown.size());
+    for (const rta::Group& g : shown) {
       rta::DetectedUnit u;
       u.x1 = g.bbox.x1;
       u.y1 = g.bbox.y1;
@@ -1242,6 +1271,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       u.glyphIndex = g.glyphIndex;
       u.glyphStarts = g.glyphStarts;
       u.glyphIndices = g.glyphIndices;
+      u.linkGroup = g.linkId;
       a.units.push_back(std::move(u));
     }
     // Timing, for the overlay's timeline. Only what the overlay cannot know
@@ -1490,6 +1520,30 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "means clicking one or two things rather than all of them.");
     p->setDefault(false);
     addParam(page, p);
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("linkGroups");
+    p->setLabels("Link Elements", "Links", "Link Elements");
+    p->setHint(
+        "Units that are ONE element, wherever they sit: \"3 7 12; 5 9\" joins three units "
+        "into one and two into another. Each ; ends a group; the numbers are the ones Show "
+        "Detection paints, and naming any character of a unit claims the whole unit. Unlike "
+        "Merge At, which only joins neighbours, a link can take the first and third dash of "
+        "a dashed line, or a label and its arrow. Linked units move, turn and scale as one. "
+        "Easier to write by clicking: see Link By Clicking.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkMode");
+    p->setLabels("Link By Clicking", "Link Mode", "Link By Clicking");
+    p->setHint(
+        "Turns the viewer into a linker. Click an element to start a group, click more to "
+        "add them, drag a box to add everything inside it; click a linked element to take "
+        "it out again; click empty space to finish the group so the next click starts a "
+        "new one. Needs Show Detection on.");
+    p->setDefault(false);
+    addParamUI(page, p);
   }
   {
     OFX::IntParamDescriptor* p = desc.defineIntParam("revealStart");

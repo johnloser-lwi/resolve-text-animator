@@ -131,6 +131,20 @@ struct DetectParams {
   // order, and a newline in the string means no more than a space.
   std::string referenceText;
 
+  // Units that are ONE element because the user said so, addressed by
+  // character index like every other override. Each inner list is one link;
+  // naming any character of a unit claims the whole unit.
+  //
+  // This is a different kind of statement from Merge At. A merge removes the
+  // boundary before a character, so it can only ever join neighbours in
+  // reading order. A link is a set: the first and third dash of a dashed line,
+  // a label and the arrow that points at it, anything that is one thing to
+  // animate however it sits on the page. It runs LAST -- after the mode, the
+  // reference text, and the merges and splits -- and unions whatever final
+  // units contain the listed characters, so it composes with all of them
+  // without changing what any of them mean.
+  std::vector<std::vector<int>> linkGroups;
+
   bool autoSlant = true;         // measure the slant from the image
   float italicSlant = 0.0f;      // degrees, used when autoSlant is off
 
@@ -141,7 +155,7 @@ struct DetectParams {
            bridgeRadius == o.bridgeRadius && maxLetterGap == o.maxLetterGap && mode == o.mode &&
            autoSlant == o.autoSlant && italicSlant == o.italicSlant &&
            mergeAt == o.mergeAt && splitBefore == o.splitBefore &&
-           referenceText == o.referenceText;
+           referenceText == o.referenceText && linkGroups == o.linkGroups;
   }
   bool operator!=(const DetectParams& o) const { return !(*this == o); }
 };
@@ -181,6 +195,10 @@ struct Group {
   int line = 0;        // 0-based, top to bottom
   int indexInLine = 0; // 0-based, left to right
   std::vector<int> labels;  // component labels belonging to this group
+  // Which link this unit is part of, or -1. On a final group it is the link
+  // the group IS; on a member (see Segmentation::linkMembers) it is the link
+  // the member was folded into.
+  int linkId = -1;
 };
 
 // What the reference text did, if anything.
@@ -210,6 +228,13 @@ struct Segmentation {
   // measured against, published so the render side can convert one without
   // measuring the type a second time and disagreeing about the answer.
   float letterHeight = 0.0f;
+
+  // The units as they were before links were applied, each tagged with the
+  // link it went into. Empty when there are no links. The overlay draws and
+  // hit-tests THESE rather than the unions, so clicking a dash hits that dash
+  // and not an enclosing box that also covers whatever sits between the
+  // dashes; the render uses `groups`.
+  std::vector<Group> linkMembers;
 
   RefStatus refStatus = RefStatus::NotUsed;
   // Why it failed, in the user's terms -- which line, and the two counts that

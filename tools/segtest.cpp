@@ -157,6 +157,27 @@ int main(int argc, char** argv) {
       }
     } else if (!std::strcmp(a, "--reftext")) {
       p.referenceText = next();
+    } else if (!std::strcmp(a, "--link")) {
+      // "3 7 12; 5 9" -- groups by ';', members by anything else.
+      const char* list = next();
+      std::vector<int> g;
+      int v = 0;
+      bool has = false;
+      for (const char* ch = list;; ++ch) {
+        if (*ch >= '0' && *ch <= '9') {
+          v = v * 10 + (*ch - '0');
+          has = true;
+        } else {
+          if (has) g.push_back(v);
+          v = 0;
+          has = false;
+          if (*ch == ';' || !*ch) {
+            if (g.size() >= 2) p.linkGroups.push_back(g);
+            g.clear();
+          }
+          if (!*ch) break;
+        }
+      }
     } else if (!std::strcmp(a, "--maxgap")) {
       p.maxLetterGap = float(std::atof(next()));
     } else if (!std::strcmp(a, "--bridge")) {

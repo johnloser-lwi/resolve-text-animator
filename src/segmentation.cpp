@@ -1503,6 +1503,77 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     g.glyphIndex = g.glyphIndices.empty() ? 0 : g.glyphIndices.front();
   }
 
+  // 11. Links: units that are one element because the user said so.
+  //
+  // Applied to the FINAL units, after everything else has had its say, so a
+  // link means the same thing whatever mode or override produced the units it
+  // names. A union keeps the reading position of its first member, so it slots
+  // into Forward, Reverse and a hand-picked order where that member was.
+  //
+  // Members keep their own boxes in linkMembers: the compositor masks by label,
+  // so nothing about how the pixels draw changes -- only that they now share
+  // one transform and one pivot, which is what "one element" means when it
+  // turns or scales.
+  if (!params.linkGroups.empty() && !seg.groups.empty()) {
+    std::vector<int> linkOf(seg.groups.size(), -1);
+    for (size_t k = 0; k < params.linkGroups.size(); ++k) {
+      for (int ci : params.linkGroups[k]) {
+        for (size_t gi = 0; gi < seg.groups.size(); ++gi) {
+          if (linkOf[gi] >= 0) continue;  // a unit belongs to one link; the first claim wins
+          const std::vector<int>& idx = seg.groups[gi].glyphIndices;
+          if (std::find(idx.begin(), idx.end(), ci) != idx.end()) {
+            linkOf[gi] = int(k);
+            break;
+          }
+        }
+      }
+    }
+
+    bool linked = false;
+    for (int v : linkOf) linked = linked || v >= 0;
+    if (linked) {
+      seg.linkMembers = seg.groups;
+      for (size_t gi = 0; gi < seg.groups.size(); ++gi) seg.linkMembers[gi].linkId = linkOf[gi];
+
+      std::vector<Group> out;
+      out.reserve(seg.groups.size());
+      std::vector<int> slot(params.linkGroups.size(), -1);  // where each union sits in `out`
+      for (size_t gi = 0; gi < seg.groups.size(); ++gi) {
+        const Group& g = seg.groups[gi];
+        const int k = linkOf[gi];
+        if (k < 0) {
+          out.push_back(g);
+          continue;
+        }
+        if (slot[size_t(k)] < 0) {
+          slot[size_t(k)] = int(out.size());
+          Group u = g;
+          u.linkId = k;
+          out.push_back(std::move(u));
+          continue;
+        }
+        Group& u = out[size_t(slot[size_t(k)])];
+        u.bbox.unionWith(g.bbox);
+        u.sx1 = std::min(u.sx1, g.sx1);
+        u.sx2 = std::max(u.sx2, g.sx2);
+        u.glyphCount += g.glyphCount;
+        u.labels.insert(u.labels.end(), g.labels.begin(), g.labels.end());
+        u.glyphStarts.insert(u.glyphStarts.end(), g.glyphStarts.begin(), g.glyphStarts.end());
+        u.glyphIndices.insert(u.glyphIndices.end(), g.glyphIndices.begin(), g.glyphIndices.end());
+        u.glyphIndex = std::min(u.glyphIndex, g.glyphIndex);
+        // line, indexInLine and firstGlyph stay the first member's: that is the
+        // reading position the union takes.
+      }
+
+      // Dense per-line numbering again, since unions swallowed some positions.
+      std::vector<int> next(lineGlyphs.size(), 0);
+      for (Group& g : out)
+        if (g.line >= 0 && size_t(g.line) < next.size()) g.indexInLine = next[size_t(g.line)]++;
+
+      seg.groups.swap(out);
+    }
+  }
+
   seg.labelToGroup.assign(size_t(labelCount) + 1, -1);
   for (size_t gi = 0; gi < seg.groups.size(); ++gi)
     for (int l : seg.groups[gi].labels) seg.labelToGroup[l] = int(gi);
