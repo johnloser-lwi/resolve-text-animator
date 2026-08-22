@@ -679,6 +679,14 @@ class CurveInteract : public OFX::OverlayInteract {
     if (a.width <= 0 || a.height <= 0) return -1;
     const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
     if (w <= 0.0 || h <= 0.0) return -1;
+    // The SMALLEST box under the point wins, not the first. Boxes nest: a
+    // drawing's outline box contains the boxes of everything drawn inside it,
+    // and taking the first match meant the outline took every click, so the
+    // thing inside could be named by number but never by clicking. Smallest
+    // is the reading every editor uses -- click inside the small thing to get
+    // it, click the big thing on its own ink outside the small one to get that.
+    int best = -1;
+    double bestArea = 0.0;
     for (size_t i = 0; i < a.units.size(); ++i) {
       const DetectedUnit& u = a.units[i];
       const double x1 = c.rod.x1 + double(u.x1) / a.width * w;
@@ -686,9 +694,14 @@ class CurveInteract : public OFX::OverlayInteract {
       // Image y runs down, canonical y runs up.
       const double y1 = c.rod.y2 - double(u.y2) / a.height * h;
       const double y2 = c.rod.y2 - double(u.y1) / a.height * h;
-      if (p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2) return int(i);
+      if (p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2) continue;
+      const double area = (x2 - x1) * (y2 - y1);
+      if (best < 0 || area < bestArea) {
+        best = int(i);
+        bestArea = area;
+      }
     }
-    return -1;
+    return best;
   }
 
   static std::vector<int> parseList(const std::string& in) {
