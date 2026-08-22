@@ -553,6 +553,79 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
     while (y < h && rowCount[y] != 0) ++y;
     lineSpans.push_back(RectI{0, start, w, y});
   }
+
+  // 6b. A band too thin to be a line is a MARK with clear rows either side of
+  //     it: the dot of an i on a line with no ascenders, where nothing reaches
+  //     up to bridge the gap between dot and stem. Left alone it becomes a line
+  //     of its own, and then nothing can rejoin it to the stem -- glyph
+  //     assembly works within a line -- so the reveal gets a ten-pixel unit
+  //     numbered wherever that phantom line falls in reading order.
+  //
+  // Only a line with NO ascender triggers it, which is why it looked arbitrary
+  // from outside: "easy views" broke and "easy vibes" would not have, because
+  // the b fills the rows the dot sits in.
+  //
+  // Merged only when the thin band sits directly over or under something in
+  // the neighbouring band that it overlaps in x, within a short gap -- the
+  // geometry of a mark and its base -- so a genuine row of small shapes with
+  // nothing above or below it is left as the line it is.
+  if (lineSpans.size() > 1) {
+    int refH = 0;
+    for (const RectI& sp : lineSpans) refH = std::max(refH, sp.height());
+    const int thinH = int(0.3f * float(refH));
+    const int maxGap = int(0.5f * float(refH));
+
+    auto bandOf = [&](int l) {
+      const int cy = (comps[l].bbox.y1 + comps[l].bbox.y2) / 2;
+      for (size_t i = 0; i < lineSpans.size(); ++i)
+        if (cy >= lineSpans[i].y1 && cy < lineSpans[i].y2) return int(i);
+      return -1;
+    };
+
+    bool merged = true;
+    while (merged && lineSpans.size() > 1) {
+      merged = false;
+      for (size_t i = 0; i < lineSpans.size(); ++i) {
+        if (lineSpans[i].height() >= thinH) continue;
+
+        int pick = -1;
+        int pickGap = INT_MAX;
+        for (int dir = -1; dir <= 1; dir += 2) {
+          const int j = int(i) + dir;
+          if (j < 0 || size_t(j) >= lineSpans.size()) continue;
+          const int gap = dir < 0 ? lineSpans[i].y1 - lineSpans[size_t(j)].y2
+                                  : lineSpans[size_t(j)].y1 - lineSpans[i].y2;
+          if (gap > maxGap) continue;
+
+          // Something in the neighbour directly under (or over) this band's ink.
+          bool over = false;
+          for (int a = 1; a <= labelCount && !over; ++a) {
+            if (!comps[a].alive || bandOf(a) != int(i)) continue;
+            for (int b = 1; b <= labelCount; ++b) {
+              if (!comps[b].alive || bandOf(b) != j) continue;
+              if (xOverlapRatio(comps[a].sx1, comps[a].sx2, comps[b].sx1, comps[b].sx2) >= 0.5f) {
+                over = true;
+                break;
+              }
+            }
+          }
+          if (over && gap < pickGap) {
+            pick = j;
+            pickGap = gap;
+          }
+        }
+        if (pick < 0) continue;
+
+        const size_t lo = size_t(std::min(int(i), pick)), hi = size_t(std::max(int(i), pick));
+        lineSpans[lo].y1 = std::min(lineSpans[lo].y1, lineSpans[hi].y1);
+        lineSpans[lo].y2 = std::max(lineSpans[lo].y2, lineSpans[hi].y2);
+        lineSpans.erase(lineSpans.begin() + std::ptrdiff_t(hi));
+        merged = true;
+        break;
+      }
+    }
+  }
+
   if (lineSpans.empty()) return seg;
   seg.lineCount = int(lineSpans.size());
 
