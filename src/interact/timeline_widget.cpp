@@ -45,6 +45,7 @@ struct Timing {
   bool outUsable = false;
   double inStart = 0.0, inEnd = 0.0;
   double outStart = 0.0, outEnd = 0.0;
+  bool sequenced = false;  // cues own the entrance's timing
 };
 
 Timing resolveTiming(const OverlayContext& c) {
@@ -64,6 +65,14 @@ Timing resolveTiming(const OverlayContext& c) {
   t.clipFrame = c.time - a.origin;
   t.inStart = start;
   t.inEnd = start + a.inSpan;
+  // With cues the entrance is not Start plus a span any more -- its runs sit
+  // wherever the cues put them -- so the bar takes the extent render resolved.
+  // That one does lag a render; the cue ticks below are read live.
+  if (a.sequenced) {
+    t.sequenced = true;
+    t.inStart = a.inStartFrame;
+    t.inEnd = a.inEndFrame;
+  }
   t.outEnd = a.clipLength - offset;
   t.outStart = t.outEnd - a.outSpan;
   return t;
@@ -239,6 +248,29 @@ void TimelineWidget::draw(const OverlayContext& c) {
          _rect.y2 - c.sy(6.0), kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
   }
 
+  // Cues, as ticks on the entrance lane, each with the element it starts. Read
+  // straight from the parameter rather than from what render published, so a
+  // click in the sequencer shows up here at once -- and a hold reads as the
+  // stretch of bar between one run finishing and the next tick.
+  {
+    std::string seq;
+    try {
+      c.effect->fetchStringParam("sequence")->getValue(seq);
+    } catch (...) {
+    }
+    const std::vector<SequenceCue> cues = validSequence(parseSequence(seq));
+    const OfxRectD lane = laneRect(c, 0);
+    for (const SequenceCue& q : cues) {
+      const double x = frameToX(q.frame);
+      if (x < lane.x1 || x > lane.x2) continue;
+      SetColour(c, kText);
+      SetLineWidth(c, 2.0f);
+      Line(c, x, lane.y1 - c.sy(2.0), x, lane.y2 + c.sy(2.0));
+      Text(c, std::to_string(q.index), x + c.sx(3.0), (lane.y1 + lane.y2) * 0.5 + c.sy(4.0),
+           kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+    }
+  }
+
   // Playhead last, so it reads on top of the lanes.
   const double px = frameToX(a.clipFrame);
   if (px >= _rect.x1 && px <= _rect.x2) {
@@ -258,6 +290,10 @@ bool TimelineWidget::penDown(const OverlayContext& c, const OfxPointD& p) {
     if (p.y < lane.y1 || p.y > lane.y2) continue;
     const bool on = i == 0 || (a.enableOut && a.outUsable);
     if (!on) return true;
+    // A sequenced entrance is not draggable as a bar: the cues place it, and
+    // moving Start would slide only the part ahead of the first cue while the
+    // bar suggested the whole thing had moved.
+    if (i == 0 && a.sequenced) return true;
 
     const double s = i == 0 ? a.inStart : a.outStart;
     const double e = i == 0 ? a.inEnd : a.outEnd;

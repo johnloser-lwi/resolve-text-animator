@@ -32,7 +32,8 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
                                const rta::AnimParams& anim, rta::Stage stage, int count,
                                double atFraction, double step, int& outW, int& outH,
                                const rta::SpacingParams& sp, const rta::Segmentation* charSeg,
-                               int revealFirst, int revealLast, bool isolate) {
+                               int revealFirst, int revealLast, bool isolate,
+                               const std::vector<rta::SequenceCue>& cues) {
   rta::RectI area;
   for (const auto& g : seg.groups) area.unionWith(g.bbox);
   // Bounded before the int conversion, for the same reason the sampler bounds:
@@ -59,7 +60,18 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
   const double stageStart = stage == rta::Stage::Out ? 0.0 : anim.startTime;
   const std::vector<int> rank = rta::revealOrder(seg.groups, seg.lineCount, s);
   const std::vector<double> delays = rta::revealDelays(seg.groups, rank, s);
-  const double total = stageStart + rta::stageSpan(rta::maxDelay(delays), s);
+  // Cues are applied the way the plugin applies them: one shift per group,
+  // taken off the clock that group is evaluated at.
+  const std::vector<double> shifts =
+      stage == rta::Stage::In ? rta::sequenceShifts(rank, delays, s, stageStart, cues)
+                              : std::vector<double>(seg.groups.size(), 0.0);
+  double total = stageStart + rta::stageSpan(rta::maxDelay(delays), s);
+  if (stage == rta::Stage::In && !cues.empty()) {
+    double last = -1.0e300;
+    for (size_t g = 0; g < seg.groups.size(); ++g)
+      last = std::max(last, stageStart + delays[g] * s.stagger + shifts[g]);
+    total = last + s.duration;
+  }
   const int taps = rta::tapCount(anim);
   for (int i = 0; i < count; ++i) {
     const double t = step > 0.0 ? stageStart + double(i) * step
@@ -67,7 +79,8 @@ std::vector<float> renderStrip(const rta::ImageView& src, const rta::Segmentatio
                    : total * double(i) / double(std::max(1, count - 1));
     std::vector<rta::GroupTransform> xf(seg.groups.size() * size_t(taps));
     for (size_t g = 0; g < seg.groups.size(); ++g)
-      rta::transformTaps(stage, delays[g], t, stageStart, anim, s, &xf[g * size_t(taps)]);
+      rta::transformTaps(stage, delays[g], t - shifts[g], stageStart, anim, s,
+                         &xf[g * size_t(taps)]);
     rta::applyRevealRange(rank, revealFirst, revealLast, isolate, taps, &xf);
 
     // Units are characters when tracking has to move letters inside a word, and
@@ -103,6 +116,7 @@ int main(int argc, char** argv) {
                  "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
                  "             --angle DEG --easing 0-4 --order 0-4 --lineorder 0|1\n"
                  "             --manual \"3,0,7\"  --from N --to N  --isolate\n"
+                 "             --seq \"0:1,60:3\"   (frame:element cues)\n"
                  "             --rotate DEG --scale F --blur PX --mblur 0|1 --shutter DEG --samples N\n"
                  "             --bez x1,y1,x2,y2\n"
                  "  (--stagger and --dur are in FRAMES, matching the plugin)\n");
@@ -114,6 +128,7 @@ int main(int argc, char** argv) {
   rta::SpacingParams sp;
   int revealFirst = 1, revealLast = 0;
   bool isolate = false;
+  std::string seqText;
   int strip = 0;
   double atFraction = -1.0;
   double step = 0.0;
@@ -157,6 +172,8 @@ int main(int argc, char** argv) {
       }
     } else if (!std::strcmp(a, "--reftext")) {
       p.referenceText = next();
+    } else if (!std::strcmp(a, "--seq")) {
+      seqText = next();
     } else if (!std::strcmp(a, "--link")) {
       // "3 7 12; 5 9" -- groups by ';', members by anything else.
       const char* list = next();
@@ -303,6 +320,26 @@ int main(int argc, char** argv) {
                 g.bbox.height(), g.labels.size());
   }
 
+  // The sequence, resolved, and printed as numbers: which frame each element
+  // starts on. A hold is hard to judge from a contact sheet and trivial to read
+  // off a table.
+  std::vector<rta::SequenceCue> seqDropped;
+  const std::vector<rta::SequenceCue> seqCues =
+      rta::validSequence(rta::parseSequence(seqText), &seqDropped);
+  for (const rta::SequenceCue& d : seqDropped)
+    std::printf("sequence: cue %s IGNORED\n", rta::formatSequence({d}).c_str());
+  if (!seqCues.empty()) {
+    const std::vector<int> r = rta::revealOrder(seg.groups, seg.lineCount, anim.in);
+    const std::vector<double> d = rta::revealDelays(seg.groups, r, anim.in);
+    const std::vector<double> sh = rta::sequenceShifts(r, d, anim.in, anim.startTime, seqCues);
+    std::printf("sequence: %s\n", rta::formatSequence(seqCues).c_str());
+    for (size_t pos = 0; pos < r.size(); ++pos)
+      for (size_t g = 0; g < r.size(); ++g)
+        if (r[g] == int(pos))
+          std::printf("  element %zu starts at frame %g\n", pos + 1,
+                      anim.startTime + d[g] * anim.in.stagger + sh[g]);
+  }
+
   int ow = w, oh = h;
   std::vector<float> strippedBuf;
   const float* result = buf.data();
@@ -320,12 +357,23 @@ int main(int argc, char** argv) {
     }
     strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, step, ow, oh, sp,
                               sp.needsPerCharacter() ? &charSeg : nullptr, revealFirst, revealLast,
-                              isolate);
+                              isolate, seqCues);
     result = strippedBuf.data();
     const rta::StageSettings& s = stage == rta::Stage::Out ? anim.out : anim.in;
+    const std::vector<int> sr = rta::revealOrder(seg.groups, seg.lineCount, s);
+    const std::vector<double> sd = rta::revealDelays(seg.groups, sr, s);
+    double stripSpan = rta::stageSpan(rta::maxDelay(sd), s);
+    if (stage == rta::Stage::In && !seqCues.empty()) {
+      // With cues the stage runs to wherever the last run ends, not for its
+      // unsequenced span.
+      const std::vector<double> sh = rta::sequenceShifts(sr, sd, s, anim.startTime, seqCues);
+      double last = -1.0e300;
+      for (size_t g = 0; g < sd.size(); ++g)
+        last = std::max(last, sd[g] * s.stagger + sh[g]);
+      stripSpan = last + s.duration;
+    }
     std::printf("strip: %d samples of the %s stage over %.1f frames\n", strip,
-                stage == rta::Stage::Out ? "OUT" : "IN",
-                rta::stageSpan(rta::maxDelay(rta::revealDelays(seg.groups, rta::revealOrder(seg.groups, seg.lineCount, s), s)), s));
+                stage == rta::Stage::Out ? "OUT" : "IN", stripSpan);
   } else {
     rta::drawDiagnostics(view, seg, 2);
   }

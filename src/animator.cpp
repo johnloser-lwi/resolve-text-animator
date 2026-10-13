@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <random>
 
@@ -416,9 +418,9 @@ void transformTapsCombined(double delayIn, double delayOut, double frames, doubl
 }
 
 FitReport checkFit(double maxDelayIn, double maxDelayOut, const AnimParams& p, double clipLength,
-                   bool haveLength) {
+                   bool haveLength, double inExtraFrames) {
   FitReport r;
-  r.inNeeds = p.startTime + stageSpan(maxDelayIn, p.in);
+  r.inNeeds = p.startTime + stageSpan(maxDelayIn, p.in) + inExtraFrames;
   if (!haveLength) return r;
 
   // The entrance must settle before the clip ends.
@@ -644,6 +646,122 @@ void applySpacing(const Segmentation& unitSeg, const Segmentation& groupSeg,
       (*outTaps)[u * size_t(taps) + size_t(k)] = t;
     }
   }
+}
+
+// --------------------------------------------------------------- sequencer
+
+namespace {
+
+// Whole frames print as whole numbers; a typed fraction keeps its fraction.
+std::string cueFrameLabel(double f) {
+  char buf[48];
+  if (f == std::floor(f) && std::fabs(f) < 1.0e15)
+    std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(f));
+  else
+    std::snprintf(buf, sizeof(buf), "%.3f", f);
+  return buf;
+}
+
+}  // namespace
+
+std::vector<SequenceCue> parseSequence(const std::string& s) {
+  std::vector<SequenceCue> out;
+  const size_t n = s.size();
+  size_t i = 0;
+  while (i < n) {
+    size_t end = i;
+    while (end < n && s[end] != ',' && s[end] != ';' && s[end] != '\n') ++end;
+    const std::string piece = s.substr(i, end - i);
+    i = end + 1;
+
+    const char* p = piece.c_str();
+    char* stop = nullptr;
+    while (*p && !((*p >= '0' && *p <= '9') || *p == '-' || *p == '.')) ++p;
+    if (!*p) continue;
+    const double frame = std::strtod(p, &stop);
+    if (stop == p || !(frame == frame)) continue;
+    p = stop;
+    while (*p && !(*p >= '0' && *p <= '9')) ++p;
+    if (!*p) continue;  // a frame with no element says nothing
+    const long index = std::strtol(p, &stop, 10);
+    if (stop == p) continue;
+    SequenceCue c;
+    c.frame = frame;
+    c.index = int(index);
+    out.push_back(c);
+  }
+  return out;
+}
+
+std::string formatSequence(const std::vector<SequenceCue>& cues) {
+  std::string out;
+  for (size_t i = 0; i < cues.size(); ++i) {
+    if (i) out += ", ";
+    out += cueFrameLabel(cues[i].frame) + ":" + std::to_string(cues[i].index);
+  }
+  return out;
+}
+
+std::vector<SequenceCue> validSequence(std::vector<SequenceCue> cues,
+                                       std::vector<SequenceCue>* dropped) {
+  std::stable_sort(cues.begin(), cues.end(),
+                   [](const SequenceCue& a, const SequenceCue& b) { return a.frame < b.frame; });
+  std::vector<SequenceCue> kept;
+  for (const SequenceCue& c : cues) {
+    const bool ok = c.index >= 1 && (kept.empty() || (c.frame > kept.back().frame &&
+                                                      c.index > kept.back().index));
+    if (ok)
+      kept.push_back(c);
+    else if (dropped)
+      dropped->push_back(c);
+  }
+  return kept;
+}
+
+bool cueAllowed(const std::vector<SequenceCue>& cues, const SequenceCue& c, std::string* why) {
+  auto say = [&](const std::string& m) {
+    if (why) *why = m;
+    return false;
+  };
+  if (c.index < 1) return say("there is no element " + std::to_string(c.index));
+  const std::string me = "element " + std::to_string(c.index);
+  for (const SequenceCue& q : cues) {
+    const std::string other = "element " + std::to_string(q.index);
+    const std::string at = "frame " + cueFrameLabel(q.frame);
+    if (q.frame == c.frame) return say(at + " already starts " + other);
+    if (q.frame < c.frame && q.index >= c.index)
+      return say(me + " cannot start after " + other + ", which starts at " + at);
+    if (q.frame > c.frame && q.index <= c.index)
+      return say(me + " cannot start before " + other + ", which starts at " + at);
+  }
+  return true;
+}
+
+std::vector<double> sequenceShifts(const std::vector<int>& rank, const std::vector<double>& delays,
+                                   const StageSettings& s, double startTime,
+                                   const std::vector<SequenceCue>& cues) {
+  const size_t n = rank.size();
+  std::vector<double> shifts(n, 0.0);
+  if (cues.empty() || delays.size() != n) return shifts;
+
+  std::vector<int> byRank(n, -1);
+  for (size_t i = 0; i < n; ++i)
+    if (rank[i] >= 0 && size_t(rank[i]) < n) byRank[size_t(rank[i])] = int(i);
+
+  // Walk the reveal order once. Each cue takes over at its own element and its
+  // shift then rides along until the next cue replaces it.
+  double cur = 0.0;  // ahead of the first cue: Start (frames), untouched
+  size_t ci = 0;
+  for (size_t r = 0; r < n; ++r) {
+    while (ci < cues.size() && cues[ci].index - 1 <= int(r)) {
+      const int cr = cues[ci].index - 1;
+      if (cr >= 0 && size_t(cr) < n && byRank[size_t(cr)] >= 0)
+        cur = cues[ci].frame - startTime - delays[size_t(byRank[size_t(cr)])] * s.stagger;
+      ++ci;
+    }
+    if (byRank[r] >= 0) shifts[size_t(byRank[r])] = cur;
+  }
+  return shifts;
 }
 
 }  // namespace rta

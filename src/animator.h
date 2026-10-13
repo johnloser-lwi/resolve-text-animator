@@ -2,6 +2,7 @@
 // Pure math -- no pixels, no host.
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "segmentation.h"
@@ -231,6 +232,54 @@ double maxDelay(const std::vector<double>& delays);
 // stagger is uniform.
 double stageSpan(double maxDelayUnits, const StageSettings& s);
 
+// --------------------------------------------------------------- sequencer
+//
+// A cue says: on THIS frame, THIS element starts. Between cues the reveal runs
+// on as it always did; when it reaches the next cued element it holds until
+// that cue's frame. It is what a cut does on the Edit page -- "carry on from
+// here" -- for a Fusion comp, where there is one node and nothing to cut.
+//
+// `frame` is a clip frame, the unit Start (frames) is in. `index` is the
+// element's REVEAL POSITION counted from one -- its place after Order and any
+// hand-picked sequence -- so a cue list reads in the order things appear.
+struct SequenceCue {
+  double frame = 0.0;
+  int index = 1;
+};
+
+// "0:1, 60:3". Pairs are separated by ',' or ';'; inside a pair the first
+// number is the frame and the second the element, and whatever sits between
+// them is only there for the reader.
+std::vector<SequenceCue> parseSequence(const std::string& s);
+std::string formatSequence(const std::vector<SequenceCue>& cues);
+
+// The cues that can be honoured, sorted by frame.
+//
+// One rule, and only one: frames and elements rise TOGETHER. A later cue must
+// name a later element. Nothing here looks at Stagger or Duration, on purpose
+// -- a rule that did would let a cue that was legal when it was written turn
+// illegal the moment a timing slider moved. Cues that break the rule are left
+// out, and handed back through `dropped` so the user can be told which.
+std::vector<SequenceCue> validSequence(std::vector<SequenceCue> cues,
+                                       std::vector<SequenceCue>* dropped = nullptr);
+
+// Whether `c` could join `cues` (already valid, and not containing a cue for
+// the same element) without breaking that rule. `why` says what it collides
+// with, in the terms the viewer shows. The click and the renderer ask the same
+// question of the same function, so there is no second opinion.
+bool cueAllowed(const std::vector<SequenceCue>& cues, const SequenceCue& c, std::string* why);
+
+// Frames to ADD to each group's start, indexed by group. All zero without cues.
+//
+// A cue moves its own element to its frame and carries everything up to the
+// next cue with it, each keeping the spacing it had from that element -- so
+// Stagger and Stagger By Length go on meaning what they mean inside a run.
+// Elements ahead of the first cue are left on Start (frames), which is what
+// makes an empty list exactly the unsequenced reveal.
+std::vector<double> sequenceShifts(const std::vector<int>& rank, const std::vector<double>& delays,
+                                   const StageSettings& s, double startTime,
+                                   const std::vector<SequenceCue>& cues);
+
 // Pose of one group.
 //
 // `stageStart` is the frame the stage's first group begins on: startTime for
@@ -300,8 +349,10 @@ struct FitReport {
   bool ok() const { return inFits && outFits; }
 };
 
+// `inExtraFrames` is how much later (or earlier) a sequence makes the entrance
+// finish than its unsequenced span would; zero when there are no cues.
 FitReport checkFit(double maxDelayIn, double maxDelayOut, const AnimParams& p,
-                   double clipLength, bool haveLength);
+                   double clipLength, bool haveLength, double inExtraFrames = 0.0);
 
 // Derives the exit settings from the entrance when the two are linked.
 //

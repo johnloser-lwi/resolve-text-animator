@@ -82,6 +82,8 @@ class CurveInteract : public OFX::OverlayInteract {
       addParamToSlaveTo(_effect->fetchStringParam("manualOrder"));
       addParamToSlaveTo(_effect->fetchBooleanParam("linkMode"));
       addParamToSlaveTo(_effect->fetchStringParam("linkGroups"));
+      addParamToSlaveTo(_effect->fetchBooleanParam("sequencePick"));
+      addParamToSlaveTo(_effect->fetchStringParam("sequence"));
       // The timeline draws from these; a drag on it writes them and has to see
       // the bar move.
       addParamToSlaveTo(_effect->fetchBooleanParam("showTimeline"));
@@ -105,6 +107,7 @@ class CurveInteract : public OFX::OverlayInteract {
     drawSlant(c);
     drawUnits(c);
     drawLinks(c);
+    drawSequencer(c);
     drawOrderPicker(c);
     drawClearButton(c);
     if (showTimeline(args.time)) {
@@ -146,6 +149,11 @@ class CurveInteract : public OFX::OverlayInteract {
            "(!) REFERENCE TEXT DOES NOT MATCH - " + w.referenceMessage +
                ". Using automatic detection.",
            x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+      y -= c.sy(22.0);
+    }
+    if (!w.sequenceMessage.empty()) {
+      Text(c, "(!) SEQUENCE - " + w.sequenceMessage + ".", x, y,
+           kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
     }
   }
 
@@ -546,6 +554,169 @@ class CurveInteract : public OFX::OverlayInteract {
     return true;
   }
 
+  // --- sequencer: cueing elements to frames ---------------------------------
+  //
+  // Park the playhead, click an element, and it is cued to start there. The
+  // string this writes is the one the renderer reads, and the question "may
+  // this cue exist" is put to the same function the renderer filters with, so
+  // what the viewer accepts and what gets drawn cannot disagree.
+  //
+  // Stands alone -- it does not need Show Detection. The number that matters
+  // here is an element's place in the REVEAL, not the character index Show
+  // Detection paints, and two sets of numbers on every element would be noise.
+
+  bool sequencing(double time) const {
+    try {
+      return _effect->fetchBooleanParam("sequencePick")->getValueAtTime(time);
+    } catch (...) {
+      return false;
+    }
+  }
+
+  std::vector<SequenceCue> sequenceList(const OverlayContext& c) const {
+    try {
+      std::string v;
+      c.effect->fetchStringParam("sequence")->getValue(v);
+      return validSequence(parseSequence(v));
+    } catch (...) {
+      return {};
+    }
+  }
+
+  void writeSequence(const OverlayContext& c, const std::vector<SequenceCue>& cues,
+                     const char* label) {
+    try {
+      beginEdit(c.effect, label);
+      c.effect->fetchStringParam("sequence")->setValue(formatSequence(cues));
+      endEdit(c.effect);
+    } catch (...) {
+    }
+  }
+
+  OfxRectD sequenceButtonRect(const OverlayContext& c) const {
+    // Fourth in the stack, above the link button.
+    const double w = c.sx(190.0), h = c.sy(26.0);
+    const double x = c.rod.x1 + c.sx(24.0);
+    const double y = c.rod.y1 + c.sy(24.0) + 3.0 * (h + c.sy(8.0));
+    return OfxRectD{x, y, x + w, y + h};
+  }
+
+  void drawSequencer(const OverlayContext& c) {
+    if (!sequencing(c.time)) return;
+    const AnalysisState a = analysisState(_effect);
+    const double w = c.rod.x2 - c.rod.x1, h = c.rod.y2 - c.rod.y1;
+    const std::vector<SequenceCue> cues = sequenceList(c);
+    const Colour kCue{1.0f, 0.85f, 0.2f, 1.0f};
+
+    if (a.width > 0 && a.height > 0 && w > 0.0 && h > 0.0) {
+      for (const DetectedUnit& u : a.units) {
+        if (u.rank < 0) continue;
+        const int index = u.rank + 1;
+        const SequenceCue* cue = nullptr;
+        for (const SequenceCue& q : cues)
+          if (q.index == index) cue = &q;
+
+        const double x1 = c.rod.x1 + double(u.x1) / a.width * w;
+        const double x2 = c.rod.x1 + double(u.x2) / a.width * w;
+        const double y1 = c.rod.y2 - double(u.y2) / a.height * h;
+        const double y2 = c.rod.y2 - double(u.y1) / a.height * h;
+
+        SetColour(c, cue ? kCue : kUnitPalette[size_t(u.rank) % 8]);
+        SetLineWidth(c, cue ? 3.0f : 1.0f);
+        StrokeRect(c, x1, y1, x2, y2);
+
+        // The reveal number above the box, where Show Detection puts its own.
+        Text(c, std::to_string(index), x1 + c.sx(3.0), y2 + c.sy(14.0),
+             kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+        // And on a cued element, the frame it is held for, inside the box.
+        if (cue)
+          Text(c, "@" + FrameLabel(cue->frame), (x1 + x2) * 0.5, (y1 + y2) * 0.5,
+               kOfxDrawTextAlignmentCenterH | kOfxDrawTextAlignmentCenterV);
+      }
+    }
+
+    const OfxRectD r = sequenceButtonRect(c);
+    Panel(c, r);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "CLEAR SEQUENCE (%d)", int(cues.size()));
+    SetColour(c, kCue);
+    Text(c, buf, r.x1 + c.sx(10.0), r.y2 - c.sy(7.0),
+         kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+
+    // What a click would log, said before the click is made.
+    const std::string status =
+        a.haveTiming ? "SEQUENCE  frame " + FrameLabel(c.time - a.origin) +
+                           "  -  click an element to start it here"
+                     : std::string("SEQUENCE  -  no frame rendered yet");
+    Text(c, status, r.x1, r.y2 + c.sy(22.0), kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+
+    // The last refusal stays up until the next click, since a click that
+    // changed nothing is otherwise indistinguishable from one that missed.
+    if (!_seqMessage.empty()) {
+      SetColour(c, Colour{1.0f, 0.25f, 0.25f, 1.0f});
+      Text(c, "(!) NOT LOGGED - " + _seqMessage, r.x1, r.y2 + c.sy(44.0),
+           kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+    }
+  }
+
+  bool sequenceDown(const OverlayContext& c, const OfxPointD& p) {
+    if (Contains(sequenceButtonRect(c), p)) {
+      writeSequence(c, {}, "Clear sequence");
+      _seqMessage.clear();
+      return true;
+    }
+    const AnalysisState a = analysisState(_effect);
+    const int hit = unitAt(c, a, p);
+    if (hit < 0) return false;
+
+    const DetectedUnit& u = a.units[size_t(hit)];
+    if (!a.haveTiming || u.rank < 0) {
+      _seqMessage = "this frame is not showing the entrance, so there is no element number";
+      redraw();
+      return true;
+    }
+
+    SequenceCue cue;
+    cue.frame = std::floor(c.time - a.origin + 0.5);
+    cue.index = u.rank + 1;
+
+    std::vector<SequenceCue> cues = sequenceList(c);
+    const auto mine = std::find_if(cues.begin(), cues.end(),
+                                   [&](const SequenceCue& q) { return q.index == cue.index; });
+    const bool moving = mine != cues.end();
+    if (moving) {
+      if (mine->frame == cue.frame) {
+        // On its own frame: take the cue back out.
+        cues.erase(mine);
+        writeSequence(c, cues, "Remove cue");
+        _seqMessage.clear();
+        return true;
+      }
+      // Elsewhere: this is a move, so it is judged against the list WITHOUT
+      // its old self -- otherwise it would always collide with where it was.
+      cues.erase(mine);
+    }
+
+    std::string why;
+    if (!cueAllowed(cues, cue, &why)) {
+      _seqMessage = why;
+      redraw();
+      return true;  // refused: nothing is written
+    }
+    cues.push_back(cue);
+    writeSequence(c, validSequence(cues), moving ? "Move cue" : "Add cue");
+    _seqMessage.clear();
+    return true;
+  }
+
+  // A refusal changes no parameter, so nothing would repaint the reason.
+  void redraw() {
+    try {
+      requestRedraw();
+    } catch (...) {
+    }
+  }
+
   // --- picking the reveal order off the picture ----------------------------
   //
   // Typing "18, 0" means reading numbers off the viewer, holding them, and
@@ -845,6 +1016,8 @@ class CurveInteract : public OFX::OverlayInteract {
     // elements by accident while linking would be the worst of the outcomes.
     if (linking(args.time)) {
       if (linkDown(c, args.penPosition)) return true;
+    } else if (sequencing(args.time)) {
+      if (sequenceDown(c, args.penPosition)) return true;
     } else if (orderPicking(args.time)) {
       if (pickOrder(c, args.penPosition)) return true;
     } else if (groupingMode(args.time)) {
@@ -957,6 +1130,7 @@ class CurveInteract : public OFX::OverlayInteract {
   CurveWidget _curve;
   TimelineWidget _timeline;
   int _activeLink = -1;  // group the next click adds to, or -1 for a new one
+  std::string _seqMessage;  // why the last sequencer click was refused, if it was
   bool _marquee = false;
   OfxPointD _marqueeA{0.0, 0.0}, _marqueeB{0.0, 0.0};
   int _dragUnit = -1;   // unit a merge drag started on

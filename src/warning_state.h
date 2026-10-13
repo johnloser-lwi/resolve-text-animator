@@ -30,8 +30,12 @@ struct WarningState {
   // string had been ignored.
   bool referenceMismatch = false;
   std::string referenceMessage;
+  // Cues in a typed Sequence that could not be honoured. Empty when all could.
+  std::string sequenceMessage;
 
-  bool any() const { return sourceOffset || clipTooShort || referenceMismatch; }
+  bool any() const {
+    return sourceOffset || clipTooShort || referenceMismatch || !sequenceMessage.empty();
+  }
 };
 
 namespace detail {
@@ -87,6 +91,10 @@ struct DetectedUnit {
   // The link this unit was folded into, or -1. With links present the units
   // published are the MEMBERS, so a click lands on the dash it is over.
   int linkGroup = -1;
+  // Reveal position in the ENTRANCE, counted from zero, or -1 when this frame is
+  // showing the exit in a grouping of its own. The sequencer turns a click into
+  // an element number with it.
+  int rank = -1;
 };
 
 struct AnalysisState {
@@ -115,6 +123,10 @@ struct AnalysisState {
   bool outUsable = false;    // the exit has a clip end to anchor to
   double inSpan = 0.0;       // first unit starting to last unit settling
   double outSpan = 0.0;
+  // With a Sequence the entrance is no longer Start plus a span -- cues place
+  // its runs wherever they like -- so its resolved extent is published whole.
+  bool sequenced = false;
+  double inStartFrame = 0.0, inEndFrame = 0.0;
 };
 
 namespace detail {

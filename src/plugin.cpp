@@ -283,6 +283,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _referenceText = fetchStringParam("referenceText");
     _mergeAt = fetchStringParam("mergeAt");
     _linkGroups = fetchStringParam("linkGroups");
+    _sequence = fetchStringParam("sequence");
     _splitBefore = fetchStringParam("splitBefore");
     _clearOverrides = fetchPushButtonParam("clearOverrides");
     _italicSlant = fetchDoubleParam("italicSlant");
@@ -764,7 +765,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::DoubleParam *_tracking, *_lineSpacing;
   OFX::ChoiceParam *_trackAnchor, *_lineAnchor;
   OFX::BooleanParam* _autoSlant;
-  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder, *_linkGroups;
+  OFX::StringParam *_mergeAt, *_splitBefore, *_referenceText, *_manualOrder, *_linkGroups, *_sequence;
   OFX::IntParam *_revealStart, *_revealEnd;
   OFX::BooleanParam *_singleElement, *_orderPick, *_isolate;
   OFX::PushButtonParam* _clearOverrides;
@@ -928,6 +929,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     _manualOrder->getValueAtTime(args.time, mo);
     in.manualOrder = parseIndexList(mo);
   }
+  std::string seqText;
+  _sequence->getValueAtTime(args.time, seqText);
   in.lineOrder = rta::LineOrder(choiceAt(_lineOrder, args.time, 0, 1));
   in.randomSeed = _randomSeed->getValueAtTime(args.time);
   in.duration = _duration->getValueAtTime(args.time);
@@ -1108,11 +1111,32 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // Each stage's span -- first unit starting to last unit settling -- which is
   // what the timeline overlay draws. Both are taken from their own grouping
   // and settings regardless of which stage this frame happens to be in.
-  const double inSpan = rta::stageSpan(
-      rta::maxDelay(rta::revealDelays(
-          segIn->groups, rta::revealOrder(segIn->groups, segIn->lineCount, anim.in), anim.in)),
-      anim.in);
+  const std::vector<int> seqRank = rta::revealOrder(segIn->groups, segIn->lineCount, anim.in);
+  const std::vector<double> seqDelay = rta::revealDelays(segIn->groups, seqRank, anim.in);
+  const double inSpan = rta::stageSpan(rta::maxDelay(seqDelay), anim.in);
   double outSpan = 0.0;
+
+  // The sequence: cues that hold the entrance at chosen elements until chosen
+  // frames. Resolved to one number per group -- frames to add to its start --
+  // and applied below by handing the evaluator a shifted time, so nothing the
+  // compositor sees changes shape. No cues, all zeros, and every subtraction
+  // below is of exactly 0.0.
+  std::vector<rta::SequenceCue> seqDropped;
+  const std::vector<rta::SequenceCue> seqCues =
+      rta::validSequence(rta::parseSequence(seqText), &seqDropped);
+  const std::vector<double> seqShift =
+      rta::sequenceShifts(seqRank, seqDelay, anim.in, anim.startTime, seqCues);
+  double inStartFrame = anim.startTime, inEndFrame = anim.startTime + inSpan;
+  if (!seqCues.empty() && !seqShift.empty()) {
+    double first = 1.0e300, last = -1.0e300;
+    for (size_t i = 0; i < seqShift.size(); ++i) {
+      const double st = anim.startTime + seqDelay[i] * anim.in.stagger + seqShift[i];
+      first = std::min(first, st);
+      last = std::max(last, st);
+    }
+    inStartFrame = first;
+    inEndFrame = last + anim.in.duration;
+  }
 
   double outSeqStart = 0.0;
   bool outUsable = false;
@@ -1169,6 +1193,11 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 
   const std::vector<int> rank = rta::revealOrder(useSeg->groups, useSeg->lineCount, active);
   const std::vector<double> delayIn = rta::revealDelays(useSeg->groups, rank, active);
+  // Cues are written against the entrance's own grouping and order. A frame
+  // drawing the exit in a grouping of its own has different units, and a shift
+  // indexed by the entrance's would land on the wrong ones.
+  const bool seqActive = !seqCues.empty() && useSeg == segIn.get() &&
+                         stage != rta::Stage::Out && seqShift.size() == useSeg->groups.size();
 
   rta::StageSettings outActive = anim.out;
   outActive.slideDistance = rawSlideOut * lengthScale;
@@ -1198,11 +1227,17 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     const int got = rta::tapCount(q);
     out.assign(useSeg->groups.size() * size_t(got), rta::GroupTransform());
     for (size_t i = 0; i < useSeg->groups.size(); ++i) {
+      // Moving the clock back by the shift is the same as moving this group's
+      // start forward by it. The exit's start goes back by the same amount in
+      // the combined case, so the exit stays exactly where it was and only the
+      // entrance moves.
+      const double sh = seqActive ? seqShift[i] : 0.0;
       if (useCombined)
-        rta::transformTapsCombined(delayIn[i], delayOut[i], frames, anim.startTime, outSeqStart, q,
-                                   active, outActive, &out[i * size_t(got)]);
+        rta::transformTapsCombined(delayIn[i], delayOut[i], frames - sh, anim.startTime,
+                                   outSeqStart - sh, q, active, outActive,
+                                   &out[i * size_t(got)]);
       else
-        rta::transformTaps(stage, delayIn[i], frames, stageStart, q, active,
+        rta::transformTaps(stage, delayIn[i], frames - sh, stageStart, q, active,
                            &out[i * size_t(got)]);
     }
     return got;
@@ -1229,7 +1264,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   {
     const double mdIn = rta::maxDelay(delayIn);
     const double mdOut = useCombined ? rta::maxDelay(delayOut) : mdIn;
-    const rta::FitReport fit = rta::checkFit(mdIn, mdOut, anim, clipLength, haveLength);
+    const double seqExtra = seqCues.empty() ? 0.0 : inEndFrame - (anim.startTime + inSpan);
+    const rta::FitReport fit =
+        rta::checkFit(mdIn, mdOut, anim, clipLength, haveLength, seqExtra);
     _fitOk.store(fit.ok(), std::memory_order_relaxed);
 
     // Publish for the overlay, which is where these are actually legible.
@@ -1245,6 +1282,14 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     w.clipTooShort = !fit.ok();
     w.referenceMismatch = useSeg->refStatus == rta::RefStatus::Failed;
     w.referenceMessage = useSeg->refMessage;
+    if (!seqDropped.empty()) {
+      // Named, not just counted: the user has to find it in a string to fix it.
+      w.sequenceMessage = "cue " + rta::formatSequence({seqDropped.front()}) + " ignored" +
+                          (seqDropped.size() > 1
+                               ? " (and " + std::to_string(seqDropped.size() - 1) + " more)"
+                               : std::string()) +
+                          " - a later frame must start a later element";
+    }
     rta::setWarningState(this, w);
 
     // Publish what detection measured, so the overlay can show it and ticking
@@ -1259,6 +1304,19 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     // union box would catch whatever sits between the dashes too.
     const std::vector<rta::Group>& shown =
         useSeg->linkMembers.empty() ? useSeg->groups : useSeg->linkMembers;
+    // Reveal position of each published unit, so a click in the sequencer can be
+    // turned into an element number. Looked up by character index, because with
+    // links the units published are the members and each takes its group's place.
+    std::vector<int> rankOfChar;
+    if (useSeg == segIn.get() && seqRank.size() == useSeg->groups.size()) {
+      for (size_t gi = 0; gi < useSeg->groups.size(); ++gi) {
+        for (int ci : useSeg->groups[gi].glyphIndices) {
+          if (ci < 0) continue;
+          if (size_t(ci) >= rankOfChar.size()) rankOfChar.resize(size_t(ci) + 1, -1);
+          rankOfChar[size_t(ci)] = seqRank[gi];
+        }
+      }
+    }
     a.units.reserve(shown.size());
     for (const rta::Group& g : shown) {
       rta::DetectedUnit u;
@@ -1272,6 +1330,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       u.glyphStarts = g.glyphStarts;
       u.glyphIndices = g.glyphIndices;
       u.linkGroup = g.linkId;
+      u.rank = (g.glyphIndex >= 0 && size_t(g.glyphIndex) < rankOfChar.size())
+                   ? rankOfChar[size_t(g.glyphIndex)]
+                   : -1;
       a.units.push_back(std::move(u));
     }
     // Timing, for the overlay's timeline. Only what the overlay cannot know
@@ -1287,6 +1348,9 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     a.outUsable = outUsable;
     a.inSpan = inSpan;
     a.outSpan = outSpan;
+    a.sequenced = !seqCues.empty();
+    a.inStartFrame = inStartFrame;
+    a.inEndFrame = inEndFrame;
     rta::setAnalysisState(this, a);
   }
 
@@ -1542,6 +1606,33 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
         "add them, drag a box to add everything inside it; click a linked element to take "
         "it out again; click empty space to finish the group so the next click starts a "
         "new one. Needs Show Detection on.");
+    p->setDefault(false);
+    addParamUI(page, p);
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("sequence");
+    p->setLabels("Sequence", "Sequence", "Sequence");
+    p->setHint(
+        "Cues: on this frame, this element starts. \"0:1, 60:3\" starts element 1 at frame "
+        "0 and element 3 at frame 60 -- element 2 follows element 1 by the normal stagger, "
+        "then everything holds until 60. Frames are clip frames, the same as Start (frames); "
+        "elements are numbered in reveal order, the same as Start At Element. A later frame "
+        "must name a later element; a cue that does not is ignored and flagged over the "
+        "viewer. What a cut does on the Edit page, for a Fusion comp where there is nothing "
+        "to cut. Empty leaves the reveal exactly as it is. Easier by clicking: see Sequence "
+        "By Clicking.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("sequencePick");
+    p->setLabels("Sequence By Clicking", "Sequencer", "Sequence By Clicking");
+    p->setHint(
+        "Turns the viewer into a sequencer. Park the playhead, click an element, and it is "
+        "cued to start on that frame. Click a cued element at another frame to move its cue "
+        "there; click it on its own frame to remove it. A click that would put elements out "
+        "of order is refused, with the reason shown, and nothing is written. Elements are "
+        "numbered in reveal order.");
     p->setDefault(false);
     addParamUI(page, p);
   }
