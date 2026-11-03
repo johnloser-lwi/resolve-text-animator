@@ -689,8 +689,12 @@ Segmentation segment(const ImageView& src, const DetectParams& params) {
       g.sx2 = std::max(g.sx2, comps[ids[i]].sx2);
       g.labels.push_back(ids[i]);
     }
-    std::sort(glyphs.begin(), glyphs.end(),
-              [](const Glyph& a, const Glyph& b) { return a.sx1 < b.sx1; });
+    // Stable, because pieces can share a left edge -- an i and its dot in Object
+    // mode -- and std::sort breaks that tie differently in each standard library.
+    // Scan order is what MSVC kept, so element numbers, and every override that
+    // names them, mean the same thing on every platform.
+    std::stable_sort(glyphs.begin(), glyphs.end(),
+                     [](const Glyph& a, const Glyph& b) { return a.sx1 < b.sx1; });
   }
 
   // 8. Word breaks from gap statistics.

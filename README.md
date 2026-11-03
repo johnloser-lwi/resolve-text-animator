@@ -30,14 +30,23 @@ is one readback per *title change* rather than one per frame. To detect that
 change cheaply, the alpha fingerprint is reduced on-device, so the steady-state
 per-frame cost off the GPU is an 8-byte readback.
 
+On **macOS** there is no CUDA, so the plugin renders on the CPU — the same
+compositor `segtest` verifies — and Resolve moves each frame to system memory
+for it. Expect slower playback than on Windows until a Metal path exists.
+
 ## Requirements
 
 - DaVinci Resolve **Studio** (the free version does not load third-party OFX)
-- Windows x64, Visual Studio 18 Community (C++ toolset)
-- Optional: CUDA toolkit (12.8+ for RTX 50-series). Without it the plugin still
-  builds and runs, CPU-only.
+- **Windows:** x64, Visual Studio 18 Community (C++ toolset). Optional: CUDA
+  toolkit (12.8+ for RTX 50-series); without it the plugin still builds and
+  runs, CPU-only.
+- **macOS:** 11 or later, Xcode command line tools (`xcode-select --install`),
+  CMake 3.20+ (`brew install cmake`). Ninja is used if installed. The build is
+  universal — Apple silicon and Intel.
 
 ## Build
+
+Windows:
 
 ```powershell
 git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git external/openfx
@@ -49,7 +58,22 @@ Produces `build\bundle\TextAnimator.ofx.bundle` and `build\segtest.exe`.
 `build.ps1` uses the CMake and Ninja bundled with VS 18 rather than the system
 CMake, which predates VS 18 and cannot generate for it.
 
+`.\build.ps1 -NoCuda` builds the CPU-only plugin — the Mac's render path — into
+`build-cpu\`, so that path can be tried in Resolve without a Mac.
+
+macOS:
+
+```bash
+./build.sh
+```
+
+Fetches the OpenFX SDK at the same commit the Windows build uses, then produces
+`build/bundle/TextAnimator.ofx.bundle` (ad-hoc signed — Apple silicon will not
+load unsigned code) and `build/segtest`.
+
 ## Install
+
+Windows:
 
 ```powershell
 .\install.ps1
@@ -57,7 +81,20 @@ CMake, which predates VS 18 and cannot generate for it.
 
 Prompts for elevation, copies the bundle to
 `C:\Program Files\Common Files\OFX\Plugins`, and reminds you to restart Resolve.
-Re-run after each rebuild.
+Re-run after each rebuild. Add `-NoCuda` to install the `build-cpu\` bundle.
+
+macOS:
+
+```bash
+./install.sh
+```
+
+Copies the bundle to `/Library/OFX/Plugins`, asking for your password through
+`sudo`. `--build` builds first; `--force` quits Resolve first. As on Windows,
+Resolve only finds plugins at launch.
+
+Presets live in `Documents/TextAnimator/Presets` on both platforms, and a
+`.tapreset` file moves between them unchanged.
 
 ## Use
 
@@ -310,6 +347,8 @@ Tune detection here, not in Resolve — the loop is seconds instead of a relaunc
 | `src/cuda_compositor.*` | the same compositing as CUDA kernels, plus on-device hashing |
 | `src/diagnostics.*` | detection overlay |
 | `src/plugin.cpp` | OFX glue: params, render dispatch |
+| `src/preset_io*` | preset folder and the native Save/Load dialogs (Win32, AppKit) |
+| `mac/` | the bundle's `Info.plist` template |
 | `src/interact/` | viewer overlay: draw-suite wrappers and the curve editor |
 | `tools/segtest.cpp` | standalone harness |
 

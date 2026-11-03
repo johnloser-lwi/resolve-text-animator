@@ -15,13 +15,18 @@ param(
     # Close Resolve automatically instead of aborting.
     [switch]$Force,
 
+    # Install the CPU-only build from build-cpu\ (build.ps1 -NoCuda) -- the
+    # render path the Mac build uses.
+    [switch]$NoCuda,
+
     # Set internally when relaunching elevated; keeps the new window open.
     [switch]$Elevated
 )
 
 $ErrorActionPreference = 'Stop'
 $repo   = $PSScriptRoot
-$bundle = Join-Path $repo 'build\bundle\TextAnimator.ofx.bundle'
+$buildDir = $(if ($NoCuda) { 'build-cpu' } else { 'build' })
+$bundle = Join-Path $repo "$buildDir\bundle\TextAnimator.ofx.bundle"
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok  ($msg) { Write-Host "    $msg" -ForegroundColor Green }
@@ -53,7 +58,7 @@ $needsElevation = -not (Test-Writable $Destination)
 # admin account, and every later non-elevated build then fails to overwrite it.
 if ($Build -and -not $isAdmin) {
     Write-Step "Building..."
-    & (Join-Path $repo 'build.ps1')
+    & (Join-Path $repo 'build.ps1') -NoCuda:$NoCuda
 }
 
 # --- Elevate if needed -------------------------------------------------------
@@ -68,6 +73,7 @@ if ($needsElevation -and -not $isAdmin) {
         '-Elevated'
     )
     if ($Force) { $argList += '-Force' }
+    if ($NoCuda) { $argList += '-NoCuda' }
 
     try {
         $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList `

@@ -3,9 +3,13 @@
 # The system CMake (3.28) predates Visual Studio 18, and VS 18 Community is the
 # only install here carrying a C++ toolset -- so we drive VS 18's own bundled
 # CMake + Ninja from inside its developer environment instead.
+#
+# -NoCuda builds the CPU-only plugin, the same render path the Mac build uses,
+# into build-cpu\ so it never overwrites the normal build.
 param(
   [string]$Config = "Release",
-  [switch]$Clean
+  [switch]$Clean,
+  [switch]$NoCuda
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,7 +25,8 @@ foreach ($p in @($vcvars, $cmake, $ninja)) {
   if (-not (Test-Path $p)) { throw "Not found: $p" }
 }
 
-$build = Join-Path $root "build"
+$build = Join-Path $root $(if ($NoCuda) { "build-cpu" } else { "build" })
+$cuda = $(if ($NoCuda) { "OFF" } else { "ON" })
 if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 
 # vcvars64 only exports into a cmd session, so configure and build must both
@@ -33,7 +38,7 @@ set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"
 call "$vcvars" >nul || exit /b 1
 "$cmake" -S "$root" -B "$build" -G Ninja ^
   -DCMAKE_MAKE_PROGRAM="$ninja" ^
-  -DCMAKE_BUILD_TYPE=$Config || exit /b 1
+  -DCMAKE_BUILD_TYPE=$Config -DRTA_ENABLE_CUDA=$cuda || exit /b 1
 "$cmake" --build "$build" || exit /b 1
 "@
 

@@ -10,6 +10,23 @@
 namespace rta {
 namespace {
 
+// std::shuffle's algorithm is left to each standard library, so one seed gave a
+// different Random order on Mac than on Windows. This is MSVC's, written out --
+// Fisher-Yates over Lemire's bounded draw from 32-bit mt19937 output -- so the
+// orders saved in Windows projects stay put and every platform agrees with them.
+void shuffleLikeMsvc(std::vector<int>& v, std::mt19937& rng) {
+  for (size_t target = 1; target < v.size(); ++target) {
+    const uint64_t bound = uint64_t(target) + 1;
+    uint64_t product = uint64_t(uint32_t(rng())) * bound;
+    if ((product & 0xffffffffu) < bound) {
+      const uint64_t threshold = ((uint64_t(1) << 32) - bound) % bound;
+      while ((product & 0xffffffffu) < threshold) product = uint64_t(uint32_t(rng())) * bound;
+    }
+    const size_t off = size_t(product >> 32);
+    if (off != target) std::swap(v[target], v[off]);
+  }
+}
+
 // One coordinate of a cubic bezier from 0 to 1 with the given control values.
 inline float bezierAt(float t, float p1, float p2) {
   const float u = 1.0f - t;
@@ -191,7 +208,7 @@ std::vector<int> revealOrder(const std::vector<Group>& groups, int lineCount,
       std::vector<int> shuffled(n);
       std::iota(shuffled.begin(), shuffled.end(), 0);
       std::mt19937 rng(uint32_t(p.randomSeed) * 2654435761u + 1u);
-      std::shuffle(shuffled.begin(), shuffled.end(), rng);
+      shuffleLikeMsvc(shuffled, rng);
       for (size_t r = 0; r < n; ++r) rank[seq[r]] = shuffled[r];
       break;
     }

@@ -1,7 +1,8 @@
 // Where preset files live, and the dialogs that find them.
 //
-// Separated from preset.cpp because everything here is Win32 and none of it can
-// be exercised without a desktop. Keeping the schema and the parser free of that
+// Separated from preset.cpp because everything here is platform code (Win32,
+// or AppKit in preset_io_mac.mm) and none of it can be exercised without a
+// desktop. Keeping the schema and the parser free of that
 // is what lets them be tested offline.
 #pragma once
 
@@ -9,9 +10,9 @@
 
 namespace rta {
 
-// Documents\TextAnimator\Presets, created on demand -- somewhere the user can
-// browse to, copy from and back up. Falls back to LocalAppData if Documents
-// cannot be resolved.
+// Documents\TextAnimator\Presets (~/Documents/... on macOS), created on demand
+// -- somewhere the user can browse to, copy from and back up. On Windows, falls
+// back to LocalAppData if Documents cannot be resolved.
 std::string presetFolder();
 
 // Native Save/Open dialogs. Return an empty string if the user cancels, which

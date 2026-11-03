@@ -10,6 +10,14 @@
 
 #include <commdlg.h>
 #include <shlobj.h>
+#else
+#include <sys/stat.h>
+
+#include <cstdlib>
+#endif
+
+#ifdef __APPLE__
+#include "preset_io_mac.h"
 #endif
 
 namespace rta {
@@ -29,6 +37,13 @@ void makeDirs(const std::string& path) {
       if (i < 3) continue;  // skip the drive root
       CreateDirectoryA(path.substr(0, i).c_str(), nullptr);
     }
+  }
+}
+#else
+// Same job, POSIX: every missing level, and an existing one is not an error.
+void makeDirs(const std::string& path) {
+  for (size_t i = 1; i <= path.size(); ++i) {
+    if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755);
   }
 }
 #endif
@@ -51,7 +66,10 @@ std::string presetFolder() {
   return dir;
 #else
   const char* home = std::getenv("HOME");
-  return home ? std::string(home) + "/TextAnimator/Presets" : std::string();
+  if (!home || !home[0]) return "";
+  const std::string dir = std::string(home) + "/Documents/TextAnimator/Presets";
+  makeDirs(dir);
+  return dir;
 #endif
 }
 
@@ -85,6 +103,9 @@ std::string askSavePath(const std::string& suggestedName) {
   OPENFILENAMEA ofn = baseDialog(buf, sizeof(buf), presetFolder(), kFilter);
   ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
   return GetSaveFileNameA(&ofn) ? std::string(buf) : std::string();
+#elif defined(__APPLE__)
+  return macAskSavePath(presetFolder(),
+                        (suggestedName.empty() ? "preset" : suggestedName) + ".tapreset");
 #else
   (void)suggestedName;
   return "";
@@ -98,6 +119,8 @@ std::string askOpenPath() {
   OPENFILENAMEA ofn = baseDialog(buf, sizeof(buf), presetFolder(), kFilter);
   ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
   return GetOpenFileNameA(&ofn) ? std::string(buf) : std::string();
+#elif defined(__APPLE__)
+  return macAskOpenPath(presetFolder());
 #else
   return "";
 #endif

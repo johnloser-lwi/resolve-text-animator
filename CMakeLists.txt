@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
+
+# macOS: one universal binary, so the same bundle loads in Resolve on Apple
+# silicon and on Intel. Both must be set before project(); other platforms
+# ignore them, and -D on the command line still wins over these defaults.
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures to build")
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Oldest macOS the plugin loads on")
+
 project(ResolveTextAnimator VERSION 1.0 LANGUAGES CXX)
+if(APPLE)
+  enable_language(OBJCXX)  # the native preset dialogs, src/preset_io_mac.mm
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -62,11 +72,23 @@ if(MSVC)
   target_compile_definitions(TextAnimator PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+if(APPLE)
+  target_sources(TextAnimator PRIVATE src/preset_io_mac.mm)
+  set_source_files_properties(src/preset_io_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_link_libraries(TextAnimator PRIVATE "-framework AppKit" "-framework UniformTypeIdentifiers")
+endif()
+
 # ------------------------------------------------------------------- CUDA path
 # Optional: without a CUDA toolkit the plugin still builds and runs on the CPU.
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
+# Never on macOS, which has no CUDA; there the CPU path is the render path.
+# -DRTA_ENABLE_CUDA=OFF builds that same CPU-only plugin on Windows, which is
+# the way to rehearse the Mac render path without a Mac.
+option(RTA_ENABLE_CUDA "Build the CUDA render path when a toolkit is found" ON)
+if(RTA_ENABLE_CUDA AND NOT APPLE)
+  include(CheckLanguage)
+  check_language(CUDA)
+endif()
+if(RTA_ENABLE_CUDA AND NOT APPLE AND CMAKE_CUDA_COMPILER)
   # Must be set BEFORE enable_language: that call installs a default (75 here),
   # after which a "if(NOT DEFINED ...)" guard silently never fires and the
   # plugin ships PTX-only code that the driver has to JIT.
@@ -101,16 +123,35 @@ if(CMAKE_CUDA_COMPILER)
   endif()
 else()
   target_compile_definitions(TextAnimator PRIVATE RTA_WITH_CUDA=0)
-  message(STATUS "CUDA toolkit not found - building CPU-only")
+  message(STATUS "CUDA off or not found - building CPU-only")
 endif()
 
-# Assemble the .ofx.bundle next to the binary.
-set(BUNDLE ${CMAKE_BINARY_DIR}/bundle/TextAnimator.ofx.bundle/Contents/Win64)
+# Assemble the .ofx.bundle next to the binary. The folder under Contents names
+# the platform, and an OFX host only looks in the one that matches its own.
+set(BUNDLE_ROOT ${CMAKE_BINARY_DIR}/bundle/TextAnimator.ofx.bundle)
+if(APPLE)
+  set(BUNDLE ${BUNDLE_ROOT}/Contents/MacOS)
+elseif(WIN32)
+  set(BUNDLE ${BUNDLE_ROOT}/Contents/Win64)
+else()
+  set(BUNDLE ${BUNDLE_ROOT}/Contents/Linux-x86-64)
+endif()
 add_custom_command(TARGET TextAnimator POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory ${BUNDLE}
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:TextAnimator> ${BUNDLE}/TextAnimator.ofx
   COMMENT "Assembling TextAnimator.ofx.bundle"
 )
+if(APPLE)
+  configure_file(mac/Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
+  # Ad-hoc signed as a whole bundle after the copy. Apple silicon refuses to
+  # load unsigned arm64 code, and the linker's own signature covers only the
+  # binary, not the Info.plist beside it.
+  add_custom_command(TARGET TextAnimator POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/Info.plist ${BUNDLE_ROOT}/Contents/Info.plist
+    COMMAND codesign --force --sign - ${BUNDLE_ROOT}
+    COMMENT "Signing TextAnimator.ofx.bundle (ad hoc)"
+  )
+endif()
 
 # ---------------------------------------------------------------- test harness
 add_executable(segtest tools/segtest.cpp)
