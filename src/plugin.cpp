@@ -27,6 +27,9 @@
 #define kPluginName "Text Animator"
 #define kPluginGrouping "Text"
 #define kPluginIdentifier "com.johnlwi.TextAnimator"
+// Optional second input whose alpha replaces the source's for detection only.
+// Not called "Mask", and not declared one, because it never masks the output.
+#define kDetectionMaskClip "DetectionMask"
 #define kPluginDescription                                                         \
   "Reveals rendered text one character, word or line at a time by detecting "      \
   "glyphs directly from the alpha channel. Apply to a title clip on its own "      \
@@ -220,6 +223,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   explicit TextAnimatorPlugin(OfxImageEffectHandle handle) : OFX::ImageEffect(handle) {
     _dstClip = fetchClip(kOfxImageEffectOutputClipName);
     _srcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
+    if (getContext() == OFX::eContextGeneral) _maskClip = fetchClip(kDetectionMaskClip);
 
     _groupMode = fetchChoiceParam("groupMode");
     _animation = fetchChoiceParam("animation");
@@ -751,6 +755,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
  private:
   OFX::Clip* _dstClip = nullptr;
   OFX::Clip* _srcClip = nullptr;
+  OFX::Clip* _maskClip = nullptr;  // General context (Fusion) only
 
   OFX::ChoiceParam *_groupMode, *_animation, *_easing, *_order, *_lineOrder, *_distanceUnits;
   OFX::IntParam *_randomSeed, *_minBlobArea, *_bridgeRadius, *_blurSamples;
@@ -976,12 +981,43 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   }
 
   // --------------------------------------------------------------- analysis
+  // With a Detection Mask connected, ITS alpha is what gets measured, and
+  // Source only supplies the pixels that move. Every unit then comes from the
+  // mask's own shapes -- a bar drawn over a word is that word, whatever its
+  // letters would have said -- and Source's alpha is never looked at.
+  //
+  // Each input arrives cropped to its own bounds, so the mask is read over the
+  // part of it that overlaps the source region and placed back by the offset.
+  // The rest of the mask has no source pixels under it to move.
+  std::unique_ptr<OFX::Image> mask(
+      (_maskClip && _maskClip->isConnected()) ? _maskClip->fetchImage(args.time) : nullptr);
+  const bool useMask = mask.get() && mask->getPixelDepth() == OFX::eBitDepthFloat &&
+                       mask->getPixelComponents() == OFX::ePixelComponentRGBA;
+  rta::ImageView maskView;
+  int maskX = 0, maskY = 0;  // its top-left within srcView, top-down
+  if (useMask) {
+    const OfxRectI mb = mask->getBounds();
+    const OfxRectI overlap{std::max(mb.x1, common.x1), std::max(mb.y1, common.y1),
+                           std::min(mb.x2, common.x2), std::min(mb.y2, common.y2)};
+    if (overlap.x2 > overlap.x1 && overlap.y2 > overlap.y1) {
+      maskView = makeView(mask.get(), overlap);
+      maskX = overlap.x1 - common.x1;
+      maskY = common.y2 - overlap.y2;
+    }
+  }
+  // The picture detection measures and the fingerprint that says when to
+  // measure it again. Source's, unless the mask replaces it.
+  const rta::ImageView& measured = useMask ? maskView : srcView;
+
   uint64_t hash = 0;
+  if (!measured.valid()) {
+    hash = 0;  // a mask that misses the text entirely: nothing to fingerprint
+  } else
 #if RTA_WITH_CUDA
   if (useCuda) {
     bool ok = false;
     std::lock_guard<std::mutex> lock(_cache.mutex);
-    hash = rta::cudaHashAlpha(srcView.data, srcView.rowStride, srcView.width, srcView.height,
+    hash = rta::cudaHashAlpha(measured.data, measured.rowStride, measured.width, measured.height,
                               det.alphaThreshold, _cache.scratch, args.pCudaStream, &ok);
     if (!ok) {
       return;
@@ -989,7 +1025,15 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   } else
 #endif
   {
-    hash = rta::hashAlpha(srcView, det.alphaThreshold);
+    hash = rta::hashAlpha(measured, det.alphaThreshold);
+  }
+  if (useMask) {
+    // Same shapes in a different place are different units, and switching
+    // between mask and source must never reuse the other's analysis.
+    for (const uint64_t v : {uint64_t(0x6d61736bu), uint64_t(uint32_t(maskX)),
+                             uint64_t(uint32_t(maskY)), uint64_t(uint32_t(srcView.width)),
+                             uint64_t(uint32_t(srcView.height))})
+      hash = (hash ^ v) * 1099511628211ull;
   }
 
   std::shared_ptr<const rta::Segmentation> segIn, segOut, segChar;
@@ -1018,20 +1062,29 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     if (needIn || needOut || needChar) {
       // One readback serves both modes. This is the only full-frame transfer in
       // the plugin, and it happens per title change rather than per frame.
+      // With a mask that is the mask's overlap instead -- usually far smaller --
+      // and Source is not read back at all.
       std::vector<float> host;
-      rta::ImageView hostView = srcView;
+      rta::ImageView hostView = measured;
 #if RTA_WITH_CUDA
-      if (useCuda) {
-        if (!rta::cudaDownload(host, srcView.data, srcView.rowStride, srcView.width,
-                               srcView.height)) {
+      if (useCuda && measured.valid()) {
+        if (!rta::cudaDownload(host, measured.data, measured.rowStride, measured.width,
+                               measured.height)) {
           return;
         }
         const std::ptrdiff_t absStride =
-            srcView.rowStride < 0 ? -srcView.rowStride : srcView.rowStride;
-        hostView = rta::ImageView{host.data() + absStride * (srcView.height - 1), srcView.width,
-                                  srcView.height, -absStride};
+            measured.rowStride < 0 ? -measured.rowStride : measured.rowStride;
+        hostView = rta::ImageView{host.data() + absStride * (measured.height - 1), measured.width,
+                                  measured.height, -absStride};
       }
 #endif
+      // Labels index Source's pixels, so the mask is measured in Source's frame.
+      std::vector<float> placed;
+      if (useMask) {
+        placed = rta::placeAlpha(hostView, maskX, maskY, srcView.width, srcView.height);
+        hostView = rta::ImageView{placed.data(), srcView.width, srcView.height,
+                                  std::ptrdiff_t(srcView.width) * 4};
+      }
       auto build = [&](rta::GroupMode m) {
         rta::DetectParams d = det;
         d.mode = m;
@@ -1048,6 +1101,15 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       segChar = _cache.byMode[int(rta::GroupMode::Character)];
   }
   if (!segIn || segIn->empty()) {
+    if (useMask) {
+      // An empty Source is self-explanatory; text that vanishes because the
+      // mask beside it found nothing is not. Say so, and drop the boxes from
+      // the last mask that did find something.
+      rta::WarningState w;
+      w.maskEmpty = true;
+      rta::setWarningState(this, w);
+      rta::clearAnalysisState(this);
+    }
     return;
   }
 
@@ -1481,12 +1543,33 @@ void TextAnimatorFactory::describe(OFX::ImageEffectDescriptor& desc) {
   rta::registerOverlay(desc);
 }
 
-void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum) {
+void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
+                                            OFX::ContextEnum context) {
   OFX::ClipDescriptor* src = desc.defineClip(kOfxImageEffectSimpleSourceClipName);
   src->addSupportedComponent(OFX::ePixelComponentRGBA);
   src->setTemporalClipAccess(false);
   src->setSupportsTiles(false);
   src->setIsMask(false);
+
+  if (context == OFX::eContextGeneral) {
+    // Detection reads this input's alpha instead of Source's; the picture still
+    // comes from Source. General context only, which is what Fusion uses -- the
+    // Edit page has nowhere to connect a second input anyway.
+    //
+    // Deliberately NOT setIsMask: a host may treat a mask clip as an effect mask
+    // and blend the output by it itself, which would cut the moving letters off
+    // at the static bars. Optional, so with nothing connected the effect is
+    // exactly what it was. RGBA only, like Shatter's map input, so the host
+    // converts a single-channel mask and every path here reads alpha the same
+    // way.
+    OFX::ClipDescriptor* mask = desc.defineClip(kDetectionMaskClip);
+    mask->setLabels("Detection Mask", "Mask", "Detection Mask");
+    mask->addSupportedComponent(OFX::ePixelComponentRGBA);
+    mask->setTemporalClipAccess(false);
+    mask->setSupportsTiles(false);
+    mask->setIsMask(false);
+    mask->setOptional(true);
+  }
 
   OFX::ClipDescriptor* dst = desc.defineClip(kOfxImageEffectOutputClipName);
   dst->addSupportedComponent(OFX::ePixelComponentRGBA);

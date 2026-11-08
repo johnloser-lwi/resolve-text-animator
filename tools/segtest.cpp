@@ -113,6 +113,7 @@ int main(int argc, char** argv) {
                  "  detection: --gap N --alpha N --bridge N\n"
                  "             --pad F --minmark F   (relative: fractions of letter height)\n"
                  "             --reftext \"THE WORDS THE TITLE SAYS\"\n"
+                 "             --mask m.png [--maskcrop]   (detect on m.png's alpha)\n"
                  "  animation: --strip N --at FRAC --stagger F --dur F --slide PX\n"
                  "             --angle DEG --easing 0-4 --order 0-4 --lineorder 0|1\n"
                  "             --manual \"3,0,7\"  --from N --to N  --isolate\n"
@@ -129,6 +130,8 @@ int main(int argc, char** argv) {
   int revealFirst = 1, revealLast = 0;
   bool isolate = false;
   std::string seqText;
+  std::string maskPath;
+  bool maskCrop = false;
   int strip = 0;
   double atFraction = -1.0;
   double step = 0.0;
@@ -174,6 +177,10 @@ int main(int argc, char** argv) {
       p.referenceText = next();
     } else if (!std::strcmp(a, "--seq")) {
       seqText = next();
+    } else if (!std::strcmp(a, "--mask")) {
+      maskPath = next();
+    } else if (!std::strcmp(a, "--maskcrop")) {
+      maskCrop = true;
     } else if (!std::strcmp(a, "--link")) {
       // "3 7 12; 5 9" -- groups by ';', members by anything else.
       const char* list = next();
@@ -304,7 +311,46 @@ int main(int argc, char** argv) {
   stbi_image_free(png);
 
   rta::ImageView view{buf.data(), w, h, std::ptrdiff_t(w) * 4};
-  const rta::Segmentation seg = rta::segment(view, p);
+
+  // --mask: detection measures that image's alpha instead, as the plugin does
+  // with a Detection Mask connected, while the picture still comes from
+  // <in.png>. --maskcrop hands it over cropped to its own ink, the way Fusion
+  // crops an input to its region of definition, so the placement is exercised
+  // with a real offset rather than always at (0,0).
+  std::vector<float> maskBuf, placed;
+  rta::ImageView measured = view;
+  if (!maskPath.empty()) {
+    int mw = 0, mh = 0, mn = 0;
+    unsigned char* mpng = stbi_load(maskPath.c_str(), &mw, &mh, &mn, 4);
+    if (!mpng) {
+      std::fprintf(stderr, "failed to read %s: %s\n", maskPath.c_str(), stbi_failure_reason());
+      return 1;
+    }
+    int bx1 = 0, by1 = 0, bx2 = mw, by2 = mh;
+    if (maskCrop) {
+      bx1 = mw, by1 = mh, bx2 = 0, by2 = 0;
+      for (int y = 0; y < mh; ++y)
+        for (int x = 0; x < mw; ++x)
+          if (mpng[(size_t(y) * mw + x) * 4 + 3]) {
+            bx1 = std::min(bx1, x), by1 = std::min(by1, y);
+            bx2 = std::max(bx2, x + 1), by2 = std::max(by2, y + 1);
+          }
+      if (bx2 <= bx1) bx1 = by1 = bx2 = by2 = 0;
+    }
+    const int cw = bx2 - bx1, ch = by2 - by1;
+    maskBuf.assign(size_t(std::max(cw, 0)) * std::max(ch, 0) * 4, 0.0f);
+    for (int y = 0; y < ch; ++y)
+      for (int x = 0; x < cw; ++x)
+        maskBuf[(size_t(y) * cw + x) * 4 + 3] =
+            mpng[(size_t(y + by1) * mw + (x + bx1)) * 4 + 3] / 255.0f;
+    stbi_image_free(mpng);
+    const rta::ImageView mv{maskBuf.data(), cw, ch, std::ptrdiff_t(cw) * 4};
+    placed = rta::placeAlpha(mv, bx1, by1, w, h);
+    measured = rta::ImageView{placed.data(), w, h, std::ptrdiff_t(w) * 4};
+    std::printf("mask: %s  %dx%d placed at %d,%d\n", maskPath.c_str(), cw, ch, bx1, by1);
+  }
+
+  const rta::Segmentation seg = rta::segment(measured, p);
 
   std::printf("%dx%d  lines=%d  groups=%zu  slant=%.1fdeg\n", w, h, seg.lineCount,
               seg.groups.size(), seg.slantDegrees);
@@ -353,7 +399,7 @@ int main(int argc, char** argv) {
     if (sp.needsPerCharacter()) {
       rta::DetectParams cp = p;
       cp.mode = rta::GroupMode::Character;
-      charSeg = rta::segment(view, cp);
+      charSeg = rta::segment(measured, cp);
     }
     strippedBuf = renderStrip(view, seg, anim, stage, strip, atFraction, step, ow, oh, sp,
                               sp.needsPerCharacter() ? &charSeg : nullptr, revealFirst, revealLast,

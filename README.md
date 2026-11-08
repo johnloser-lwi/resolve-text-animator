@@ -72,6 +72,31 @@ unit over the dimmed static text, which tells you whether detection is right
 independently of whether the timing is right. If words are mis-split, adjust
 **Word Gap** (lower splits more eagerly, higher merges more).
 
+### Detection Mask (Fusion)
+
+In Fusion the node has a second, optional input, **Detection Mask**. Connect
+something to it and detection measures *that* image's alpha instead of the
+text's: every shape in the mask becomes an element, and the text pixels under it
+move with it. The picture itself still comes from the main input.
+
+This bypasses detection's guesswork entirely. Draw one bar over each word — or
+over a whole line, or half a word — and that is exactly how the text is grouped,
+however its letters are spaced. Use **Object** mode, so each separate shape is
+one element; the other modes measure gaps between the shapes as if they were
+letters.
+
+- Text outside every shape is **not drawn**, even once settled. Make the shapes
+  generous, or raise Character Padding, which grows them.
+- Alpha Threshold applies to the mask. Other detection settings measure the
+  shapes, so "% of text height" means the shapes' height.
+- The mask may be cropped to its own region (Fusion crops inputs to their
+  domain of definition); it is placed by its position, not assumed to fill the
+  frame.
+- A static mask is analysed once. An animated one is re-analysed whenever it
+  changes, and its element numbers can change with it.
+- With nothing connected the node behaves exactly as before. The Edit page has
+  no second input, so this is Fusion only.
+
 ### Parameters
 
 | | |
@@ -292,7 +317,9 @@ build\segtest.exe testdata\single.png strip.png --mode word --strip 8 --stagger 
 
 Options: `--mode char|word|line`, `--gap`, `--alpha`, `--bridge`, `--minarea`,
 `--strip`, `--stagger`, `--dur`, `--slide`, `--angle`, `--easing`, `--order`,
-`--lineorder`, `--rotate`, `--blur`, `--mblur`, `--shutter`, `--samples`, `--fps`.
+`--lineorder`, `--rotate`, `--blur`, `--mblur`, `--shutter`, `--samples`, `--fps`,
+`--mask m.png` (detect on that image's alpha, as with a Detection Mask) and
+`--maskcrop` (hand the mask over cropped to its shapes, as Fusion would).
 
 Note the harness renders with the **CPU** compositor. The CUDA kernels mirror it
 but are a separate implementation, so a harness render is not proof the GPU path
