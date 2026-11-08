@@ -32,9 +32,13 @@ struct WarningState {
   std::string referenceMessage;
   // Cues in a typed Sequence that could not be honoured. Empty when all could.
   std::string sequenceMessage;
+  // A Detection Mask is connected but nothing in it is above Alpha Threshold
+  // where the text is, so there is nothing to animate and nothing is drawn.
+  bool maskEmpty = false;
 
   bool any() const {
-    return sourceOffset || clipTooShort || referenceMismatch || !sequenceMessage.empty();
+    return sourceOffset || clipTooShort || referenceMismatch || !sequenceMessage.empty() ||
+           maskEmpty;
   }
 };
 

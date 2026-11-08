@@ -251,4 +251,15 @@ Segmentation segment(const ImageView& src, const DetectParams& params);
 // cached Segmentation is still valid. Subsamples, so it is O(pixels/64).
 uint64_t hashAlpha(const ImageView& src, float threshold);
 
+// What detection measures when a Detection Mask stands in for the source's
+// alpha: a width x height RGBA image, top-down with a stride of width * 4,
+// whose alpha is `mask` placed with its top-left pixel at (ox, oy) and zero
+// wherever the mask does not reach. Any part of the mask outside the frame is
+// dropped. RGB stays zero, because segment() reads alpha and nothing else.
+//
+// The offset is the point: a host is free to hand over each input cropped to
+// its own region of definition -- Fusion does -- so a mask of bars arrives as
+// just the bars, and has to be put back where they sit over the text.
+std::vector<float> placeAlpha(const ImageView& mask, int ox, int oy, int width, int height);
+
 }  // namespace rta

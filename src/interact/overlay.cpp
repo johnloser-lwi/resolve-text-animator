@@ -154,6 +154,13 @@ class CurveInteract : public OFX::OverlayInteract {
     if (!w.sequenceMessage.empty()) {
       Text(c, "(!) SEQUENCE - " + w.sequenceMessage + ".", x, y,
            kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
+      y -= c.sy(22.0);
+    }
+    if (w.maskEmpty) {
+      Text(c,
+           "(!) DETECTION MASK IS EMPTY - nothing in it is above Alpha Threshold over the text, "
+           "so nothing is drawn.",
+           x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
     }
   }
 

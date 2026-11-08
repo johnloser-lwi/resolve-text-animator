@@ -368,6 +368,19 @@ uint64_t hashAlpha(const ImageView& src, float threshold) {
   return h;
 }
 
+std::vector<float> placeAlpha(const ImageView& mask, int ox, int oy, int width, int height) {
+  std::vector<float> out(size_t(std::max(0, width)) * size_t(std::max(0, height)) * 4, 0.0f);
+  if (!mask.valid() || width <= 0 || height <= 0) return out;
+  const int x0 = std::max(0, ox), x1 = std::min(width, ox + mask.width);
+  const int y0 = std::max(0, oy), y1 = std::min(height, oy + mask.height);
+  for (int y = y0; y < y1; ++y) {
+    const float* s = mask.row(y - oy);
+    float* d = &out[(size_t(y) * width) * 4];
+    for (int x = x0; x < x1; ++x) d[x * 4 + 3] = s[(x - ox) * 4 + 3];
+  }
+  return out;
+}
+
 Segmentation segment(const ImageView& src, const DetectParams& params) {
   Segmentation seg;
   if (!src.valid()) return seg;
