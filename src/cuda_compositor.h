@@ -78,20 +78,24 @@ class CudaScratch {
   unsigned long long* hashAccum();
 
   // Grow-only device buffer for per-frame transform uploads.
-  void* tapBuffer(size_t bytes);
+  void* tapBuffer(size_t bytes, void* stream);
 
   // Two tiles for the defocus. A separable blur reads one and writes the
   // other, so it needs somewhere to land that is not what it is reading.
-  void* tileBuffer(int which, size_t bytes);
+  void* tileBuffer(int which, size_t bytes, void* stream);
 
   // Grow-only between trims. Without these a tile would keep the largest size
   // ever drawn -- a frame and a quarter, at 4K with heavy blur -- long after
   // the title that needed it had gone. trim() frees a tile far larger than
-  // what was asked for since the last trim; releaseTiles() frees both. Both
-  // free with cudaFree, which waits for the device, so nothing in flight can
-  // still be reading what they free.
-  void trim();
-  void releaseTiles();
+  // what was asked for since the last trim; releaseTiles() frees both.
+  //
+  // Every allocation and free here is stream-ordered where the device allows
+  // (cudaMallocAsync / cudaFreeAsync): the free is queued behind `stream`'s
+  // work rather than waited for. Plain cudaFree waits for the WHOLE device --
+  // the host's own work included -- from inside a render, which is a hang
+  // waiting to happen; this used to be rare, and trimming made it routine.
+  void trim(void* stream);
+  void releaseTiles(void* stream);
 
   size_t bytes() const {
     return tileBytes_[0] + tileBytes_[1] + tapBytes_ + (accum_ ? sizeof(*accum_) : 0);
@@ -108,6 +112,10 @@ class CudaScratch {
   // give it back while the first stays busy.
   size_t peak_[2] = {0, 0};
   bool tried_ = false;
+  int async_ = -1;  // stream-ordered allocation supported: -1 not yet asked
+
+  void* allocate(size_t bytes, void* stream);
+  void release(void* p, void* stream);
 };
 
 // ------------------------------------------------- device memory, shared

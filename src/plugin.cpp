@@ -241,6 +241,10 @@ AnalysisRegistry& analysisRegistry() {
   return r;
 }
 
+// For the readout. An atomic, so the viewer, drawing on the host's UI thread,
+// never queues behind a render for the registry's lock.
+std::atomic<size_t> gAnalysisBytes{0};
+
 // Called after a render has taken what it needs from `mine`, never while
 // holding its lock. Another instance's cache is only ever try-locked: one that
 // is busy is rendering, so it is not idle, and skipping it cannot deadlock.
@@ -258,6 +262,7 @@ void retainAnalysis(AnalysisCache* mine, size_t bytes) {
     it->second->invalidate();
     r.budget.remove(v);
   }
+  gAnalysisBytes.store(r.budget.total());
 }
 
 void releaseAnalysis(AnalysisCache* mine) {
@@ -265,15 +270,12 @@ void releaseAnalysis(AnalysisCache* mine) {
   std::lock_guard<std::mutex> lock(r.mutex);
   r.caches.erase(mine);
   r.budget.remove(mine);
+  gAnalysisBytes.store(r.budget.total());
 }
 
 }  // namespace
 
-size_t rta::hostAnalysisBytes() {
-  AnalysisRegistry& r = analysisRegistry();
-  std::lock_guard<std::mutex> lock(r.mutex);
-  return r.budget.total();
-}
+size_t rta::hostAnalysisBytes() { return gAnalysisBytes.load(); }
 
 namespace {
 

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -396,6 +397,8 @@ bool cudaDownload(std::vector<float>& out, const float* srcDev, std::ptrdiff_t s
 }
 
 CudaScratch::~CudaScratch() {
+  // Only reached if a scratch is ever deleted, which the shared store never
+  // does. cudaFree accepts stream-ordered allocations too.
   if (accum_) cudaFree(accum_);
   if (taps_) cudaFree(taps_);
   for (int i = 0; i < 2; ++i)
@@ -405,14 +408,38 @@ CudaScratch::~CudaScratch() {
   tiles_[0] = tiles_[1] = nullptr;
 }
 
-void CudaScratch::trim() {
+void* CudaScratch::allocate(size_t bytes, void* stream) {
+  if (async_ < 0) {
+    int dev = 0, supported = 0;
+    async_ = cudaGetDevice(&dev) == cudaSuccess &&
+                     cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported, dev) ==
+                         cudaSuccess &&
+                     supported
+                 ? 1
+                 : 0;
+  }
+  void* p = nullptr;
+  const cudaError_t e =
+      async_ ? cudaMallocAsync(&p, bytes, asStream(stream)) : cudaMalloc(&p, bytes);
+  return e == cudaSuccess ? p : nullptr;
+}
+
+void CudaScratch::release(void* p, void* stream) {
+  if (!p) return;
+  if (async_ == 1)
+    cudaFreeAsync(p, asStream(stream));  // after this stream's work; nothing waits
+  else
+    cudaFree(p);  // a device without memory pools: the old way, and its wait
+}
+
+void CudaScratch::trim(void* stream) {
   // Small tiles are not worth the reallocation; large ones four times what the
   // last render needed are. Four, so a blur shrinking frame by frame reallocates
   // a few times on the way down rather than every frame.
   constexpr size_t kWorthFreeing = size_t(64) << 20;
   for (int i = 0; i < 2; ++i) {
     if (tiles_[i] && tileBytes_[i] > kWorthFreeing && tileBytes_[i] > peak_[i] * 4) {
-      cudaFree(tiles_[i]);
+      release(tiles_[i], stream);
       tiles_[i] = nullptr;
       tileBytes_[i] = 0;
     }
@@ -420,46 +447,42 @@ void CudaScratch::trim() {
   }
 }
 
-void CudaScratch::releaseTiles() {
+void CudaScratch::releaseTiles(void* stream) {
   for (int i = 0; i < 2; ++i) {
-    if (tiles_[i]) cudaFree(tiles_[i]);
+    release(tiles_[i], stream);
     tiles_[i] = nullptr;
     tileBytes_[i] = 0;
     peak_[i] = 0;
   }
 }
 
-void* CudaScratch::tileBuffer(int which, size_t bytes) {
+void* CudaScratch::tileBuffer(int which, size_t bytes, void* stream) {
   if (bytes == 0 || which < 0 || which > 1) return nullptr;
   peak_[which] = std::max(peak_[which], bytes);
   if (tiles_[which] && tileBytes_[which] >= bytes) return tiles_[which];
-  if (tiles_[which]) cudaFree(tiles_[which]);
+  release(tiles_[which], stream);
   tiles_[which] = nullptr;
   tileBytes_[which] = 0;
   // Round up, so walking through groups of slightly different sizes does not
   // reallocate on every one of them. A quarter, not double: a tile can be the
   // whole frame, and doubling that held twice a frame for good.
   const size_t want = bytes + bytes / 4;
-  if (cudaMalloc(&tiles_[which], want) != cudaSuccess) {
-    tiles_[which] = nullptr;
-    return nullptr;
-  }
+  tiles_[which] = allocate(want, stream);
+  if (!tiles_[which]) return nullptr;
   tileBytes_[which] = want;
   return tiles_[which];
 }
 
-void* CudaScratch::tapBuffer(size_t bytes) {
+void* CudaScratch::tapBuffer(size_t bytes, void* stream) {
   if (bytes == 0) return nullptr;
   if (taps_ && tapBytes_ >= bytes) return taps_;
-  if (taps_) cudaFree(taps_);
+  release(taps_, stream);
   taps_ = nullptr;
   tapBytes_ = 0;
   // Round up so a changing group count doesn't reallocate every frame.
   const size_t want = bytes * 2;
-  if (cudaMalloc(&taps_, want) != cudaSuccess) {
-    taps_ = nullptr;
-    return nullptr;
-  }
+  taps_ = allocate(want, stream);
+  if (!taps_) return nullptr;
   tapBytes_ = want;
   return taps_;
 }
@@ -502,17 +525,28 @@ struct Stencil {
 };
 
 struct DeviceStore {
-  std::vector<ScratchLease::Slot*> all;  // every scratch ever made, for the readout
   std::vector<ScratchLease::Slot*> idle;
   std::map<const void*, Stencil> stencils;
   std::vector<const void*> forgotten;
   LruBudget budget;
 };
 
+// The store's lock guards its bookkeeping and nothing else. NO CUDA call is
+// ever made while it is held -- no upload, no free, no destructor of a stencil.
+// Several CUDA calls wait for the whole device, the device can be waiting on a
+// host thread, and that thread can be waiting for this lock: a render holding
+// it across cudaFree, with the viewer's thread queued behind it, hung Resolve
+// on the way into the Fusion page.
 std::mutex& storeMutex() {
   static std::mutex m;
   return m;
 }
+
+// The readout's figures, kept as atomics so the viewer -- which draws on the
+// host's UI thread -- never takes the store's lock at all.
+std::atomic<size_t> gStencilBytes{0};
+std::atomic<size_t> gScratchBytes{0};
+std::atomic<int> gScratchCount{0};
 
 // Never destroyed. Freeing device memory from a static destructor runs while
 // the host unloads the plugin, when the CUDA runtime may already be gone;
@@ -520,6 +554,34 @@ std::mutex& storeMutex() {
 std::map<int, DeviceStore>& stores() {
   static auto* s = new std::map<int, DeviceStore>();
   return *s;
+}
+
+}  // namespace
+
+namespace {
+
+// A slot is owned by exactly one thread whenever it is out of the idle list, so
+// its fields need no lock; only the list does.
+void setHeld(ScratchLease::Slot* s, size_t bytes);
+
+// Stencils to free once the store's lock is let go: dropping the last reference
+// runs cudaFree, which must never happen under the lock.
+using Released = std::vector<std::shared_ptr<CudaSegmentation>>;
+
+void dropStencil(DeviceStore& store, const void* owner, Released& out) {
+  auto it = store.stencils.find(owner);
+  if (it != store.stencils.end()) {
+    out.push_back(std::move(it->second.dev));
+    store.stencils.erase(it);
+  }
+  store.budget.remove(owner);
+}
+
+// Called with the lock held; only reads the store.
+void publishStencilBytes() {
+  size_t t = 0;
+  for (const auto& kv : stores()) t += kv.second.budget.total();
+  gStencilBytes.store(t);
 }
 
 }  // namespace
@@ -532,32 +594,52 @@ struct ScratchLease::Slot {
   size_t heldBytes = 0;  // what it held when last returned, for the readout
 };
 
+namespace {
+void setHeld(ScratchLease::Slot* s, size_t bytes) {
+  gScratchBytes.fetch_add(bytes);
+  gScratchBytes.fetch_sub(s->heldBytes);
+  s->heldBytes = bytes;
+}
+}  // namespace
+
 ScratchLease::ScratchLease(void* stream) : device_(currentDevice()), stream_(stream) {
+  // A scratch only exists because renders once overlapped. When they stop
+  // overlapping, the extra ones sit idle; give back their tiles. They are taken
+  // OUT of the idle list under the lock and freed after it is let go.
+  std::vector<Slot*> stale;
   {
     std::lock_guard<std::mutex> lock(storeMutex());
-    DeviceStore& store = stores()[device_];
-    std::vector<Slot*>& idle = store.idle;
+    std::vector<Slot*>& idle = stores()[device_].idle;
     if (!idle.empty()) {
       slot_ = idle.back();
       idle.pop_back();
     }
-    // A scratch only exists because renders once overlapped. When they stop
-    // overlapping, the extra ones sit idle; give back their tiles. This thread
-    // has the host's context current, which is why it happens here.
     const double now = nowSeconds();
-    for (Slot* s : idle) {
-      if (s->heldBytes > 0 && now - s->lastUse > kIdleScratchSeconds) {
-        s->scratch.releaseTiles();
-        s->heldBytes = s->scratch.bytes();
+    for (auto it = idle.begin(); it != idle.end();) {
+      if ((*it)->heldBytes > 0 && now - (*it)->lastUse > kIdleScratchSeconds) {
+        stale.push_back(*it);
+        it = idle.erase(it);
+      } else {
+        ++it;
       }
     }
+  }
+  if (!stale.empty()) {
+    for (Slot* s : stale) {
+      // Its last work ran on another stream; free behind it on this one.
+      if (s->pending && s->done) cudaStreamWaitEvent(asStream(stream_), s->done, 0);
+      s->scratch.releaseTiles(stream_);
+      setHeld(s, s->scratch.bytes());
+    }
+    std::lock_guard<std::mutex> lock(storeMutex());
+    std::vector<Slot*>& idle = stores()[device_].idle;
+    idle.insert(idle.end(), stale.begin(), stale.end());
   }
   if (!slot_) {
     slot_ = new Slot();
     if (cudaEventCreateWithFlags(&slot_->done, cudaEventDisableTiming) != cudaSuccess)
       slot_->done = nullptr;
-    std::lock_guard<std::mutex> lock(storeMutex());
-    stores()[device_].all.push_back(slot_);
+    gScratchCount.fetch_add(1);
   }
   // The previous lease's kernels may still be reading these tiles on another
   // stream. Queue behind them rather than wait for them here.
@@ -566,9 +648,10 @@ ScratchLease::ScratchLease(void* stream) : device_(currentDevice()), stream_(str
 
 ScratchLease::~ScratchLease() {
   if (!slot_) return;
-  // Before the event: trim frees with cudaFree, which waits for the device, so
-  // it can only ever free what this frame has finished with.
-  slot_->scratch.trim();
+  // Queued behind this frame's kernels, so it only frees what they have
+  // finished with -- and recorded before the event, so the next lease waits
+  // for the free too.
+  slot_->scratch.trim(stream_);
   if (slot_->done) {
     slot_->pending = cudaEventRecord(slot_->done, asStream(stream_)) == cudaSuccess;
   } else {
@@ -577,8 +660,8 @@ ScratchLease::~ScratchLease() {
     slot_->pending = false;
   }
   slot_->lastUse = nowSeconds();
+  setHeld(slot_, slot_->scratch.bytes());
   std::lock_guard<std::mutex> lock(storeMutex());
-  slot_->heldBytes = slot_->scratch.bytes();
   stores()[device_].idle.push_back(slot_);
 }
 
@@ -587,38 +670,61 @@ CudaScratch* ScratchLease::get() const { return slot_ ? &slot_->scratch : nullpt
 std::shared_ptr<const CudaSegmentation> deviceStencil(const void* owner,
                                                       const std::shared_ptr<const Segmentation>& seg) {
   if (!owner || !seg) return nullptr;
-  const double now = nowSeconds();
-  std::lock_guard<std::mutex> lock(storeMutex());
-  DeviceStore& store = stores()[currentDevice()];
+  const int device = currentDevice();
+  // Declared first, so it is destroyed last -- after every lock below is let
+  // go. That is where evicted stencils are actually freed.
+  Released released;
+  std::shared_ptr<CudaSegmentation> reuse;
+  {
+    std::lock_guard<std::mutex> lock(storeMutex());
+    DeviceStore& store = stores()[device];
 
-  // Owners destroyed since the last render here. This thread has the host's
-  // context current, so this is the place to free what they held.
-  for (const void* gone : store.forgotten) {
-    store.stencils.erase(gone);
-    store.budget.remove(gone);
-  }
-  store.forgotten.clear();
+    // Owners destroyed since the last render here. This thread has the host's
+    // context current, so this render is the place to free what they held.
+    for (const void* gone : store.forgotten) dropStencil(store, gone, released);
+    store.forgotten.clear();
 
-  Stencil& s = store.stencils[owner];
-  if (!s.dev || s.src.lock() != seg) {
-    // Reuse the allocation unless a frame in flight still holds it.
-    std::shared_ptr<CudaSegmentation> dev =
-        (s.dev && s.dev.use_count() == 1) ? s.dev : std::make_shared<CudaSegmentation>();
-    if (!dev->upload(*seg)) {
-      store.stencils.erase(owner);
-      store.budget.remove(owner);
-      return nullptr;
+    auto it = store.stencils.find(owner);
+    if (it != store.stencils.end() && it->second.dev && it->second.src.lock() == seg) {
+      // Already held: the common case, every frame of a steady title.
+      std::shared_ptr<const CudaSegmentation> out = it->second.dev;
+      const double now = nowSeconds();
+      store.budget.touch(owner, it->second.dev->bytes(), now);
+      for (const void* v : store.budget.victims(kStencilBudget, now, kRecentSeconds, owner))
+        dropStencil(store, v, released);
+      publishStencilBytes();
+      return out;
     }
-    s.dev = dev;
-    s.src = seg;
+    // Reuse the allocation unless a frame in flight still holds it.
+    if (it != store.stencils.end() && it->second.dev && it->second.dev.use_count() == 1)
+      reuse = it->second.dev;
+    publishStencilBytes();
   }
-  std::shared_ptr<const CudaSegmentation> out = s.dev;
-  store.budget.touch(owner, s.dev->bytes(), now);
-  for (const void* v : store.budget.victims(kStencilBudget, now, kRecentSeconds, owner)) {
-    store.stencils.erase(v);
-    store.budget.remove(v);
+
+  // The upload allocates and copies, both of which can wait on the device --
+  // so it happens with no lock held. Only this owner's renders ever reach its
+  // entry, and the host never runs two of those at once.
+  std::shared_ptr<CudaSegmentation> dev = reuse ? reuse : std::make_shared<CudaSegmentation>();
+  const bool ok = dev->upload(*seg);
+
+  std::lock_guard<std::mutex> lock(storeMutex());
+  DeviceStore& store = stores()[device];
+  if (!ok) {
+    dropStencil(store, owner, released);
+    released.push_back(std::move(dev));
+    publishStencilBytes();
+    return nullptr;
   }
-  return out;
+  Stencil& s = store.stencils[owner];
+  if (s.dev && s.dev != dev) released.push_back(std::move(s.dev));
+  s.dev = dev;
+  s.src = seg;
+  const double now = nowSeconds();
+  store.budget.touch(owner, dev->bytes(), now);
+  for (const void* v : store.budget.victims(kStencilBudget, now, kRecentSeconds, owner))
+    dropStencil(store, v, released);
+  publishStencilBytes();
+  return dev;
 }
 
 void forgetStencil(const void* owner) {
@@ -629,12 +735,9 @@ void forgetStencil(const void* owner) {
 
 DeviceMemoryUse deviceMemoryUse() {
   DeviceMemoryUse u;
-  std::lock_guard<std::mutex> lock(storeMutex());
-  for (const auto& kv : stores()) {
-    u.stencils += kv.second.budget.total();
-    for (const ScratchLease::Slot* s : kv.second.all) u.scratch += s->heldBytes;
-    u.scratchCount += int(kv.second.all.size());
-  }
+  u.stencils = gStencilBytes.load();
+  u.scratch = gScratchBytes.load();
+  u.scratchCount = gScratchCount.load();
   return u;
 }
 
@@ -703,7 +806,7 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
     host[i] = DevTap{t.offsetX, t.offsetY, t.scale, t.rotation, t.blur, t.opacity, t.visible ? 1 : 0};
   }
   const size_t bytes = host.size() * sizeof(DevTap);
-  DevTap* devTaps = static_cast<DevTap*>(scratch.tapBuffer(bytes));
+  DevTap* devTaps = static_cast<DevTap*>(scratch.tapBuffer(bytes, stream));
   if (!devTaps) return false;
   RTA_CUDA_OK(cudaMemcpyAsync(devTaps, host.data(), bytes, cudaMemcpyHostToDevice, s));
 
@@ -738,7 +841,7 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
 
     const int tw = dest.width(), th = dest.height();
     const size_t tileBytes = size_t(tw) * size_t(th) * 4 * sizeof(float);
-    float* tileA = static_cast<float*>(scratch.tileBuffer(0, tileBytes));
+    float* tileA = static_cast<float*>(scratch.tileBuffer(0, tileBytes, stream));
     if (!tileA) return false;
 
     renderTileKernel<<<gridFor(tw, th, block), block, 0, s>>>(
@@ -748,7 +851,7 @@ bool cudaCompositeGroups(float* dstDev, std::ptrdiff_t dstStride, const float* s
     // Only skipped where the window is narrow enough to BE the identity, not at
     // some threshold that would put the snap back.
     if (radius > 0.003f) {
-      float* tileB = static_cast<float*>(scratch.tileBuffer(1, tileBytes));
+      float* tileB = static_cast<float*>(scratch.tileBuffer(1, tileBytes, stream));
       if (!tileB) return false;
       // Same three passes, same width, same order as the CPU path.
       const float halfWidth = radius / 3.0f;
