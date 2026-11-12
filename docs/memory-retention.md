@@ -1,6 +1,6 @@
 # Memory that grows over a long render: diagnosis and fix
 
-Written from Text Animator (commit `b815a58`) as a handoff for other OFX plugins
+Written from Text Animator (commits `b815a58` and the tile-trimming follow-up) as a handoff for other OFX plugins
 that may have the same problem. Everything here is about *retention*, not a
 classic leak: nothing was lost track of, it was just never given back.
 
@@ -82,6 +82,24 @@ to handle it:
 Also: round grow-only buffers up by a fraction (we use 1.25x), not 2x. A tile
 can be a whole frame; doubling that holds two frames' worth for good.
 
+**Pooling bounds how many buffers exist, not how big each one grows.** This was
+the second round of the fix: with only the pool, VRAM still crept up late in a
+render, because every pooled tile kept the largest size it had ever drawn. Two
+more rules close that:
+
+- *Trim at the end of each lease.* Track the largest size asked of **each**
+  buffer during the lease (per buffer, not one peak for all -- a blur-only
+  buffer must be freeable on a frame without blur while the other stays busy).
+  Free any buffer over 64 MB that is more than 4x that peak. Four, so a blur
+  that shrinks frame by frame reallocates a few times on the way down, not
+  every frame.
+- *Release idle pool entries.* Extra entries exist only because renders once
+  overlapped. When one has been idle for 10 s, free its buffers, at the next
+  lease on that device.
+
+Both free with `cudaFree`, which waits for the device, so nothing still queued
+can be reading what is freed.
+
 ### 2. Keep reusable per-instance data under one global budget (LRU)
 
 Data worth keeping between frames of the *same* clip (analysis results, device
@@ -95,9 +113,43 @@ copies of them) goes in a store with a byte budget shared by all instances:
   it, the budget is allowed to overflow instead, which is the right failure.
 - A dropped owner simply recomputes once when it renders again.
 
-Budgets used here: 1 GB for the host analyses, 512 MB for the device stencils.
+Budgets used here: 1 GB for the host analyses, 256 MB for the device stencils.
+The device budget can be small when the host copy is kept separately: a dropped
+device copy costs one upload (about a millisecond at 1080p) to bring back, while
+a dropped host analysis costs a full re-detection.
 
 ### 3. Make the cross-thread parts safe
+
+**The rule that matters most: never make a GPU call while holding a lock that
+any other thread can wait on.** The first version of this fix broke it and hung
+Resolve on the way into the Fusion page. The cycle:
+
+1. A render thread holds the store's lock and calls `cudaFree` (or a plain
+   `cudaMemcpy`, or `cudaMalloc` in some cases). Those wait for the **whole
+   device** to go idle -- the host's own GPU work included.
+2. The host's GPU work can be waiting on one of the host's threads (a host
+   function queued on a stream, interop with the viewer). Resolve does this.
+3. That thread -- here the UI thread, drawing the viewer overlay, which read the
+   memory readout -- is waiting for the store's lock. Nobody can move.
+
+So:
+
+- The shared lock guards **bookkeeping only**. Decide under the lock, then let
+  go, then upload, allocate or free. Collect evicted objects into a local list
+  declared *before* the lock, so their destructors (which free) run after it is
+  released.
+- Anything the UI thread reads (the readout) is an **atomic**, never behind a
+  lock a render can hold.
+- In render paths, free with **stream-ordered** calls (`cudaMallocAsync` /
+  `cudaFreeAsync` on the render's stream, where
+  `cudaDevAttrMemoryPoolsSupported`): the free is queued behind that stream's
+  work instead of waiting for the whole device. Where it is unsupported, fall
+  back to `cudaFree`, but still never under a lock.
+- When freeing something whose last work ran on another stream, make the
+  current stream wait on that stream's event first (`cudaStreamWaitEvent`),
+  then free on the current stream.
+
+Then the rest:
 
 - **Never free GPU memory from a thread that may not have the host's context.**
   In the destructor, only *mark* the owner as gone. The next render on that
@@ -115,6 +167,16 @@ Budgets used here: 1 GB for the host analyses, 512 MB for the device stencils.
   A static destructor runs while the host unloads the plugin, when the CUDA
   runtime may already be gone; the process exit returns the memory anyway.
 
+### 4. Show the plugin's own share
+
+Task Manager reports every plugin's memory as the host's, so a user cannot tell
+which plugin is growing. The stores can report what they hold. Text Animator
+draws it in the viewer with Show Detection on, top right: RAM held by all
+instances' analyses, and GPU memory split into stencils and blur buffers. After
+a render it shows what is left. If that stays small while the host keeps
+growing, the growth is not this plugin's. Read it from atomics (see 3): the
+viewer draws on the UI thread.
+
 ## Where the code is
 
 In this repository:
@@ -125,6 +187,8 @@ In this repository:
 | `src/cuda_compositor.h` / `.cu` (search `device memory, shared`) | `ScratchLease` (pool + event handoff), `deviceStencil` (budgeted device cache keyed by owner and `weak_ptr` to source), `forgetStencil` (deferred free). |
 | `src/plugin.cpp` (search `retainAnalysis`) | The host-side budget: a registry of instance caches, `retainAnalysis` after each render, `releaseAnalysis` in the destructor. |
 | `tools/cudatest.cpp` | The parity test, now drawing through the store, as the plugin does. |
+| `tools/storetest.cpp` | The store's behaviour, counted exactly: budgets, trimming, idle release, the readout. |
+| `tools/deadlocktest.cpp` | Reproduces the hang without a host: GPU work that waits on a "UI thread" which reads the readout, while render threads hammer the store. Copy this first -- it is the cheapest way to find out whether another plugin can hang its host. |
 
 ## How it was verified
 
@@ -141,18 +205,29 @@ In this repository:
   - Every other owner forgotten, then one render: 1 alive. A stencil a frame
     still held stayed valid until the frame released it.
   - Sequential leases reuse one scratch; overlapping leases get their own.
+- **The hang, reproduced and fixed.** `deadlocktest` over 8 seconds:
 
-**Not yet verified:** that this cures the slowdown in a real long render in
-Resolve. That needs the original project rendered again while watching RAM and
-VRAM in Task Manager.
+  | Store | Frames | Readouts | GPU waits stuck on the UI thread |
+  |---|---|---|---|
+  | Lock held across GPU calls (the version that hung Resolve) | 4 | 2 | deadlocked |
+  | Bookkeeping-only lock, atomic readout | ~540 | 515 | 0 |
+
+In Resolve, the first version visibly freed VRAM during a long render, which
+is what showed retention was the cause of the creep; the trimming and the
+deadlock fix after it are verified by the tests above and await a long render.
 
 ## Applying it elsewhere: order of work
 
 1. Estimate bytes per instance at UHD, with the expensive options on.
 2. Move per-render scratch to a leased pool first. This is usually the biggest
-   saving (blur tiles here) and the least risky.
+   saving (blur tiles here) and the least risky. Trim pooled buffers per lease
+   and release idle ones, or the pool keeps its largest-ever sizes.
 3. Put reusable per-instance data under a global LRU budget with a recent-use
    window.
 4. Move GPU frees out of destructors.
-5. Verify output is unchanged with the plugin's own parity or regression tests,
+5. Check every lock the new code adds: **no GPU call while it is held**, and
+   nothing the UI thread reads behind it. Then run `deadlocktest` against the
+   plugin's store. A shared store is new shared state, and shared state is how
+   one plugin instance gets to hang the whole host.
+6. Verify output is unchanged with the plugin's own parity or regression tests,
    then count live objects through `weak_ptr`s rather than reading VRAM totals.

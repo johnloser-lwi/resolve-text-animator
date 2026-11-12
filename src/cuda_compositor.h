@@ -78,11 +78,28 @@ class CudaScratch {
   unsigned long long* hashAccum();
 
   // Grow-only device buffer for per-frame transform uploads.
-  void* tapBuffer(size_t bytes);
+  void* tapBuffer(size_t bytes, void* stream);
 
-  // Two grow-only tiles for the defocus. A separable blur reads one and writes
-  // the other, so it needs somewhere to land that is not what it is reading.
-  void* tileBuffer(int which, size_t bytes);
+  // Two tiles for the defocus. A separable blur reads one and writes the
+  // other, so it needs somewhere to land that is not what it is reading.
+  void* tileBuffer(int which, size_t bytes, void* stream);
+
+  // Grow-only between trims. Without these a tile would keep the largest size
+  // ever drawn -- a frame and a quarter, at 4K with heavy blur -- long after
+  // the title that needed it had gone. trim() frees a tile far larger than
+  // what was asked for since the last trim; releaseTiles() frees both.
+  //
+  // Every allocation and free here is stream-ordered where the device allows
+  // (cudaMallocAsync / cudaFreeAsync): the free is queued behind `stream`'s
+  // work rather than waited for. Plain cudaFree waits for the WHOLE device --
+  // the host's own work included -- from inside a render, which is a hang
+  // waiting to happen; this used to be rare, and trimming made it routine.
+  void trim(void* stream);
+  void releaseTiles(void* stream);
+
+  size_t bytes() const {
+    return tileBytes_[0] + tileBytes_[1] + tapBytes_ + (accum_ ? sizeof(*accum_) : 0);
+  }
 
  private:
   unsigned long long* accum_ = nullptr;
@@ -90,7 +107,15 @@ class CudaScratch {
   size_t tapBytes_ = 0;
   void* tiles_[2] = {nullptr, nullptr};
   size_t tileBytes_[2] = {0, 0};
+  // Largest asked of each tile since the last trim. Per tile, because the
+  // second is only ever used by blur: a frame without blur must be able to
+  // give it back while the first stays busy.
+  size_t peak_[2] = {0, 0};
   bool tried_ = false;
+  int async_ = -1;  // stream-ordered allocation supported: -1 not yet asked
+
+  void* allocate(size_t bytes, void* stream);
+  void release(void* p, void* stream);
 };
 
 // ------------------------------------------------- device memory, shared
@@ -137,6 +162,16 @@ std::shared_ptr<const CudaSegmentation> deviceStencil(const void* owner,
 // not here, because the host may destroy an instance on a thread where its
 // CUDA context is not current, and a free there goes to the wrong context.
 void forgetStencil(const void* owner);
+
+// What the store holds right now, across every device and every instance.
+// Shown in the viewer so the plugin's share of the GPU can be told apart from
+// the host's own, which Task Manager reports as one number.
+struct DeviceMemoryUse {
+  size_t stencils = 0;
+  size_t scratch = 0;  // blur tiles and per-render buffers
+  int scratchCount = 0;
+};
+DeviceMemoryUse deviceMemoryUse();
 
 // Content fingerprint of the alpha channel, computed on-device so detecting a
 // changed title costs an 8-byte readback rather than a whole frame. Combining

@@ -121,6 +121,22 @@ if(RTA_ENABLE_CUDA AND NOT APPLE AND CMAKE_CUDA_COMPILER)
   if(MSVC)
     set_property(TARGET cudatest PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   endif()
+
+  # The shared device store. storetest: budgets, trimming and the readout.
+  # deadlocktest: that the store never hangs a host whose GPU work waits on its
+  # UI thread, which it once did on the way into the Fusion page. Run by hand.
+  foreach(t storetest deadlocktest)
+    add_executable(${t} tools/${t}.cpp src/cuda_compositor.cu)
+    target_link_libraries(${t} PRIVATE rta_core)
+    target_include_directories(${t} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_compile_definitions(${t} PRIVATE RTA_WITH_CUDA=1 _CRT_SECURE_NO_WARNINGS)
+    set_target_properties(${t} PROPERTIES
+      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+      CUDA_RUNTIME_LIBRARY Static)
+    if(MSVC)
+      set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+  endforeach()
 else()
   target_compile_definitions(TextAnimator PRIVATE RTA_WITH_CUDA=0)
   message(STATUS "CUDA off or not found - building CPU-only")

@@ -156,4 +156,8 @@ inline void clearAnalysisState(const void* effect) {
   detail::analysisMap().erase(effect);
 }
 
+// RAM held by every instance's cached analyses together, for the memory
+// readout. Defined in plugin.cpp, beside the budget that bounds it.
+size_t hostAnalysisBytes();
+
 }  // namespace rta
