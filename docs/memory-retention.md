@@ -1,6 +1,6 @@
 # Memory that grows over a long render: diagnosis and fix
 
-Written from Text Animator (commit `b815a58`) as a handoff for other OFX plugins
+Written from Text Animator (commits `b815a58` and the tile-trimming follow-up) as a handoff for other OFX plugins
 that may have the same problem. Everything here is about *retention*, not a
 classic leak: nothing was lost track of, it was just never given back.
 
@@ -82,6 +82,24 @@ to handle it:
 Also: round grow-only buffers up by a fraction (we use 1.25x), not 2x. A tile
 can be a whole frame; doubling that holds two frames' worth for good.
 
+**Pooling bounds how many buffers exist, not how big each one grows.** This was
+the second round of the fix: with only the pool, VRAM still crept up late in a
+render, because every pooled tile kept the largest size it had ever drawn. Two
+more rules close that:
+
+- *Trim at the end of each lease.* Track the largest size asked of **each**
+  buffer during the lease (per buffer, not one peak for all -- a blur-only
+  buffer must be freeable on a frame without blur while the other stays busy).
+  Free any buffer over 64 MB that is more than 4x that peak. Four, so a blur
+  that shrinks frame by frame reallocates a few times on the way down, not
+  every frame.
+- *Release idle pool entries.* Extra entries exist only because renders once
+  overlapped. When one has been idle for 10 s, free its buffers, at the next
+  lease on that device.
+
+Both free with `cudaFree`, which waits for the device, so nothing still queued
+can be reading what is freed.
+
 ### 2. Keep reusable per-instance data under one global budget (LRU)
 
 Data worth keeping between frames of the *same* clip (analysis results, device
@@ -95,7 +113,19 @@ copies of them) goes in a store with a byte budget shared by all instances:
   it, the budget is allowed to overflow instead, which is the right failure.
 - A dropped owner simply recomputes once when it renders again.
 
-Budgets used here: 1 GB for the host analyses, 512 MB for the device stencils.
+Budgets used here: 1 GB for the host analyses, 256 MB for the device stencils.
+The device budget can be small when the host copy is kept separately: a dropped
+device copy costs one upload (about a millisecond at 1080p) to bring back, while
+a dropped host analysis costs a full re-detection.
+
+### 4. Show the plugin's own share
+
+Task Manager reports every plugin's memory as the host's, so a user cannot tell
+which plugin is growing. The stores can report what they hold. Text Animator
+draws it in the viewer with Show Detection on, top right: RAM held by all
+instances' analyses, and GPU memory split into stencils and blur buffers. After
+a render it shows what is left. If that stays small while the host keeps
+growing, the growth is not this plugin's.
 
 ### 3. Make the cross-thread parts safe
 
@@ -150,7 +180,8 @@ VRAM in Task Manager.
 
 1. Estimate bytes per instance at UHD, with the expensive options on.
 2. Move per-render scratch to a leased pool first. This is usually the biggest
-   saving (blur tiles here) and the least risky.
+   saving (blur tiles here) and the least risky. Trim pooled buffers per lease
+   and release idle ones, or the pool keeps its largest-ever sizes.
 3. Put reusable per-instance data under a global LRU budget with a recent-use
    window.
 4. Move GPU frees out of destructors.

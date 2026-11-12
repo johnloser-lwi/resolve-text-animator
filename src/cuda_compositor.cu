@@ -405,8 +405,33 @@ CudaScratch::~CudaScratch() {
   tiles_[0] = tiles_[1] = nullptr;
 }
 
+void CudaScratch::trim() {
+  // Small tiles are not worth the reallocation; large ones four times what the
+  // last render needed are. Four, so a blur shrinking frame by frame reallocates
+  // a few times on the way down rather than every frame.
+  constexpr size_t kWorthFreeing = size_t(64) << 20;
+  for (int i = 0; i < 2; ++i) {
+    if (tiles_[i] && tileBytes_[i] > kWorthFreeing && tileBytes_[i] > peak_[i] * 4) {
+      cudaFree(tiles_[i]);
+      tiles_[i] = nullptr;
+      tileBytes_[i] = 0;
+    }
+    peak_[i] = 0;
+  }
+}
+
+void CudaScratch::releaseTiles() {
+  for (int i = 0; i < 2; ++i) {
+    if (tiles_[i]) cudaFree(tiles_[i]);
+    tiles_[i] = nullptr;
+    tileBytes_[i] = 0;
+    peak_[i] = 0;
+  }
+}
+
 void* CudaScratch::tileBuffer(int which, size_t bytes) {
   if (bytes == 0 || which < 0 || which > 1) return nullptr;
+  peak_[which] = std::max(peak_[which], bytes);
   if (tiles_[which] && tileBytes_[which] >= bytes) return tiles_[which];
   if (tiles_[which]) cudaFree(tiles_[which]);
   tiles_[which] = nullptr;
@@ -451,11 +476,15 @@ unsigned long long* CudaScratch::hashAccum() {
 
 namespace {
 
-// Stencils kept for owners that are not rendering, at most. Enough for dozens
-// of 1080p titles to come back without re-uploading; a title rendered in the
-// last few seconds is never dropped, whatever the total.
-constexpr size_t kStencilBudget = size_t(512) << 20;
+// Stencils kept for owners that are not rendering, at most. Small on purpose:
+// the host analysis they are copied from is kept separately, so one that comes
+// back costs a single upload -- about a millisecond at 1080p -- not a new
+// detection. A title rendered in the last few seconds is never dropped,
+// whatever the total.
+constexpr size_t kStencilBudget = size_t(256) << 20;
 constexpr double kRecentSeconds = 3.0;
+// A scratch unused this long gives its blur tiles back.
+constexpr double kIdleScratchSeconds = 10.0;
 
 double nowSeconds() {
   using namespace std::chrono;
@@ -473,6 +502,7 @@ struct Stencil {
 };
 
 struct DeviceStore {
+  std::vector<ScratchLease::Slot*> all;  // every scratch ever made, for the readout
   std::vector<ScratchLease::Slot*> idle;
   std::map<const void*, Stencil> stencils;
   std::vector<const void*> forgotten;
@@ -498,21 +528,36 @@ struct ScratchLease::Slot {
   CudaScratch scratch;
   cudaEvent_t done = nullptr;  // recorded where the last lease's work ended
   bool pending = false;
+  double lastUse = 0.0;
+  size_t heldBytes = 0;  // what it held when last returned, for the readout
 };
 
 ScratchLease::ScratchLease(void* stream) : device_(currentDevice()), stream_(stream) {
   {
     std::lock_guard<std::mutex> lock(storeMutex());
-    std::vector<Slot*>& idle = stores()[device_].idle;
+    DeviceStore& store = stores()[device_];
+    std::vector<Slot*>& idle = store.idle;
     if (!idle.empty()) {
       slot_ = idle.back();
       idle.pop_back();
+    }
+    // A scratch only exists because renders once overlapped. When they stop
+    // overlapping, the extra ones sit idle; give back their tiles. This thread
+    // has the host's context current, which is why it happens here.
+    const double now = nowSeconds();
+    for (Slot* s : idle) {
+      if (s->heldBytes > 0 && now - s->lastUse > kIdleScratchSeconds) {
+        s->scratch.releaseTiles();
+        s->heldBytes = s->scratch.bytes();
+      }
     }
   }
   if (!slot_) {
     slot_ = new Slot();
     if (cudaEventCreateWithFlags(&slot_->done, cudaEventDisableTiming) != cudaSuccess)
       slot_->done = nullptr;
+    std::lock_guard<std::mutex> lock(storeMutex());
+    stores()[device_].all.push_back(slot_);
   }
   // The previous lease's kernels may still be reading these tiles on another
   // stream. Queue behind them rather than wait for them here.
@@ -521,6 +566,9 @@ ScratchLease::ScratchLease(void* stream) : device_(currentDevice()), stream_(str
 
 ScratchLease::~ScratchLease() {
   if (!slot_) return;
+  // Before the event: trim frees with cudaFree, which waits for the device, so
+  // it can only ever free what this frame has finished with.
+  slot_->scratch.trim();
   if (slot_->done) {
     slot_->pending = cudaEventRecord(slot_->done, asStream(stream_)) == cudaSuccess;
   } else {
@@ -528,7 +576,9 @@ ScratchLease::~ScratchLease() {
     cudaStreamSynchronize(asStream(stream_));
     slot_->pending = false;
   }
+  slot_->lastUse = nowSeconds();
   std::lock_guard<std::mutex> lock(storeMutex());
+  slot_->heldBytes = slot_->scratch.bytes();
   stores()[device_].idle.push_back(slot_);
 }
 
@@ -575,6 +625,17 @@ void forgetStencil(const void* owner) {
   std::lock_guard<std::mutex> lock(storeMutex());
   for (auto& kv : stores())
     if (kv.second.stencils.count(owner)) kv.second.forgotten.push_back(owner);
+}
+
+DeviceMemoryUse deviceMemoryUse() {
+  DeviceMemoryUse u;
+  std::lock_guard<std::mutex> lock(storeMutex());
+  for (const auto& kv : stores()) {
+    u.stencils += kv.second.budget.total();
+    for (const ScratchLease::Slot* s : kv.second.all) u.scratch += s->heldBytes;
+    u.scratchCount += int(kv.second.all.size());
+  }
+  return u;
 }
 
 uint64_t cudaHashAlpha(const float* srcDev, std::ptrdiff_t srcStride, int width, int height,

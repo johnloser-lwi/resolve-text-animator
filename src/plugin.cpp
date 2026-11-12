@@ -267,6 +267,16 @@ void releaseAnalysis(AnalysisCache* mine) {
   r.budget.remove(mine);
 }
 
+}  // namespace
+
+size_t rta::hostAnalysisBytes() {
+  AnalysisRegistry& r = analysisRegistry();
+  std::lock_guard<std::mutex> lock(r.mutex);
+  return r.budget.total();
+}
+
+namespace {
+
 // Detection settings compare equal ignoring the grouping mode, which is what
 // decides whether the cached label image can be reused across modes.
 bool sameBase(const rta::DetectParams& a, const rta::DetectParams& b) {

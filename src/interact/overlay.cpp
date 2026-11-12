@@ -11,6 +11,7 @@
 #include "ofxsInteract.h"
 
 #include "clip_time.h"
+#include "cuda_compositor.h"
 #include "curve_widget.h"
 #include "timeline_widget.h"
 #include "draw_utils.h"
@@ -104,6 +105,7 @@ class CurveInteract : public OFX::OverlayInteract {
     // Warnings first, and independently of the curve editor: they are the whole
     // reason to look at the overlay when something is wrong.
     drawWarnings(c);
+    drawMemory(c);
     drawSlant(c);
     drawUnits(c);
     drawLinks(c);
@@ -162,6 +164,29 @@ class CurveInteract : public OFX::OverlayInteract {
            "so nothing is drawn.",
            x, y, kOfxDrawTextAlignmentLeft | kOfxDrawTextAlignmentTop);
     }
+  }
+
+  // What Text Animator holds, across every instance. Task Manager reports the
+  // whole of Resolve as one number, plugins included, so this is the only way to
+  // tell this plugin's share from everything else's. Shown with Show Detection,
+  // and true at the moment it is drawn -- after a render, it says what is left.
+  void drawMemory(const OverlayContext& c) {
+    bool show = false;
+    try {
+      show = _effect->fetchBooleanParam("showDiagnostics")->getValueAtTime(c.time);
+    } catch (...) {
+    }
+    if (!show) return;
+    auto mb = [](size_t b) { return std::to_string((b + (size_t(1) << 19)) >> 20) + " MB"; };
+    std::string line = "TEXT ANIMATOR, ALL INSTANCES:  RAM " + mb(hostAnalysisBytes());
+#if RTA_WITH_CUDA
+    const DeviceMemoryUse d = deviceMemoryUse();
+    line += "   GPU " + mb(d.stencils + d.scratch) + " (stencils " + mb(d.stencils) +
+            ", blur buffers " + mb(d.scratch) + " in " + std::to_string(d.scratchCount) + ")";
+#endif
+    SetColour(c, Colour{0.85f, 0.85f, 0.85f, 1.0f});
+    Text(c, line, c.rod.x2 - c.sx(24.0), c.rod.y2 - c.sy(28.0),
+         kOfxDrawTextAlignmentRight | kOfxDrawTextAlignmentTop);
   }
 
   // The italic angle, drawn as lines you can match against the letters. A number
