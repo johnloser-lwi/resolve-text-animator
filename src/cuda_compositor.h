@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "animator.h"
@@ -47,6 +48,9 @@ class CudaSegmentation {
   const int32_t* labelToGroup() const { return labelToGroup_; }
   int width() const { return width_; }
   int height() const { return height_; }
+  size_t bytes() const {
+    return (size_t(width_) * size_t(height_) + size_t(labelCount_)) * sizeof(int32_t);
+  }
 
  private:
   int32_t* labels_ = nullptr;
@@ -88,6 +92,51 @@ class CudaScratch {
   size_t tileBytes_[2] = {0, 0};
   bool tried_ = false;
 };
+
+// ------------------------------------------------- device memory, shared
+// Both of the above used to belong to an effect instance and lived as long as
+// it did. The host keeps an instance for every use of the effect, so a long
+// timeline held a stencil and two blur tiles for every title in it, all at
+// once, and nothing was given back. Now they belong to a per-device store, sized
+// by what renders at once rather than by how many instances exist.
+
+// A scratch for one render. The store holds one per render that has ever run
+// at the same time as others, so blur tiles are as many as concurrent renders.
+//
+// Ending a lease does not wait for the GPU. It records an event on the stream
+// instead, and the next lease of the same scratch makes its own stream wait on
+// it -- so the kernels still reading the tiles finish first, without stalling
+// the CPU here.
+class ScratchLease {
+ public:
+  explicit ScratchLease(void* stream);
+  ~ScratchLease();
+  ScratchLease(const ScratchLease&) = delete;
+  ScratchLease& operator=(const ScratchLease&) = delete;
+
+  // Null only if the store could not make one.
+  CudaScratch* get() const;
+
+  struct Slot;  // a scratch and the event that says when its last user finished
+
+ private:
+  Slot* slot_ = nullptr;
+  int device_ = 0;
+  void* stream_ = nullptr;
+};
+
+// The device stencil of `seg` for `owner`, uploaded only when what is held is
+// not already that segmentation. Over the budget, the stencils of owners that
+// have not rendered for a while are freed; they upload again if they return.
+// Shared, so an eviction by another render cannot free one mid-frame. Null if
+// the upload failed.
+std::shared_ptr<const CudaSegmentation> deviceStencil(const void* owner,
+                                                      const std::shared_ptr<const Segmentation>& seg);
+
+// The owner is gone. Its stencil is freed by the next render on its device --
+// not here, because the host may destroy an instance on a thread where its
+// CUDA context is not current, and a free there goes to the wrong context.
+void forgetStencil(const void* owner);
 
 // Content fingerprint of the alpha channel, computed on-device so detecting a
 // changed title costs an 8-byte readback rather than a whole frame. Combining

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstring>
 #include <atomic>
+#include <chrono>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -21,6 +23,7 @@
 #include "cuda_compositor.h"
 #include "diagnostics.h"
 #include "interact/overlay.h"
+#include "lru_budget.h"
 #include "segmentation.h"
 #include "warning_state.h"
 
@@ -193,22 +196,76 @@ struct AnalysisCache {
   // group differently -- words in, characters out. At most two are ever filled.
   std::shared_ptr<const rta::Segmentation> byMode[4];
 
+  // The device copy and the blur tiles are not held here any more: they live in
+  // the shared per-device store (cuda_compositor.h), which bounds them by what
+  // renders at once instead of by how many instances the host keeps.
   void invalidate() {
     for (auto& s : byMode) s.reset();
-#if RTA_WITH_CUDA
-    devSegMode = -1;
-    devSegValid = false;
-#endif
   }
 
-#if RTA_WITH_CUDA
-  // Device copy of whichever segmentation the current frame actually uses.
-  rta::CudaSegmentation devSeg;
-  rta::CudaScratch scratch;
-  int devSegMode = -1;
-  bool devSegValid = false;
-#endif
+  size_t bytes() const {
+    size_t b = 0;
+    for (const auto& s : byMode) {
+      if (!s) continue;
+      b += s->labelImage.size() * sizeof(int32_t) + s->labelToGroup.size() * sizeof(int) +
+           (s->groups.size() + s->linkMembers.size()) * sizeof(rta::Group);
+    }
+    return b;
+  }
 };
+
+// Every instance's analyses, kept under one budget.
+//
+// The host keeps an instance for every use of the effect, for the whole
+// session, and each held a label image per grouping mode -- 8 MB at 1080p, 33 MB
+// at UHD -- until it was destroyed. Over a long timeline that is gigabytes held
+// for titles long finished. Now, over the budget, the analyses of instances
+// that have not rendered for a few seconds are dropped; one that comes back
+// detects again, once.
+constexpr size_t kAnalysisBudget = size_t(1) << 30;
+constexpr double kRecentSeconds = 3.0;
+
+double steadySeconds() {
+  using namespace std::chrono;
+  return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+struct AnalysisRegistry {
+  std::mutex mutex;
+  rta::LruBudget budget;
+  std::map<const void*, AnalysisCache*> caches;
+};
+
+AnalysisRegistry& analysisRegistry() {
+  static AnalysisRegistry r;
+  return r;
+}
+
+// Called after a render has taken what it needs from `mine`, never while
+// holding its lock. Another instance's cache is only ever try-locked: one that
+// is busy is rendering, so it is not idle, and skipping it cannot deadlock.
+void retainAnalysis(AnalysisCache* mine, size_t bytes) {
+  AnalysisRegistry& r = analysisRegistry();
+  const double now = steadySeconds();
+  std::lock_guard<std::mutex> lock(r.mutex);
+  r.caches[mine] = mine;
+  r.budget.touch(mine, bytes, now);
+  for (const void* v : r.budget.victims(kAnalysisBudget, now, kRecentSeconds, mine)) {
+    auto it = r.caches.find(v);
+    if (it == r.caches.end()) continue;
+    std::unique_lock<std::mutex> other(it->second->mutex, std::try_to_lock);
+    if (!other.owns_lock()) continue;
+    it->second->invalidate();
+    r.budget.remove(v);
+  }
+}
+
+void releaseAnalysis(AnalysisCache* mine) {
+  AnalysisRegistry& r = analysisRegistry();
+  std::lock_guard<std::mutex> lock(r.mutex);
+  r.caches.erase(mine);
+  r.budget.remove(mine);
+}
 
 // Detection settings compare equal ignoring the grouping mode, which is what
 // decides whether the cached label image can be reused across modes.
@@ -318,6 +375,10 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   ~TextAnimatorPlugin() override {
     rta::clearWarningState(this);
     rta::clearAnalysisState(this);
+    releaseAnalysis(&_cache);
+#if RTA_WITH_CUDA
+    rta::forgetStencil(this);
+#endif
   }
 
   void render(const OFX::RenderArguments& args) override;
@@ -1009,6 +1070,16 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // measure it again. Source's, unless the mask replaces it.
   const rta::ImageView& measured = useMask ? maskView : srcView;
 
+#if RTA_WITH_CUDA
+  // Device scratch for this render only -- the hash accumulator now, the blur
+  // tiles later -- borrowed from the shared store and handed back on return.
+  std::unique_ptr<rta::ScratchLease> lease;
+  if (useCuda) {
+    lease.reset(new rta::ScratchLease(args.pCudaStream));
+    if (!lease->get()) return;
+  }
+#endif
+
   uint64_t hash = 0;
   if (!measured.valid()) {
     hash = 0;  // a mask that misses the text entirely: nothing to fingerprint
@@ -1016,9 +1087,8 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 #if RTA_WITH_CUDA
   if (useCuda) {
     bool ok = false;
-    std::lock_guard<std::mutex> lock(_cache.mutex);
     hash = rta::cudaHashAlpha(measured.data, measured.rowStride, measured.width, measured.height,
-                              det.alphaThreshold, _cache.scratch, args.pCudaStream, &ok);
+                              det.alphaThreshold, *lease->get(), args.pCudaStream, &ok);
     if (!ok) {
       return;
     }
@@ -1037,6 +1107,7 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   }
 
   std::shared_ptr<const rta::Segmentation> segIn, segOut, segChar;
+  size_t cacheBytes = 0;
   {
     std::lock_guard<std::mutex> lock(_cache.mutex);
     if (_cache.hash != hash || _cache.width != srcView.width ||
@@ -1099,7 +1170,11 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     if (anim.enableOut) segOut = _cache.byMode[int(outMode)];
     if (spacing.needsPerCharacter() && det.mode != rta::GroupMode::Object)
       segChar = _cache.byMode[int(rta::GroupMode::Character)];
+    cacheBytes = _cache.bytes();
   }
+  // This frame holds its own references now, so a sweep that drops this
+  // cache's analyses -- or another's -- cannot pull them out from under it.
+  retainAnalysis(&_cache, cacheBytes);
   if (!segIn || segIn->empty()) {
     if (useMask) {
       // An empty Source is self-explanatory; text that vanishes because the
@@ -1166,7 +1241,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   rta::Stage stage = rta::Stage::Settled;
   const rta::Segmentation* useSeg = segIn.get();
   const rta::StageSettings* useSet = &anim.in;
-  rta::GroupMode useMode = det.mode;
   double stageStart = anim.startTime;
   double rawSlide = rawSlideIn, rawBlur = rawBlurIn;
 
@@ -1217,7 +1291,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       stage = rta::Stage::Out;
       useSeg = segOut.get();
       useSet = &anim.out;
-      useMode = outMode;
       stageStart = outSeqStart;
       rawSlide = rawSlideOut;
       rawBlur = rawBlurOut;
@@ -1445,7 +1518,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // pixels and those inner edges change. Worth it when the letters are moving
   // anyway, not worth paying for when nothing asked them to.
   const rta::Segmentation* unitSeg = useSeg;
-  int unitMode = int(useMode);
   const float* pivotData = nullptr;
   std::vector<rta::GroupTransform> unitTaps;
   std::vector<float> pivots;
@@ -1454,7 +1526,6 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   if (spacing.any()) {
     if (spacing.needsPerCharacter() && segChar && !segChar->empty()) {
       unitSeg = segChar.get();
-      unitMode = int(rta::GroupMode::Character);
     }
     const std::vector<int> unitToGroup = rta::mapUnitsToGroups(*unitSeg, *useSeg);
     const std::vector<float> offsets = rta::spacingOffsets(*unitSeg, spacing);
@@ -1465,32 +1536,23 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   }
   const std::vector<rta::GroupTransform>& compTaps = spacing.any() ? unitTaps : transforms;
 
-#if RTA_WITH_CUDA
-  if (useCuda) {
-    // Keep the device stencil in step with whichever segmentation this frame
-    // draws -- the two stages may group differently, and spacing may swap the
-    // whole thing for characters.
-    std::lock_guard<std::mutex> lock(_cache.mutex);
-    if (_cache.devSegMode != unitMode) {
-      _cache.devSegValid = _cache.devSeg.upload(*unitSeg);
-      _cache.devSegMode = _cache.devSegValid ? unitMode : -1;
-    }
-  }
-#endif
-
-
   const rta::RectI window = toLocal(args.renderWindow, common);
   const bool diagnostics = _showDiagnostics->getValueAtTime(args.time);
 
 #if RTA_WITH_CUDA
   if (useCuda) {
-    std::lock_guard<std::mutex> lock(_cache.mutex);
-    if (!_cache.devSegValid) {
+    // The device stencil of whichever segmentation this frame draws -- the two
+    // stages may group differently, and spacing may swap the whole thing for
+    // characters. The store uploads only when that is not what it already holds.
+    const std::shared_ptr<const rta::Segmentation>& owning =
+        unitSeg == segIn.get() ? segIn : unitSeg == segOut.get() ? segOut : segChar;
+    const std::shared_ptr<const rta::CudaSegmentation> devSeg = rta::deviceStencil(this, owning);
+    if (!devSeg) {
       return;
     }
     if (!rta::cudaCompositeGroups(dstView.data, dstView.rowStride, srcView.data, srcView.rowStride,
-                                  dstView.width, dstView.height, _cache.devSeg, unitSeg->groups,
-                                  compTaps, taps, window, _cache.scratch, args.pCudaStream,
+                                  dstView.width, dstView.height, *devSeg, unitSeg->groups,
+                                  compTaps, taps, window, *lease->get(), args.pCudaStream,
                                   pivotData)) {
       return;
     }

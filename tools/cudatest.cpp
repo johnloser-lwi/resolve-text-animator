@@ -116,12 +116,10 @@ int main(int argc, char** argv) {
   anim.in.startBlur = startBlur;
   anim.motionBlur = motionBlur;
 
-  rta::CudaSegmentation devSeg;
-  rta::CudaScratch scratch;
-  if (!devSeg.upload(unitSeg)) {
-    std::fprintf(stderr, "devSeg upload failed\n");
-    return 1;
-  }
+  // Through the shared device store, exactly as the plugin draws: the stencil
+  // held for an owner, the scratch leased per frame.
+  const int owner = 0;
+  const auto unitShared = std::make_shared<const rta::Segmentation>(unitSeg);
 
   float *dSrc = nullptr, *dDst = nullptr;
   size_t srcPitch = 0, dstPitch = 0;
@@ -160,11 +158,17 @@ int main(int argc, char** argv) {
 
     const std::ptrdiff_t srcStrideF = std::ptrdiff_t(srcPitch / sizeof(float));
     const std::ptrdiff_t dstStrideF = std::ptrdiff_t(dstPitch / sizeof(float));
-    if (!rta::cudaCompositeGroups(dDst, dstStrideF, dSrc, srcStrideF, w, h, devSeg,
-                                  unitSeg.groups, ct, taps, window, scratch, nullptr, pivotData)) {
-      std::printf("frame %2d: cudaCompositeGroups FAILED\n", f);
-      ++failures;
-      continue;
+    {
+      rta::ScratchLease lease(nullptr);
+      const auto devSeg = rta::deviceStencil(&owner, unitShared);
+      if (!lease.get() || !devSeg ||
+          !rta::cudaCompositeGroups(dDst, dstStrideF, dSrc, srcStrideF, w, h, *devSeg,
+                                    unitSeg.groups, ct, taps, window, *lease.get(), nullptr,
+                                    pivotData)) {
+        std::printf("frame %2d: cudaCompositeGroups FAILED\n", f);
+        ++failures;
+        continue;
+      }
     }
     cudaDeviceSynchronize();
     cudaMemcpy2D(gpu.data(), size_t(w) * 4 * sizeof(float), dDst, dstPitch,

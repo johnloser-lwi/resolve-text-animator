@@ -5,7 +5,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <map>
+#include <mutex>
+
+#include "lru_budget.h"
 
 #include "tiny_font.h"
 #include "transform_geom.h"
@@ -407,8 +412,9 @@ void* CudaScratch::tileBuffer(int which, size_t bytes) {
   tiles_[which] = nullptr;
   tileBytes_[which] = 0;
   // Round up, so walking through groups of slightly different sizes does not
-  // reallocate on every one of them.
-  const size_t want = bytes * 2;
+  // reallocate on every one of them. A quarter, not double: a tile can be the
+  // whole frame, and doubling that held twice a frame for good.
+  const size_t want = bytes + bytes / 4;
   if (cudaMalloc(&tiles_[which], want) != cudaSuccess) {
     tiles_[which] = nullptr;
     return nullptr;
@@ -439,6 +445,136 @@ unsigned long long* CudaScratch::hashAccum() {
     if (cudaMalloc(&accum_, sizeof(unsigned long long)) != cudaSuccess) accum_ = nullptr;
   }
   return accum_;
+}
+
+// ------------------------------------------------- device memory, shared
+
+namespace {
+
+// Stencils kept for owners that are not rendering, at most. Enough for dozens
+// of 1080p titles to come back without re-uploading; a title rendered in the
+// last few seconds is never dropped, whatever the total.
+constexpr size_t kStencilBudget = size_t(512) << 20;
+constexpr double kRecentSeconds = 3.0;
+
+double nowSeconds() {
+  using namespace std::chrono;
+  return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+int currentDevice() {
+  int d = 0;
+  return cudaGetDevice(&d) == cudaSuccess ? d : 0;
+}
+
+struct Stencil {
+  std::shared_ptr<CudaSegmentation> dev;
+  std::weak_ptr<const Segmentation> src;  // weak: a freed one cannot match a new one at its address
+};
+
+struct DeviceStore {
+  std::vector<ScratchLease::Slot*> idle;
+  std::map<const void*, Stencil> stencils;
+  std::vector<const void*> forgotten;
+  LruBudget budget;
+};
+
+std::mutex& storeMutex() {
+  static std::mutex m;
+  return m;
+}
+
+// Never destroyed. Freeing device memory from a static destructor runs while
+// the host unloads the plugin, when the CUDA runtime may already be gone;
+// the process ending returns it anyway.
+std::map<int, DeviceStore>& stores() {
+  static auto* s = new std::map<int, DeviceStore>();
+  return *s;
+}
+
+}  // namespace
+
+struct ScratchLease::Slot {
+  CudaScratch scratch;
+  cudaEvent_t done = nullptr;  // recorded where the last lease's work ended
+  bool pending = false;
+};
+
+ScratchLease::ScratchLease(void* stream) : device_(currentDevice()), stream_(stream) {
+  {
+    std::lock_guard<std::mutex> lock(storeMutex());
+    std::vector<Slot*>& idle = stores()[device_].idle;
+    if (!idle.empty()) {
+      slot_ = idle.back();
+      idle.pop_back();
+    }
+  }
+  if (!slot_) {
+    slot_ = new Slot();
+    if (cudaEventCreateWithFlags(&slot_->done, cudaEventDisableTiming) != cudaSuccess)
+      slot_->done = nullptr;
+  }
+  // The previous lease's kernels may still be reading these tiles on another
+  // stream. Queue behind them rather than wait for them here.
+  if (slot_->pending && slot_->done) cudaStreamWaitEvent(asStream(stream_), slot_->done, 0);
+}
+
+ScratchLease::~ScratchLease() {
+  if (!slot_) return;
+  if (slot_->done) {
+    slot_->pending = cudaEventRecord(slot_->done, asStream(stream_)) == cudaSuccess;
+  } else {
+    // No event to hand over with, so make sure nothing is left in flight.
+    cudaStreamSynchronize(asStream(stream_));
+    slot_->pending = false;
+  }
+  std::lock_guard<std::mutex> lock(storeMutex());
+  stores()[device_].idle.push_back(slot_);
+}
+
+CudaScratch* ScratchLease::get() const { return slot_ ? &slot_->scratch : nullptr; }
+
+std::shared_ptr<const CudaSegmentation> deviceStencil(const void* owner,
+                                                      const std::shared_ptr<const Segmentation>& seg) {
+  if (!owner || !seg) return nullptr;
+  const double now = nowSeconds();
+  std::lock_guard<std::mutex> lock(storeMutex());
+  DeviceStore& store = stores()[currentDevice()];
+
+  // Owners destroyed since the last render here. This thread has the host's
+  // context current, so this is the place to free what they held.
+  for (const void* gone : store.forgotten) {
+    store.stencils.erase(gone);
+    store.budget.remove(gone);
+  }
+  store.forgotten.clear();
+
+  Stencil& s = store.stencils[owner];
+  if (!s.dev || s.src.lock() != seg) {
+    // Reuse the allocation unless a frame in flight still holds it.
+    std::shared_ptr<CudaSegmentation> dev =
+        (s.dev && s.dev.use_count() == 1) ? s.dev : std::make_shared<CudaSegmentation>();
+    if (!dev->upload(*seg)) {
+      store.stencils.erase(owner);
+      store.budget.remove(owner);
+      return nullptr;
+    }
+    s.dev = dev;
+    s.src = seg;
+  }
+  std::shared_ptr<const CudaSegmentation> out = s.dev;
+  store.budget.touch(owner, s.dev->bytes(), now);
+  for (const void* v : store.budget.victims(kStencilBudget, now, kRecentSeconds, owner)) {
+    store.stencils.erase(v);
+    store.budget.remove(v);
+  }
+  return out;
+}
+
+void forgetStencil(const void* owner) {
+  std::lock_guard<std::mutex> lock(storeMutex());
+  for (auto& kv : stores())
+    if (kv.second.stencils.count(owner)) kv.second.forgotten.push_back(owner);
 }
 
 uint64_t cudaHashAlpha(const float* srcDev, std::ptrdiff_t srcStride, int width, int height,
