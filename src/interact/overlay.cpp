@@ -179,7 +179,7 @@ class CurveInteract : public OFX::OverlayInteract {
     if (!show) return;
     auto mb = [](size_t b) { return std::to_string((b + (size_t(1) << 19)) >> 20) + " MB"; };
     std::string line = "TEXT ANIMATOR, ALL INSTANCES:  RAM " + mb(hostAnalysisBytes());
-#if RTA_WITH_CUDA
+#if RTA_WITH_CUDA || RTA_WITH_METAL
     const DeviceMemoryUse d = deviceMemoryUse();
     line += "   GPU " + mb(d.stencils + d.scratch) + " (stencils " + mb(d.stencils) +
             ", blur buffers " + mb(d.scratch) + " in " + std::to_string(d.scratchCount) + ")";

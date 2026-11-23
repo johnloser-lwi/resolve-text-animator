@@ -21,6 +21,7 @@
 #include "compositor.h"
 #include "edit_block.h"
 #include "cuda_compositor.h"
+#include "metal_compositor.h"
 #include "diagnostics.h"
 #include "interact/overlay.h"
 #include "lru_budget.h"
@@ -180,6 +181,28 @@ rta::ImageView makeView(OFX::Image* img, const OfxRectI& region) {
   v.rowStride = -std::ptrdiff_t(img->getRowBytes()) / std::ptrdiff_t(sizeof(float));
   return v;
 }
+
+#if RTA_WITH_METAL
+// makeView for a Metal render. The host hands the image over as an
+// id<MTLBuffer>, not an address -- getPixelAddress on it computes nonsense -- so
+// the view is that buffer plus the float offset of the region's top-left pixel,
+// with the same negative stride that flips OFX's bottom-up rows.
+rta::MetalImage makeMetalImage(OFX::Image* img, const OfxRectI& region) {
+  rta::MetalImage m;
+  if (!img || !img->getPixelData()) return m;
+  const OfxRectI b = img->getBounds();
+  if (region.x1 < b.x1 || region.y1 < b.y1 || region.x2 > b.x2 || region.y2 > b.y2 ||
+      region.x2 <= region.x1 || region.y2 <= region.y1)
+    return m;
+  const std::ptrdiff_t rowFloats = std::ptrdiff_t(img->getRowBytes()) / std::ptrdiff_t(sizeof(float));
+  m.buffer = img->getPixelData();
+  m.width = region.x2 - region.x1;
+  m.height = region.y2 - region.y1;
+  m.offset = int64_t(region.y2 - 1 - b.y1) * rowFloats + int64_t(region.x1 - b.x1) * 4;
+  m.rowStride = -rowFloats;
+  return m;
+}
+#endif
 
 // Re-labelling every frame would be wasteful while scrubbing a static title,
 // so keep the last result and reuse it when the input and settings match.
@@ -390,6 +413,9 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     releaseAnalysis(&_cache);
 #if RTA_WITH_CUDA
     rta::forgetStencil(this);
+#endif
+#if RTA_WITH_METAL
+    rta::metalForgetStencil(this);
 #endif
   }
 
@@ -905,6 +931,12 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
 #if RTA_WITH_CUDA
   useCuda = args.isEnabledCudaRender && rta::cudaAvailable();
 #endif
+  // On a Mac they are Metal buffers instead, under the same rule.
+  bool useMetal = false;
+#if RTA_WITH_METAL
+  useMetal = args.isEnabledMetalRender && args.pMetalCmdQ != nullptr;
+#endif
+  (void)useMetal;
 
   // Clear the whole render window first: anything we don't draw is transparent.
   {
@@ -917,6 +949,11 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
       if (useCuda) {
         rta::cudaClearWindow(full.data, full.rowStride, full.width, full.height, clip,
                              args.pCudaStream);
+      } else
+#endif
+#if RTA_WITH_METAL
+      if (useMetal) {
+        rta::metalClearWindow(makeMetalImage(dst.get(), dstBounds), clip, args.pMetalCmdQ);
       } else
 #endif
       {
@@ -1081,6 +1118,28 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
   // The picture detection measures and the fingerprint that says when to
   // measure it again. Source's, unless the mask replaces it.
   const rta::ImageView& measured = useMask ? maskView : srcView;
+#if RTA_WITH_METAL
+  // The same three regions as Metal buffers. Only read when useMetal.
+  rta::MetalImage srcMetal, dstMetal, measuredMetal;
+  if (useMetal) {
+    srcMetal = makeMetalImage(src.get(), common);
+    dstMetal = makeMetalImage(dst.get(), common);
+    if (!srcMetal.valid() || !dstMetal.valid()) return;
+    if (!useMask) {
+      measuredMetal = srcMetal;
+    } else if (maskView.valid()) {
+      const OfxRectI mb = mask->getBounds();
+      measuredMetal = makeMetalImage(
+          mask.get(), OfxRectI{std::max(mb.x1, common.x1), std::max(mb.y1, common.y1),
+                               std::min(mb.x2, common.x2), std::min(mb.y2, common.y2)});
+    }
+  }
+  std::unique_ptr<rta::MetalLease> metalLease;
+  if (useMetal) {
+    metalLease.reset(new rta::MetalLease(args.pMetalCmdQ));
+    if (!metalLease->valid()) return;
+  }
+#endif
 
 #if RTA_WITH_CUDA
   // Device scratch for this render only -- the hash accumulator now, the blur
@@ -1101,6 +1160,15 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     bool ok = false;
     hash = rta::cudaHashAlpha(measured.data, measured.rowStride, measured.width, measured.height,
                               det.alphaThreshold, *lease->get(), args.pCudaStream, &ok);
+    if (!ok) {
+      return;
+    }
+  } else
+#endif
+#if RTA_WITH_METAL
+  if (useMetal) {
+    bool ok = false;
+    hash = rta::metalHashAlpha(measuredMetal, det.alphaThreshold, args.pMetalCmdQ, &ok);
     if (!ok) {
       return;
     }
@@ -1157,6 +1225,18 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
         }
         const std::ptrdiff_t absStride =
             measured.rowStride < 0 ? -measured.rowStride : measured.rowStride;
+        hostView = rta::ImageView{host.data() + absStride * (measured.height - 1), measured.width,
+                                  measured.height, -absStride};
+      }
+#endif
+#if RTA_WITH_METAL
+      if (useMetal && measured.valid()) {
+        if (!rta::metalDownload(host, measuredMetal, args.pMetalCmdQ)) {
+          return;
+        }
+        // The same layout cudaDownload leaves, so the same flip.
+        const std::ptrdiff_t absStride = measuredMetal.rowStride < 0 ? -measuredMetal.rowStride
+                                                                     : measuredMetal.rowStride;
         hostView = rta::ImageView{host.data() + absStride * (measured.height - 1), measured.width,
                                   measured.height, -absStride};
       }
@@ -1571,6 +1651,22 @@ void TextAnimatorPlugin::render(const OFX::RenderArguments& args) {
     return;
   }
 #endif
+#if RTA_WITH_METAL
+  if (useMetal) {
+    // As the CUDA branch: the stencil of whichever segmentation this frame
+    // draws, uploaded only when the store does not already hold it.
+    const std::shared_ptr<const rta::Segmentation>& owning =
+        unitSeg == segIn.get() ? segIn : unitSeg == segOut.get() ? segOut : segChar;
+    const std::shared_ptr<const rta::MetalStencil> stencil =
+        rta::metalStencil(this, owning, args.pMetalCmdQ);
+    if (!stencil) {
+      return;
+    }
+    rta::metalCompositeGroups(dstMetal, srcMetal, *stencil, unitSeg->groups, compTaps, taps,
+                              window, *metalLease, args.pMetalCmdQ, pivotData);
+    return;
+  }
+#endif
 
   rta::compositeGroups(dstView, srcView, *unitSeg, compTaps, taps, window, pivotData);
 
@@ -1609,6 +1705,12 @@ void TextAnimatorFactory::describe(OFX::ImageEffectDescriptor& desc) {
   // which is what stops a CPU plugin from playing back in realtime.
   desc.setSupportsCudaRender(true);
   desc.setSupportsCudaStream(true);
+#endif
+#if RTA_WITH_METAL
+  // The same, on a Mac: frames stay in Metal buffers and are composited there.
+  // Only offered where a Metal device exists, so a machine without one still
+  // gets the CPU path rather than buffers it cannot use.
+  desc.setSupportsMetalRender(rta::metalAvailable());
 #endif
 
   // Plugin-level property, so it belongs in describe() rather than

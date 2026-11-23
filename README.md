@@ -30,9 +30,13 @@ is one readback per *title change* rather than one per frame. To detect that
 change cheaply, the alpha fingerprint is reduced on-device, so the steady-state
 per-frame cost off the GPU is an 8-byte readback.
 
-On **macOS** there is no CUDA, so the plugin renders on the CPU — the same
-compositor `segtest` verifies — and Resolve moves each frame to system memory
-for it. Expect slower playback than on Windows until a Metal path exists.
+On **macOS** the same pipeline runs on **Metal**: the fingerprint, the one
+readback per title change, and the composite (masked resample, motion blur,
+defocus) are Metal kernels working on Resolve's own buffers, so frames stay on
+the GPU there too. The kernels are compiled from source inside the plugin on the
+first render, so the build needs no Metal toolchain. `metaltest` checks them
+against the CPU compositor; they agree bit for bit except where rotation brings
+in the GPU's `sin`/`cos` (worst difference about 1e-4).
 
 ## Requirements
 
@@ -58,8 +62,8 @@ Produces `build\bundle\TextAnimator.ofx.bundle` and `build\segtest.exe`.
 `build.ps1` uses the CMake and Ninja bundled with VS 18 rather than the system
 CMake, which predates VS 18 and cannot generate for it.
 
-`.\build.ps1 -NoCuda` builds the CPU-only plugin — the Mac's render path — into
-`build-cpu\`, so that path can be tried in Resolve without a Mac.
+`.\build.ps1 -NoCuda` builds the CPU-only plugin into `build-cpu\`, so the
+CPU path can be tried in Resolve on its own.
 
 macOS:
 
@@ -69,7 +73,8 @@ macOS:
 
 Fetches the OpenFX SDK at the same commit the Windows build uses, then produces
 `build/bundle/TextAnimator.ofx.bundle` (ad-hoc signed — Apple silicon will not
-load unsigned code) and `build/segtest`.
+load unsigned code), `build/segtest` and `build/metaltest`.
+`-DRTA_ENABLE_METAL=OFF` builds the CPU-only plugin instead.
 
 ## Install
 
@@ -372,6 +377,8 @@ Tune detection here, not in Resolve — the loop is seconds instead of a relaunc
 | `src/animator.*` | ordering, stagger timing, easing → per-group transform |
 | `src/compositor.*` | label-masked sprite extraction and compositing (CPU) |
 | `src/cuda_compositor.*` | the same compositing as CUDA kernels, plus on-device hashing |
+| `src/metal_compositor.*` | the same again as Metal kernels, for the Mac |
+| `tools/metaltest.cpp` | CPU vs Metal parity (`metaltest in.png --blur 8 --mblur 1 --rotate 30`) |
 | `src/diagnostics.*` | detection overlay |
 | `src/plugin.cpp` | OFX glue: params, render dispatch |
 | `src/preset_io*` | preset folder and the native Save/Load dialogs (Win32, AppKit) |

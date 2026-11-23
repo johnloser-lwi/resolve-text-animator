@@ -78,6 +78,28 @@ if(APPLE)
   target_link_libraries(TextAnimator PRIVATE "-framework AppKit" "-framework UniformTypeIdentifiers")
 endif()
 
+# ------------------------------------------------------------------ Metal path
+# The Mac's GPU render path, the counterpart of the CUDA one below. Its kernels
+# are compiled at runtime from source held in the plugin, so the build needs no
+# Metal toolchain -- the command line tools are enough, as for everything else.
+# -DRTA_ENABLE_METAL=OFF builds the CPU-only plugin, to compare against.
+option(RTA_ENABLE_METAL "Build the Metal render path on macOS" ON)
+if(APPLE AND RTA_ENABLE_METAL)
+  target_sources(TextAnimator PRIVATE src/metal_compositor.mm)
+  set_source_files_properties(src/metal_compositor.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_compile_definitions(TextAnimator PRIVATE RTA_WITH_METAL=1)
+  target_link_libraries(TextAnimator PRIVATE "-framework Metal" "-framework Foundation")
+  message(STATUS "Metal enabled")
+
+  # CPU-vs-Metal parity harness, the counterpart of cudatest.
+  add_executable(metaltest tools/metaltest.cpp src/metal_compositor.mm)
+  target_link_libraries(metaltest PRIVATE rta_core "-framework Metal" "-framework Foundation")
+  target_include_directories(metaltest PRIVATE external/stb)
+  target_compile_definitions(metaltest PRIVATE RTA_WITH_METAL=1)
+else()
+  target_compile_definitions(TextAnimator PRIVATE RTA_WITH_METAL=0)
+endif()
+
 # ------------------------------------------------------------------- CUDA path
 # Optional: without a CUDA toolkit the plugin still builds and runs on the CPU.
 # Never on macOS, which has no CUDA; there the CPU path is the render path.

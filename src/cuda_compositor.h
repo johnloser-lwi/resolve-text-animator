@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "animator.h"
+#include "device_memory.h"
 #include "image_view.h"
 #include "segmentation.h"
 
@@ -163,15 +164,8 @@ std::shared_ptr<const CudaSegmentation> deviceStencil(const void* owner,
 // CUDA context is not current, and a free there goes to the wrong context.
 void forgetStencil(const void* owner);
 
-// What the store holds right now, across every device and every instance.
-// Shown in the viewer so the plugin's share of the GPU can be told apart from
-// the host's own, which Task Manager reports as one number.
-struct DeviceMemoryUse {
-  size_t stencils = 0;
-  size_t scratch = 0;  // blur tiles and per-render buffers
-  int scratchCount = 0;
-};
-DeviceMemoryUse deviceMemoryUse();
+// deviceMemoryUse() -- what the store holds -- is declared in device_memory.h,
+// which the Metal path shares.
 
 // Content fingerprint of the alpha channel, computed on-device so detecting a
 // changed title costs an 8-byte readback rather than a whole frame. Combining
