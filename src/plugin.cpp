@@ -14,6 +14,7 @@
 #include "ofxsMultiThread.h"
 
 #include "animator.h"
+#include "button_row.h"
 #include "param_registry.h"
 #include "preset.h"
 #include "preset_io.h"
@@ -140,10 +141,16 @@ inline int kindOf(OFX::StringParamDescriptor*) { return rta::kPKString; }
 // Anything else -- groups, pages, push buttons -- holds nothing worth storing.
 inline int kindOf(...) { return rta::kPKNone; }
 
+// The toggle group a control belongs to (kLayout), once that group has been
+// defined in this describe; null for one that is in no group. Defined below,
+// after the layout table.
+const OFX::GroupParamDescriptor* groupFor(const std::string& name);
+
 template <class T>
 void addParam(OFX::PageParamDescriptor* page, T* p) {
   p->setCacheInvalidation(OFX::eCacheInvalidateValueAll);
   rta::registerParam(p->getName(), kindOf(p));
+  if (const OFX::GroupParamDescriptor* g = groupFor(p->getName())) p->setParent(*g);
   page->addChild(*p);
 }
 
@@ -156,7 +163,221 @@ void addParamUI(OFX::PageParamDescriptor* page, T* p) {
   // a preset that restored everything except the overlay toggles would be a
   // surprise. Push buttons deduce to kPKNone and drop out on their own.
   rta::registerParam(p->getName(), kindOf(p));
+  if (const OFX::GroupParamDescriptor* g = groupFor(p->getName())) p->setParent(*g);
   page->addChild(*p);
+}
+
+// ------------------------------------------------------------ Inspector tabs
+//
+// Resolve draws no OFX pages, so the tabs are its button row (button_row.h; the
+// how and why are in Multi Transform's docs/handoff-inspector-tabs.md). Picking
+// a tab hides every control that is not on it. Two rows, because more than five
+// 56 px buttons do not fit the Inspector's width. Anywhere but Resolve the two
+// rows are one Section dropdown.
+//
+// The ids are what the host stores. Never change one.
+enum Section { kSecIn = 0, kSecOut, kSecOrder, kSecDetect, kSecSpacing, kSecRender, kSecPresets,
+               kSecCount, kSecFirstMore = kSecRender };
+const char* const kParamTabsMain = "inspectorTabs";
+const char* const kParamTabsMore = "inspectorTabsMore";
+const char* const kTabsHint = "Which controls the Inspector shows. Changes nothing in the picture.";
+const std::vector<rta::TabSpec> kTabsMain = {
+    {"in", "In"}, {"out", "Out"}, {"order", "Order"}, {"detect", "Detect"}, {"spacing", "Spacing"}};
+const std::vector<rta::TabSpec> kTabsMore = {{"render", "Render"}, {"presets", "Presets"}};
+const std::vector<rta::TabSpec> kTabsAll = [] {
+  std::vector<rta::TabSpec> v = kTabsMain;
+  v.insert(v.end(), kTabsMore.begin(), kTabsMore.end());
+  return v;
+}();
+
+// Toggle groups: Resolve's own collapsible groups, with the twirl-down
+// triangle. Resolve does the folding; the plugin only hides a whole group, with
+// everything else, when its tab is not showing.
+//
+// EVERY control below the tab bar is in one, on every tab, because of how the
+// Edit page draws them (measured, Resolve 21.2):
+//
+//  - A hidden group still leaves its separator line behind. Hidden groups that
+//    sit next to each other leave ONE line between them -- but any ordinary
+//    control between two groups, even a hidden one, splits them, and each run
+//    then leaves a line of its own, 4 px below the last. With a few ungrouped
+//    controls per tab that stacked up to five lines under the tab bar.
+//  - A visible group draws a line above its heading and one after its last
+//    row, and two groups side by side share one.
+//
+// With nothing but groups below the tab bar, the hidden ones above a tab's
+// controls form a single run whose line is the first visible group's own, and
+// the same below: one line in each place, on every tab.
+//
+// Grouping also keeps push buttons where they are defined. Outside a group the
+// Edit page lifts every push button to the top of the effect.
+struct ToggleGroup {
+  const char* name;
+  const char* title;
+};
+const ToggleGroup kToggleGroups[] = {
+    {"presetFiles", "Preset Files"},
+    {"inSetup", "Setup"},
+    {"inTiming", "Timing"},
+    {"inMotion", "Motion"},
+    {"inEasing", "Easing"},
+    {"outSetup", "Setup"},
+    {"outTiming", "Timing"},
+    {"outMotion", "Motion"},
+    {"orderMain", "Order"},
+    {"orderLinks", "Links"},
+    {"orderSequence", "Sequence"},
+    {"orderRange", "Reveal Range"},
+    {"orderOut", "Out Order"},
+    {"detectMain", "Detection"},
+    {"detectOverrides", "Overrides"},
+    {"spacingTracking", "Tracking"},
+    {"spacingLines", "Line Spacing"},
+    {"renderBlur", "Motion Blur"},
+};
+constexpr int kToggleGroupCount = int(sizeof(kToggleGroups) / sizeof(kToggleGroups[0]));
+
+// The groups' descriptors during describeInContext, so a control defined after
+// its group can be put in it (attachToGroup, from addParam). Reset at the start
+// of every describe: the descriptors belong to that one call.
+OFX::GroupParamDescriptor* gGroupDesc[kToggleGroupCount] = {};
+
+void defineToggleGroup(OFX::ImageEffectDescriptor& desc, OFX::PageParamDescriptor* page,
+                       const char* name, const char* title) {
+  OFX::GroupParamDescriptor* g = desc.defineGroupParam(name);
+  g->setLabels(title, title, title);
+  g->setOpen(true);
+  page->addChild(*g);
+  for (int i = 0; i < kToggleGroupCount; ++i)
+    if (std::strcmp(kToggleGroups[i].name, name) == 0) gGroupDesc[i] = g;
+}
+
+// Which tab and which group every control below the tab bar is on, in
+// definition order. The controls above the bar (the status line, Show
+// Detection, Show Timeline) are on every tab and so are not listed. The two
+// retired controls are, because they still need a group (see above); they are
+// hidden on every tab. describeInContext defines the same controls in the same
+// order -- keep the two in step.
+struct LayoutEntry {
+  const char* name;
+  Section section;
+  const char* group;  // a kToggleGroups name, or null
+};
+const LayoutEntry kLayout[] = {
+    // Presets: defined first, shown last (see describeInContext)
+    {"presetFiles", kSecPresets, nullptr},
+    {"savePreset", kSecPresets, "presetFiles"},
+    {"loadPreset", kSecPresets, "presetFiles"},
+    // In
+    {"inSetup", kSecIn, nullptr},
+    {"enableIn", kSecIn, "inSetup"},
+    {"groupMode", kSecIn, "inSetup"},
+    {"animation", kSecIn, "inSetup"},
+    {"inTiming", kSecIn, nullptr},
+    {"setStartToPlayhead", kSecIn, "inTiming"},
+    {"startTime", kSecIn, "inTiming"},
+    {"duration", kSecIn, "inTiming"},
+    {"stagger", kSecIn, "inTiming"},
+    {"staggerByLength", kSecIn, "inTiming"},
+    {"inMotion", kSecIn, nullptr},
+    {"distanceUnits", kSecIn, "inMotion"},
+    {"slideDistance", kSecIn, "inMotion"},
+    {"slideAngle", kSecIn, "inMotion"},
+    {"startScale", kSecIn, "inMotion"},
+    {"startRotation", kSecIn, "inMotion"},
+    {"startBlur", kSecIn, "inMotion"},
+    {"startBlurSamples", kSecIn, "inMotion"},
+    {"inEasing", kSecIn, nullptr},
+    {"easing", kSecIn, "inEasing"},
+    {"showCurveEditor", kSecIn, "inEasing"},
+    {"easeX1", kSecIn, "inEasing"},
+    {"easeY1", kSecIn, "inEasing"},
+    {"easeX2", kSecIn, "inEasing"},
+    {"easeY2", kSecIn, "inEasing"},
+    // Out
+    {"outSetup", kSecOut, nullptr},
+    {"enableOut", kSecOut, "outSetup"},
+    {"linkOut", kSecOut, "outSetup"},
+    {"mirrorOut", kSecOut, "outSetup"},
+    {"outGroupMode", kSecOut, "outSetup"},
+    {"outAnimation", kSecOut, "outSetup"},
+    {"outTiming", kSecOut, nullptr},
+    {"setOutEndToPlayhead", kSecOut, "outTiming"},
+    {"outOffset", kSecOut, "outTiming"},
+    {"clipLengthOverride", kSecOut, "outTiming"},
+    {"outDuration", kSecOut, "outTiming"},
+    {"outStagger", kSecOut, "outTiming"},
+    {"outMotion", kSecOut, nullptr},
+    {"outSlideDistance", kSecOut, "outMotion"},
+    {"outSlideAngle", kSecOut, "outMotion"},
+    {"outStartScale", kSecOut, "outMotion"},
+    {"outStartRotation", kSecOut, "outMotion"},
+    {"outStartBlur", kSecOut, "outMotion"},
+    {"outEasing", kSecOut, "outMotion"},
+    // Order
+    {"orderMain", kSecOrder, nullptr},
+    {"order", kSecOrder, "orderMain"},
+    {"lineOrder", kSecOrder, "orderMain"},
+    {"randomSeed", kSecOrder, "orderMain"},
+    {"manualOrder", kSecOrder, "orderMain"},
+    {"orderPick", kSecOrder, "orderMain"},
+    {"orderLinks", kSecOrder, nullptr},
+    {"linkGroups", kSecOrder, "orderLinks"},
+    {"linkMode", kSecOrder, "orderLinks"},
+    {"orderSequence", kSecOrder, nullptr},
+    {"sequence", kSecOrder, "orderSequence"},
+    {"sequencePick", kSecOrder, "orderSequence"},
+    {"orderRange", kSecOrder, nullptr},
+    {"revealStart", kSecOrder, "orderRange"},
+    {"singleElement", kSecOrder, "orderRange"},
+    {"revealEnd", kSecOrder, "orderRange"},
+    {"isolate", kSecOrder, "orderRange"},
+    {"orderOut", kSecOrder, nullptr},
+    {"outOrder", kSecOrder, "orderOut"},
+    {"outLineOrder", kSecOrder, "orderOut"},
+    {"outRandomSeed", kSecOrder, "orderOut"},
+    // Detect
+    {"detectMain", kSecDetect, nullptr},
+    {"alphaThreshold", kSecDetect, "detectMain"},
+    {"minBlobArea", kSecDetect, "detectMain"},
+    {"wordGapSensitivity", kSecDetect, "detectMain"},
+    {"characterGap", kSecDetect, "detectMain"},
+    {"charPadding", kSecDetect, "detectMain"},
+    {"minMarkArea", kSecDetect, "detectMain"},
+    {"bridgeRadius", kSecDetect, "detectMain"},
+    {"autoSlant", kSecDetect, "detectMain"},
+    {"italicSlant", kSecDetect, "detectMain"},
+    {"referenceText", kSecDetect, "detectMain"},
+    {"detectOverrides", kSecDetect, nullptr},
+    {"mergeAt", kSecDetect, "detectOverrides"},
+    {"splitBefore", kSecDetect, "detectOverrides"},
+    {"clearOverrides", kSecDetect, "detectOverrides"},
+    // Spacing
+    {"spacingTracking", kSecSpacing, nullptr},
+    {"tracking", kSecSpacing, "spacingTracking"},
+    {"trackAnchor", kSecSpacing, "spacingTracking"},
+    {"spacingLines", kSecSpacing, nullptr},
+    {"lineSpacing", kSecSpacing, "spacingLines"},
+    {"lineAnchor", kSecSpacing, "spacingLines"},
+    // Render
+    {"renderBlur", kSecRender, nullptr},
+    {"motionBlur", kSecRender, "renderBlur"},
+    {"shutterAngle", kSecRender, "renderBlur"},
+    {"blurSamples", kSecRender, "renderBlur"},
+    {"adaptiveSamples", kSecRender, "renderBlur"},
+    {"pixelsPerSample", kSecRender, "renderBlur"},
+};
+constexpr int kLayoutCount = int(sizeof(kLayout) / sizeof(kLayout[0]));
+
+const OFX::GroupParamDescriptor* groupFor(const std::string& name) {
+  for (const LayoutEntry& e : kLayout) {
+    if (name != e.name) continue;
+    if (!e.group) return nullptr;
+    for (int i = 0; i < kToggleGroupCount; ++i)
+      if (std::strcmp(kToggleGroups[i].name, e.group) == 0) return gGroupDesc[i];
+    return nullptr;
+  }
+  return nullptr;
 }
 
 // OFX images are bottom-up: y=0 is the bottom row. The core code is top-down
@@ -327,7 +548,6 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _singleElement = fetchBooleanParam("singleElement");
     _isolate = fetchBooleanParam("isolate");
     _orderPick = fetchBooleanParam("orderPick");
-    syncRangeUI();
     _lineOrder = fetchChoiceParam("lineOrder");
     _randomSeed = fetchIntParam("randomSeed");
     _startTime = fetchDoubleParam("startTime");
@@ -393,18 +613,32 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     // The legacy pixel padding exists to keep old projects grouping the way they
     // were saved, and for nothing else. Showing it beside the relative control it
     // replaces just poses a question with no good answer, so it appears only when
-    // a project actually carries a value in it.
+    // a project actually carries a value in it. Decided once, on load, so that
+    // dragging it to 0 does not make the row vanish from under the mouse.
     try {
-      _bridgeRadius->setIsSecret(_bridgeRadius->getValue() == 0);
+      _showLegacyPad = _bridgeRadius->getValue() != 0;
     } catch (...) {
     }
     _maxLetterGap = fetchDoubleParam("characterGap");
     _showDiagnostics = fetchBooleanParam("showDiagnostics");
     _hostWarning = fetchStringParam("hostWarning");
     updateHostWarning();
-    // Also on load, or a project saved with overrides would open showing no way
-    // to clear them until something else was touched.
-    syncOverrideUI();
+
+    // Inspector tabs. Every lookup by name happens here: the support library
+    // caches parameter handles in an unlocked map, and a first fetch during a
+    // render can crash Fusion. After this, the visibility pass only reads.
+    for (int i = 0; i < kLayoutCount; ++i) {
+      _layoutParams[i] = paramExists(kLayout[i].name) ? getParam(kLayout[i].name) : nullptr;
+      _layoutSecret[i] = -1;  // not yet set by us; the first pass sets every one
+    }
+    // Resolve builds a new instance every time a clip is selected, and remembers
+    // the tab within a session even though it is not saved. Starting on In
+    // regardless would light one button and show another tab's controls.
+    const int sec = readSection();
+    if (sec >= 0) _section = sec;
+    // Also hides Clear Overrides on a project saved with none, End At with One
+    // Element Per Clip on, and so on -- not only the other tabs.
+    syncVisibility();
   }
 
   ~TextAnimatorPlugin() override {
@@ -542,17 +776,65 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     _seenT2 = rawT2;
   }
 
-  // The Clear button is hidden while there is nothing to clear, matching the
-  // overlay's. A control that cannot do anything still invites a click and still
-  // costs a row of the panel.
-  void syncOverrideUI() {
+  // ------------------------------------------------------- what is visible
+  //
+  // The one place any control is shown or hidden. A control is visible when it
+  // is on the current tab, its toggle group (if any) is open, and its own rule
+  // allows it. One pass, because separate passes for the tab and for a rule
+  // would each overwrite the other's answer.
+
+  // The selected tab, or -1 if none can be read. Each button row holds the id of
+  // its lit button, or "" when the other row has it; the fallback Choice holds
+  // the section number itself.
+  int readSection() const {
+    if (!rta::TabRowIsButtons(this, kParamTabsMain))
+      return rta::GetTabRow(this, kParamTabsMain, kTabsAll);
+    const int m = rta::GetTabRow(this, kParamTabsMain, kTabsMain);
+    if (m >= 0) return m;
+    const int r = rta::GetTabRow(this, kParamTabsMore, kTabsMore);
+    return r >= 0 ? kSecFirstMore + r : -1;
+  }
+
+  // Folding a toggle group open or shut is Resolve's own business; this only
+  // hides a whole group, with everything else, when its tab is not showing.
+  void syncVisibility() {
+    // The controls' own rules.
+    //
+    // Clear Overrides is hidden while there is nothing to clear, matching the
+    // overlay's: a control that cannot do anything still invites a click and
+    // still costs a row of the panel. End At only means something when the clip
+    // introduces a run of elements; with one per clip it IS Start At, so showing
+    // it invites the two to disagree.
+    bool noOverrides = false, oneElement = false;
     try {
       std::string m, sp;
       _mergeAt->getValue(m);
       _splitBefore->getValue(sp);
-      const bool none = parseIndexList(m).empty() && parseIndexList(sp).empty();
-      _clearOverrides->setIsSecret(none);
+      noOverrides = parseIndexList(m).empty() && parseIndexList(sp).empty();
+      oneElement = _singleElement->getValue();
     } catch (...) {
+    }
+    for (int i = 0; i < kLayoutCount; ++i) {
+      OFX::Param* p = _layoutParams[i];
+      if (!p) continue;
+      const char* name = kLayout[i].name;
+      bool hidden = kLayout[i].section != _section;
+      if (!hidden) {
+        if (std::strcmp(name, "clearOverrides") == 0) hidden = noOverrides;
+        else if (std::strcmp(name, "revealEnd") == 0) hidden = oneElement;
+        else if (std::strcmp(name, "bridgeRadius") == 0) hidden = !_showLegacyPad;
+        // Retired: defined so old projects load, never shown.
+        else if (std::strcmp(name, "startBlurSamples") == 0 || std::strcmp(name, "minBlobArea") == 0)
+          hidden = true;
+      }
+      // Each setIsSecret is a round trip to the host, so only what changed.
+      if (_layoutSecret[i] != signed(hidden)) {
+        try {
+          p->setIsSecret(hidden);
+          _layoutSecret[i] = hidden;
+        } catch (...) {
+        }
+      }
     }
   }
 
@@ -657,10 +939,34 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     }
     rta::endEdit(this);
     _applyingPreset = false;
-    syncOverrideUI();
+    syncVisibility();
   }
 
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
+    // Tabs. Picking on one row clears the other, which calls back here at once
+    // for that row with an empty value; GetTabRow says -1 for it and nothing
+    // happens. The fallback Choice is one control and needs none of that.
+    if (name == kParamTabsMain || name == kParamTabsMore) {
+      int section = -1;
+      if (!rta::TabRowIsButtons(this, kParamTabsMain)) {
+        section = rta::GetTabRow(this, kParamTabsMain, kTabsAll);
+      } else if (name == kParamTabsMain) {
+        section = rta::GetTabRow(this, kParamTabsMain, kTabsMain);
+        if (section >= 0) rta::ClearTabRow(this, kParamTabsMore);
+      } else {
+        const int i = rta::GetTabRow(this, kParamTabsMore, kTabsMore);
+        if (i >= 0) {
+          section = kSecFirstMore + i;
+          rta::ClearTabRow(this, kParamTabsMain);
+        }
+      }
+      if (section >= 0 && section != _section) {
+        _section = section;
+        syncVisibility();
+      }
+      return;
+    }
+
     // While a preset is landing, the per-parameter reactions would fire once per
     // value and fight the values still being written.
     if (_applyingPreset) return;
@@ -705,7 +1011,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
     }
 
     if (name == "singleElement") {
-      syncRangeUI();
+      syncVisibility();
       return;
     }
     if (name == "orderPick") {
@@ -724,7 +1030,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
       _mergeAt->setValue("");
       _splitBefore->setValue("");
       rta::endEdit(this);
-      syncOverrideUI();
+      syncVisibility();
       return;
     }
 
@@ -755,7 +1061,7 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
         rta::endEdit(this);
       }
       _cleaningLists = false;
-      syncOverrideUI();
+      syncVisibility();
       return;
     }
 
@@ -794,15 +1100,6 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   //
   // Written to the LABEL, not the value: Resolve draws only the label of a
   // string parameter, so a message left in the value would be invisible.
-  // End At only means something when the clip introduces a run of elements. With
-  // one per clip it is Start At, so showing it invites the two to disagree.
-  void syncRangeUI() {
-    try {
-      _revealEnd->setIsSecret(_singleElement->getValue());
-    } catch (...) {
-    }
-  }
-
   void updateHostWarning() {
     double t1 = 0.0, t2 = 0.0;
     bool ok = true;
@@ -876,6 +1173,13 @@ class TextAnimatorPlugin : public OFX::ImageEffect {
   OFX::BooleanParam *_showDiagnostics, *_motionBlur, *_adaptiveSamples, *_staggerByLength;
   OFX::DoubleParam* _pixelsPerSample;
   OFX::StringParam* _hostWarning;
+
+  // Inspector tabs (kLayout). _layoutSecret is what this instance last told the
+  // host for each control, -1 before the first pass.
+  int _section = kSecIn;
+  OFX::Param* _layoutParams[kLayoutCount] = {};
+  signed char _layoutSecret[kLayoutCount] = {};
+  bool _showLegacyPad = false;  // Character Padding (px): only in a project that set it
 
   // Exit stage.
   OFX::BooleanParam *_enableIn, *_enableOut, *_linkOut, *_mirrorOut;
@@ -1752,7 +2056,8 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
   dst->setSupportsTiles(false);
 
   OFX::PageParamDescriptor* page = desc.definePageParam("Controls");
-
+  for (auto& g : gGroupDesc) g = nullptr;  // this describe's groups, not the last one's
+  // -------------------------------------- Pinned: above the tabs, on every tab
   {
     // Status line. Resolve draws a string parameter's label rather than its
     // value, so the text lives in the label and is rewritten at runtime.
@@ -1771,20 +2076,64 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     addParamUI(page, p);  // status only: never worth purging the cache for
   }
   {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showDiagnostics");
+    p->setLabels("Show Detection", "Show Detection", "Show Detection");
+    p->setHint("Draws a coloured box around each detected unit over the static text.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showTimeline");
+    p->setLabels("Show Timeline", "Timeline", "Show Timeline");
+    p->setHint(
+        "Draws the entrance and the exit as two bars on a ruler of the clip, with the "
+        "playhead over them, so an overlap between the two is a band you can see rather "
+        "than four numbers to subtract. Drag a bar to move it: the In bar moves Start, "
+        "the Out bar moves End Offset. Hold Shift for five-frame steps.");
+    p->setDefault(false);
+    addParamUI(page, p);
+  }
+  // The tab bar. Everything above it shows on every tab; everything below
+  // belongs to one tab (kLayout) and is hidden on the others at runtime.
+  // Resolve lays the Inspector out in definition order, so this order is the
+  // order on screen.
+  rta::DefineTabBar(desc, page, {{kParamTabsMain, &kTabsMain}, {kParamTabsMore, &kTabsMore}},
+                    kTabsHint);
+  // --------------------------------------------------------------- Presets tab
+  // Defined first though its tab is last: Resolve's Edit page keeps drawing a
+  // group's separator line while the group is hidden, so every hidden group
+  // leaves its line where it would have been. Those of the tabs defined BEFORE
+  // the one showing all land on one spot, straight under the tab bar. With this
+  // group first, that spot carries a line on every tab -- its own separator on
+  // Presets, its leftover one on the rest -- and the others land on top of it.
+  // Without it the In tab, defined first, was the one tab with no line there.
+  // A group for the same reason as Overrides: ungrouped, the Edit page lifts
+  // both buttons above the status line, side by side, on every tab they show on.
+  defineToggleGroup(desc, page, "presetFiles", "Preset Files");
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("savePreset");
+    p->setLabels("Save Preset", "Save", "Save Preset");
+    p->setHint("Writes every setting to a .tapreset file.");
+    addParamUI(page, p);
+  }
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("loadPreset");
+    p->setLabels("Load Preset", "Load", "Load Preset");
+    p->setHint(
+        "Applies a .tapreset file. Settings the file does not mention keep their current "
+        "value, and a file that will not parse changes nothing at all.");
+    addParamUI(page, p);
+  }
+
+  defineToggleGroup(desc, page, "inSetup", "Setup");
+  // -------------------------------------------------------------------- In tab
+  {
     OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableIn");
     p->setLabels("In Animation", "In", "Enable In Animation");
     p->setHint("Animate the text on. With both In and Out off the text simply sits there.");
     p->setDefault(true);
     addParam(page, p);
   }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableOut");
-    p->setLabels("Out Animation", "Out", "Enable Out Animation");
-    p->setHint("Animate the text off, anchored to the end of the clip.");
-    p->setDefault(false);
-    addParam(page, p);
-  }
-
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("groupMode");
     p->setLabels("Animate By", "Animate By", "Animate By");
@@ -1809,209 +2158,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->setDefault(1);
     addParam(page, p);
   }
-  {
-    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("order");
-    p->setLabels("Order", "Order", "Order");
-    p->setHint("The sequence elements reveal in. Manual reads it from Manual Order below.");
-    p->appendOption("Forward");
-    p->appendOption("Reverse");
-    p->appendOption("Center Out");
-    p->appendOption("Random");
-    p->appendOption("Manual");
-    p->setDefault(0);
-    addParam(page, p);
-  }
-  {
-    OFX::StringParamDescriptor* p = desc.defineStringParam("manualOrder");
-    p->setLabels("Manual Order", "Manual Order", "Manual Reveal Order");
-    p->setHint(
-        "The reveal sequence written out, e.g. \"12, 0, 30\". Only used when Order is Manual. "
-        "The numbers are the ones Show Detection paints, so naming any character of a word "
-        "selects that word. The list need not be complete: what you name goes first, in the "
-        "order you name it, and everything else follows in normal reading order.");
-    p->setDefault("");
-    addParam(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("orderPick");
-    p->setLabels("Set Order By Clicking", "Pick Order", "Set Order By Clicking");
-    p->setHint(
-        "Turns the viewer into an order picker: click the elements in the sequence you want "
-        "them to reveal, and each one takes the next number. Click a numbered element again "
-        "to take it back out. Needs Show Detection on, and switches Order to Manual for you. "
-        "Anything you never click follows in normal reading order, so a sequence usually "
-        "means clicking one or two things rather than all of them.");
-    p->setDefault(false);
-    addParam(page, p);
-  }
-  {
-    OFX::StringParamDescriptor* p = desc.defineStringParam("linkGroups");
-    p->setLabels("Link Elements", "Links", "Link Elements");
-    p->setHint(
-        "Units that are ONE element, wherever they sit: \"3 7 12; 5 9\" joins three units "
-        "into one and two into another. Each ; ends a group; the numbers are the ones Show "
-        "Detection paints, and naming any character of a unit claims the whole unit. Unlike "
-        "Merge At, which only joins neighbours, a link can take the first and third dash of "
-        "a dashed line, or a label and its arrow. Linked units move, turn and scale as one. "
-        "Easier to write by clicking: see Link By Clicking.");
-    p->setDefault("");
-    addParam(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkMode");
-    p->setLabels("Link By Clicking", "Link Mode", "Link By Clicking");
-    p->setHint(
-        "Turns the viewer into a linker. Click an element to start a group, click more to "
-        "add them, drag a box to add everything inside it; click a linked element to take "
-        "it out again; click empty space to finish the group so the next click starts a "
-        "new one. Needs Show Detection on.");
-    p->setDefault(false);
-    addParamUI(page, p);
-  }
-  {
-    OFX::StringParamDescriptor* p = desc.defineStringParam("sequence");
-    p->setLabels("Sequence", "Sequence", "Sequence");
-    p->setHint(
-        "Cues: on this frame, this element starts. \"0:1, 60:3\" starts element 1 at frame "
-        "0 and element 3 at frame 60 -- element 2 follows element 1 by the normal stagger, "
-        "then everything holds until 60. Frames are clip frames, the same as Start (frames); "
-        "elements are numbered in reveal order, the same as Start At Element. A later frame "
-        "must name a later element; a cue that does not is ignored and flagged over the "
-        "viewer. What a cut does on the Edit page, for a Fusion comp where there is nothing "
-        "to cut. Empty leaves the reveal exactly as it is. Easier by clicking: see Sequence "
-        "By Clicking.");
-    p->setDefault("");
-    addParam(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("sequencePick");
-    p->setLabels("Sequence By Clicking", "Sequencer", "Sequence By Clicking");
-    p->setHint(
-        "Turns the viewer into a sequencer. Park the playhead, click an element, and it is "
-        "cued to start on that frame. Click a cued element at another frame to move its cue "
-        "there; click it on its own frame to remove it. A click that would put elements out "
-        "of order is refused, with the reason shown, and nothing is written. Elements are "
-        "numbered in reveal order.");
-    p->setDefault(false);
-    addParamUI(page, p);
-  }
-  {
-    OFX::IntParamDescriptor* p = desc.defineIntParam("revealStart");
-    p->setLabels("Start At Element", "Start At", "Start At Element");
-    p->setHint(
-        "The first element this clip introduces, counting from 1 in reading order -- "
-        "characters, words or lines, whichever Animate By is set to. Everything before it is "
-        "already on screen and still, so you can cut and carry on: 1 and 1 on the first clip, "
-        "2 and 2 on the next, and the graphic builds up one element per cut.");
-    p->setRange(1, 10000);
-    p->setDisplayRange(1, 40);
-    p->setDefault(1);
-    addParam(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("singleElement");
-    p->setLabels("One Element Per Clip", "One Per Clip", "One Element Per Clip");
-    p->setHint(
-        "Introduce exactly one element on this clip, the one named by Start At. End At "
-        "follows it and is hidden, so stepping through a build is one number per cut instead "
-        "of two kept in step by hand.");
-    p->setDefault(false);
-    addParam(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("isolate");
-    p->setLabels("Isolate", "Isolate", "Isolate Range");
-    p->setHint(
-        "Shows only the elements in the range, hiding the earlier ones instead of leaving "
-        "them settled on screen. For judging one element's animation on its own -- turn it "
-        "off to build a graphic up across cuts, where the point is that the elements from "
-        "earlier clips are still standing there.");
-    p->setDefault(false);
-    addParam(page, p);
-  }
-  {
-    OFX::IntParamDescriptor* p = desc.defineIntParam("revealEnd");
-    p->setLabels("End At Element", "End At", "End At Element");
-    p->setHint(
-        "The last element this clip introduces. Anything after it has not appeared yet. "
-        "0 means carry on to the end, which is what you want until you start cutting.");
-    p->setRange(0, 10000);
-    p->setDisplayRange(0, 40);
-    p->setDefault(0);
-    addParam(page, p);
-  }
-  {
-    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineOrder");
-    p->setLabels("Line Order", "Line Order", "Line Order");
-    p->setHint(
-        "Which line reveals first. Words still read left to right within each "
-        "line, unlike Order > Reverse which reverses those too.");
-    p->appendOption("Top to Bottom");
-    p->appendOption("Bottom to Top");
-    p->setDefault(0);
-    addParam(page, p);
-  }
-  {
-    OFX::IntParamDescriptor* p = desc.defineIntParam("randomSeed");
-    p->setLabels("Random Seed", "Seed", "Random Seed");
-    p->setRange(0, 9999);
-    p->setDisplayRange(0, 100);
-    p->setDefault(0);
-    addParam(page, p);
-  }
-  {
-    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("easing");
-    p->setLabels("Easing", "Easing", "Easing");
-    p->appendOption("Linear");
-    p->appendOption("Smoothstep");
-    p->appendOption("Cubic Out");
-    p->appendOption("Back Out");
-    p->appendOption("Custom (curve editor)");
-    p->setDefault(2);
-    addParam(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showCurveEditor");
-    p->setLabels("Show Curve Editor", "Curve Editor", "Show Curve Editor");
-    p->setHint(
-        "Draws the easing curve over the viewer. Set the Viewer's on-screen-control "
-        "dropdown to \"Open FX Overlay\" to see it, then drag the two handles.");
-    p->setDefault(false);
-    addParamUI(page, p);
-  }
-  {
-    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showTimeline");
-    p->setLabels("Show Timeline", "Timeline", "Show Timeline");
-    p->setHint(
-        "Draws the entrance and the exit as two bars on a ruler of the clip, with the "
-        "playhead over them, so an overlap between the two is a band you can see rather "
-        "than four numbers to subtract. Drag a bar to move it: the In bar moves Start, "
-        "the Out bar moves End Offset. Hold Shift for five-frame steps.");
-    p->setDefault(false);
-    addParamUI(page, p);
-  }
-
-  // The bezier control points. They are driven by dragging the on-screen
-  // handles, but stay visible as numbers so a curve can be typed in or copied
-  // between clips.
-  {
-    static const char* names[4] = {"easeX1", "easeY1", "easeX2", "easeY2"};
-    static const char* labels[4] = {"Curve X1", "Curve Y1", "Curve X2", "Curve Y2"};
-    static const double defs[4] = {0.25, 0.1, 0.25, 1.0};  // ~ CSS "ease"
-    for (int i = 0; i < 4; ++i) {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(names[i]);
-      p->setLabels(labels[i], labels[i], labels[i]);
-      // x is bounded to 0..1 or the curve stops being a function of time; y is
-      // free so handles can be pulled past the rails for overshoot.
-      if (i % 2 == 0)
-        p->setRange(0.0, 1.0);
-      else
-        p->setRange(-10.0, 10.0);
-      p->setDisplayRange(i % 2 == 0 ? 0.0 : -1.0, i % 2 == 0 ? 1.0 : 2.0);
-      p->setDefault(defs[i]);
-      addParam(page, p);
-    }
-  }
+  defineToggleGroup(desc, page, "inTiming", "Timing");
   {
     OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setStartToPlayhead");
     p->setLabels("Set Start to Playhead", "Set Start", "Set Start to Playhead");
@@ -2059,6 +2206,7 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->setDefault(false);
     addParam(page, p);
   }
+  defineToggleGroup(desc, page, "inMotion", "Motion");
   {
     OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("distanceUnits");
     p->setLabels("Distance Units", "Units", "Distance Units");
@@ -2098,7 +2246,6 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->setDefault(1.0);
     addParam(page, p);
   }
-
   {
     OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("startRotation");
     p->setLabels("Start Rotation", "Rotation", "Start Rotation");
@@ -2133,517 +2280,647 @@ void TextAnimatorFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     p->setIsSecret(true);
     addParam(page, p);
   }
-
-  // ------------------------------------------------------------ out stage
+  defineToggleGroup(desc, page, "inEasing", "Easing");
   {
-    OFX::GroupParamDescriptor* g = desc.defineGroupParam("outStage");
-    g->setLabels("Out Animation", "Out Animation", "Out Animation");
-    g->setOpen(false);
-
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outOffset");
-      p->setLabels("End Offset (frames)", "End Offset", "Out End Offset");
-      p->setHint(
-          "Frames before the END of the clip at which the out animation "
-          "finishes. 30 means it is fully gone 30 frames before the clip ends. "
-          "Anchored to the end, so it stays put when the clip is trimmed.");
-      p->setRange(-100000.0, 100000.0);
-      p->setDisplayRange(0.0, 120.0);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setOutEndToPlayhead");
-      p->setLabels("Set End to Playhead", "Set End", "Set Out End to Playhead");
-      p->setHint("Park the playhead where the exit should finish and click.");
-      p->setParent(*g);
-      // A push button holds no value, so it has no cache invalidation to set --
-      // the parameter it writes carries that instead.
-      addParamUI(page, p);
-    }
-    {
-      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkOut");
-      p->setLabels("Link to In", "Link", "Link Out to In");
-      p->setHint("Reuse the In settings for the Out animation. Untick for an independent set.");
-      p->setDefault(true);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("mirrorOut");
-      p->setLabels("Mirror", "Mirror", "Mirror Out");
-      p->setHint(
-          "Linked only. On, the text retreats the way it came: an entrance "
-          "rising from below sinks back down. Off, it continues in the "
-          "direction of travel and carries on upward.");
-      p->setDefault(true);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("clipLengthOverride");
-      p->setLabels("Clip Length Override", "Clip Length", "Clip Length Override");
-      p->setHint(
-          "0 = ask the host. Set this only if the host does not report a clip "
-          "length, in which case the Out animation has no end to anchor to and "
-          "is skipped.");
-      p->setRange(0.0, 1000000.0);
-      p->setDisplayRange(0.0, 600.0);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-
-    // Used only when Link is off.
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outGroupMode");
-      p->setLabels("Out Animate By", "Out By", "Out Animate By");
-      p->setHint("Unlinked only. The Out stage may group differently from the In stage.");
-      p->appendOption("Character");
-      p->appendOption("Word");
-      p->appendOption("Line");
-      p->appendOption("Object");
-      p->setDefault(1);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outAnimation");
-      p->setLabels("Out Animation Type", "Out Type", "Out Animation Type");
-      p->appendOption("Fade");
-      p->appendOption("Slide + Fade");
-      p->setDefault(1);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outEasing");
-      p->setLabels("Out Easing", "Out Easing", "Out Easing");
-      p->appendOption("Linear");
-      p->appendOption("Smoothstep");
-      p->appendOption("Cubic Out");
-      p->appendOption("Back Out");
-      p->appendOption("Custom (curve editor)");
-      p->setDefault(2);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outOrder");
-      p->setLabels("Out Order", "Out Order", "Out Order");
-      p->appendOption("Forward");
-      p->appendOption("Reverse");
-      p->appendOption("Center Out");
-      p->appendOption("Random");
-      p->appendOption("Manual");
-      p->setDefault(0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outLineOrder");
-      p->setLabels("Out Line Order", "Out Lines", "Out Line Order");
-      p->appendOption("Top to Bottom");
-      p->appendOption("Bottom to Top");
-      p->setDefault(0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::IntParamDescriptor* p = desc.defineIntParam("outRandomSeed");
-      p->setLabels("Out Random Seed", "Out Seed", "Out Random Seed");
-      p->setRange(0, 9999);
-      p->setDisplayRange(0, 100);
-      p->setDefault(0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outDuration");
-      p->setLabels("Out Duration (frames)", "Out Duration", "Out Duration");
-      p->setRange(0.01, 100000.0);
-      p->setDisplayRange(1.0, 60.0);
-      p->setDefault(12.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStagger");
-      p->setLabels("Out Stagger (frames)", "Out Stagger", "Out Stagger");
-      p->setRange(0.0, 100000.0);
-      p->setDisplayRange(0.0, 15.0);
-      p->setDefault(2.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outSlideDistance");
-      p->setLabels("Out Slide Distance", "Out Distance", "Out Slide Distance");
-      p->setHint("In the same Distance Units as the In stage.");
-      p->setRange(-10000.0, 10000.0);
-      p->setDisplayRange(0.0, 30.0);
-      p->setDefault(4.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outSlideAngle");
-      p->setLabels("Out Slide Angle", "Out Angle", "Out Slide Angle");
-      p->setHint("Direction the unit departs towards. 90 sinks downward.");
-      p->setRange(-360.0, 360.0);
-      p->setDisplayRange(0.0, 360.0);
-      p->setDefault(90.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartScale");
-      p->setLabels("Out End Scale", "Out Scale", "Out End Scale");
-      p->setRange(0.01, 10.0);
-      p->setDisplayRange(0.2, 2.0);
-      p->setDefault(1.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartRotation");
-      p->setLabels("Out End Rotation", "Out Rotation", "Out End Rotation");
-      p->setRange(-3600.0, 3600.0);
-      p->setDisplayRange(-180.0, 180.0);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartBlur");
-      p->setLabels("Out End Blur", "Out Blur", "Out End Blur");
-      p->setRange(0.0, 500.0);
-      p->setDisplayRange(0.0, 5.0);
-      p->setDefault(0.0);
-      p->setParent(*g);
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("easing");
+    p->setLabels("Easing", "Easing", "Easing");
+    p->appendOption("Linear");
+    p->appendOption("Smoothstep");
+    p->appendOption("Cubic Out");
+    p->appendOption("Back Out");
+    p->appendOption("Custom (curve editor)");
+    p->setDefault(2);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showCurveEditor");
+    p->setLabels("Show Curve Editor", "Curve Editor", "Show Curve Editor");
+    p->setHint(
+        "Draws the easing curve over the viewer. Set the Viewer's on-screen-control "
+        "dropdown to \"Open FX Overlay\" to see it, then drag the two handles.");
+    p->setDefault(false);
+    addParamUI(page, p);
+  }
+  // The bezier control points. They are driven by dragging the on-screen
+  // handles, but stay visible as numbers so a curve can be typed in or copied
+  // between clips.
+  {
+    static const char* names[4] = {"easeX1", "easeY1", "easeX2", "easeY2"};
+    static const char* labels[4] = {"Curve X1", "Curve Y1", "Curve X2", "Curve Y2"};
+    static const double defs[4] = {0.25, 0.1, 0.25, 1.0};  // ~ CSS "ease"
+    for (int i = 0; i < 4; ++i) {
+      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam(names[i]);
+      p->setLabels(labels[i], labels[i], labels[i]);
+      // x is bounded to 0..1 or the curve stops being a function of time; y is
+      // free so handles can be pulled past the rails for overshoot.
+      if (i % 2 == 0)
+        p->setRange(0.0, 1.0);
+      else
+        p->setRange(-10.0, 10.0);
+      p->setDisplayRange(i % 2 == 0 ? 0.0 : -1.0, i % 2 == 0 ? 1.0 : 2.0);
+      p->setDefault(defs[i]);
       addParam(page, p);
     }
   }
 
+  defineToggleGroup(desc, page, "outSetup", "Setup");
+  // ------------------------------------------------------------------- Out tab
   {
-    OFX::GroupParamDescriptor* g = desc.defineGroupParam("motion");
-    g->setLabels("Motion Blur", "Motion Blur", "Motion Blur");
-    g->setOpen(false);
-
-    {
-      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("motionBlur");
-      p->setLabels("Motion Blur", "Motion Blur", "Motion Blur");
-      p->setHint(
-          "Supersamples each unit's transform across the open shutter, so "
-          "movement, scaling and rotation all blur.");
-      p->setDefault(false);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("shutterAngle");
-      p->setLabels("Shutter Angle", "Shutter", "Shutter Angle");
-      p->setHint("Degrees of a frame the shutter is open. 180 matches a normal cine shutter.");
-      p->setRange(0.0, 360.0);
-      p->setDisplayRange(0.0, 360.0);
-      p->setDefault(180.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::IntParamDescriptor* p = desc.defineIntParam("blurSamples");
-      p->setLabels("Samples", "Samples", "Blur Samples");
-      p->setHint("Taps used for motion blur and start blur. Higher is smoother but slower.");
-      p->setRange(2, 64);
-      p->setDisplayRange(2, 32);
-      p->setDefault(8);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("adaptiveSamples");
-      p->setLabels("Adaptive Samples", "Adaptive", "Adaptive Samples");
-      p->setHint(
-          "Spend taps in proportion to how much the frame actually smears, so Samples becomes "
-          "an upper bound rather than a fixed cost. A settled title costs one tap however high "
-          "Samples is set.");
-      p->setDefault(true);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("pixelsPerSample");
-      p->setLabels("Sample Density", "Density", "Pixels Per Sample");
-      p->setHint(
-          "Pixels of smear each adaptive tap covers. Lower is smoother and slower. Ignored "
-          "when Adaptive Samples is off.");
-      p->setRange(0.25, 16.0);
-      p->setDisplayRange(0.5, 8.0);
-      p->setDefault(2.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("enableOut");
+    p->setLabels("Out Animation", "Out", "Enable Out Animation");
+    p->setHint("Animate the text off, anchored to the end of the clip.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkOut");
+    p->setLabels("Link to In", "Link", "Link Out to In");
+    p->setHint("Reuse the In settings for the Out animation. Untick for an independent set.");
+    p->setDefault(true);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("mirrorOut");
+    p->setLabels("Mirror", "Mirror", "Mirror Out");
+    p->setHint(
+        "Linked only. On, the text retreats the way it came: an entrance "
+        "rising from below sinks back down. Off, it continues in the "
+        "direction of travel and carries on upward.");
+    p->setDefault(true);
+    addParam(page, p);
+  }
+  // Used only when Link is off.
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outGroupMode");
+    p->setLabels("Out Animate By", "Out By", "Out Animate By");
+    p->setHint("Unlinked only. The Out stage may group differently from the In stage.");
+    p->appendOption("Character");
+    p->appendOption("Word");
+    p->appendOption("Line");
+    p->appendOption("Object");
+    p->setDefault(1);
+    addParam(page, p);
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outAnimation");
+    p->setLabels("Out Animation Type", "Out Type", "Out Animation Type");
+    p->appendOption("Fade");
+    p->appendOption("Slide + Fade");
+    p->setDefault(1);
+    addParam(page, p);
+  }
+  defineToggleGroup(desc, page, "outTiming", "Timing");
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("setOutEndToPlayhead");
+    p->setLabels("Set End to Playhead", "Set End", "Set Out End to Playhead");
+    p->setHint("Park the playhead where the exit should finish and click.");
+    // A push button holds no value, so it has no cache invalidation to set --
+    // the parameter it writes carries that instead.
+    addParamUI(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outOffset");
+    p->setLabels("End Offset (frames)", "End Offset", "Out End Offset");
+    p->setHint(
+        "Frames before the END of the clip at which the out animation "
+        "finishes. 30 means it is fully gone 30 frames before the clip ends. "
+        "Anchored to the end, so it stays put when the clip is trimmed.");
+    p->setRange(-100000.0, 100000.0);
+    p->setDisplayRange(0.0, 120.0);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("clipLengthOverride");
+    p->setLabels("Clip Length Override", "Clip Length", "Clip Length Override");
+    p->setHint(
+        "0 = ask the host. Set this only if the host does not report a clip "
+        "length, in which case the Out animation has no end to anchor to and "
+        "is skipped.");
+    p->setRange(0.0, 1000000.0);
+    p->setDisplayRange(0.0, 600.0);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outDuration");
+    p->setLabels("Out Duration (frames)", "Out Duration", "Out Duration");
+    p->setRange(0.01, 100000.0);
+    p->setDisplayRange(1.0, 60.0);
+    p->setDefault(12.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStagger");
+    p->setLabels("Out Stagger (frames)", "Out Stagger", "Out Stagger");
+    p->setRange(0.0, 100000.0);
+    p->setDisplayRange(0.0, 15.0);
+    p->setDefault(2.0);
+    addParam(page, p);
+  }
+  defineToggleGroup(desc, page, "outMotion", "Motion");
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outSlideDistance");
+    p->setLabels("Out Slide Distance", "Out Distance", "Out Slide Distance");
+    p->setHint("In the same Distance Units as the In stage.");
+    p->setRange(-10000.0, 10000.0);
+    p->setDisplayRange(0.0, 30.0);
+    p->setDefault(4.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outSlideAngle");
+    p->setLabels("Out Slide Angle", "Out Angle", "Out Slide Angle");
+    p->setHint("Direction the unit departs towards. 90 sinks downward.");
+    p->setRange(-360.0, 360.0);
+    p->setDisplayRange(0.0, 360.0);
+    p->setDefault(90.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartScale");
+    p->setLabels("Out End Scale", "Out Scale", "Out End Scale");
+    p->setRange(0.01, 10.0);
+    p->setDisplayRange(0.2, 2.0);
+    p->setDefault(1.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartRotation");
+    p->setLabels("Out End Rotation", "Out Rotation", "Out End Rotation");
+    p->setRange(-3600.0, 3600.0);
+    p->setDisplayRange(-180.0, 180.0);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("outStartBlur");
+    p->setLabels("Out End Blur", "Out Blur", "Out End Blur");
+    p->setRange(0.0, 500.0);
+    p->setDisplayRange(0.0, 5.0);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outEasing");
+    p->setLabels("Out Easing", "Out Easing", "Out Easing");
+    p->appendOption("Linear");
+    p->appendOption("Smoothstep");
+    p->appendOption("Cubic Out");
+    p->appendOption("Back Out");
+    p->appendOption("Custom (curve editor)");
+    p->setDefault(2);
+    addParam(page, p);
   }
 
+  defineToggleGroup(desc, page, "orderMain", "Order");
+  // -------------------- Order tab: everything about the order things reveal in
   {
-    OFX::GroupParamDescriptor* g = desc.defineGroupParam("presets");
-    g->setLabels("Presets", "Presets", "Presets");
-    g->setOpen(false);
-
-    {
-      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("savePreset");
-      p->setLabels("Save Preset", "Save", "Save Preset");
-      p->setHint("Writes every setting to a .tapreset file.");
-      p->setParent(*g);
-      addParamUI(page, p);
-    }
-    {
-      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("loadPreset");
-      p->setLabels("Load Preset", "Load", "Load Preset");
-      p->setHint(
-          "Applies a .tapreset file. Settings the file does not mention keep their current "
-          "value, and a file that will not parse changes nothing at all.");
-      p->setParent(*g);
-      addParamUI(page, p);
-    }
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("order");
+    p->setLabels("Order", "Order", "Order");
+    p->setHint("The sequence elements reveal in. Manual reads it from Manual Order below.");
+    p->appendOption("Forward");
+    p->appendOption("Reverse");
+    p->appendOption("Center Out");
+    p->appendOption("Random");
+    p->appendOption("Manual");
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineOrder");
+    p->setLabels("Line Order", "Line Order", "Line Order");
+    p->setHint(
+        "Which line reveals first. Words still read left to right within each "
+        "line, unlike Order > Reverse which reverses those too.");
+    p->appendOption("Top to Bottom");
+    p->appendOption("Bottom to Top");
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("randomSeed");
+    p->setLabels("Random Seed", "Seed", "Random Seed");
+    p->setRange(0, 9999);
+    p->setDisplayRange(0, 100);
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("manualOrder");
+    p->setLabels("Manual Order", "Manual Order", "Manual Reveal Order");
+    p->setHint(
+        "The reveal sequence written out, e.g. \"12, 0, 30\". Only used when Order is Manual. "
+        "The numbers are the ones Show Detection paints, so naming any character of a word "
+        "selects that word. The list need not be complete: what you name goes first, in the "
+        "order you name it, and everything else follows in normal reading order.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("orderPick");
+    p->setLabels("Set Order By Clicking", "Pick Order", "Set Order By Clicking");
+    p->setHint(
+        "Turns the viewer into an order picker: click the elements in the sequence you want "
+        "them to reveal, and each one takes the next number. Click a numbered element again "
+        "to take it back out. Needs Show Detection on, and switches Order to Manual for you. "
+        "Anything you never click follows in normal reading order, so a sequence usually "
+        "means clicking one or two things rather than all of them.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  defineToggleGroup(desc, page, "orderLinks", "Links");
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("linkGroups");
+    p->setLabels("Link Elements", "Links", "Link Elements");
+    p->setHint(
+        "Units that are ONE element, wherever they sit: \"3 7 12; 5 9\" joins three units "
+        "into one and two into another. Each ; ends a group; the numbers are the ones Show "
+        "Detection paints, and naming any character of a unit claims the whole unit. Unlike "
+        "Merge At, which only joins neighbours, a link can take the first and third dash of "
+        "a dashed line, or a label and its arrow. Linked units move, turn and scale as one. "
+        "Easier to write by clicking: see Link By Clicking.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("linkMode");
+    p->setLabels("Link By Clicking", "Link Mode", "Link By Clicking");
+    p->setHint(
+        "Turns the viewer into a linker. Click an element to start a group, click more to "
+        "add them, drag a box to add everything inside it; click a linked element to take "
+        "it out again; click empty space to finish the group so the next click starts a "
+        "new one. Needs Show Detection on.");
+    p->setDefault(false);
+    addParamUI(page, p);
+  }
+  defineToggleGroup(desc, page, "orderSequence", "Sequence");
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("sequence");
+    p->setLabels("Sequence", "Sequence", "Sequence");
+    p->setHint(
+        "Cues: on this frame, this element starts. \"0:1, 60:3\" starts element 1 at frame "
+        "0 and element 3 at frame 60 -- element 2 follows element 1 by the normal stagger, "
+        "then everything holds until 60. Frames are clip frames, the same as Start (frames); "
+        "elements are numbered in reveal order, the same as Start At Element. A later frame "
+        "must name a later element; a cue that does not is ignored and flagged over the "
+        "viewer. What a cut does on the Edit page, for a Fusion comp where there is nothing "
+        "to cut. Empty leaves the reveal exactly as it is. Easier by clicking: see Sequence "
+        "By Clicking.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("sequencePick");
+    p->setLabels("Sequence By Clicking", "Sequencer", "Sequence By Clicking");
+    p->setHint(
+        "Turns the viewer into a sequencer. Park the playhead, click an element, and it is "
+        "cued to start on that frame. Click a cued element at another frame to move its cue "
+        "there; click it on its own frame to remove it. A click that would put elements out "
+        "of order is refused, with the reason shown, and nothing is written. Elements are "
+        "numbered in reveal order.");
+    p->setDefault(false);
+    addParamUI(page, p);
+  }
+  defineToggleGroup(desc, page, "orderRange", "Reveal Range");
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("revealStart");
+    p->setLabels("Start At Element", "Start At", "Start At Element");
+    p->setHint(
+        "The first element this clip introduces, counting from 1 in reading order -- "
+        "characters, words or lines, whichever Animate By is set to. Everything before it is "
+        "already on screen and still, so you can cut and carry on: 1 and 1 on the first clip, "
+        "2 and 2 on the next, and the graphic builds up one element per cut.");
+    p->setRange(1, 10000);
+    p->setDisplayRange(1, 40);
+    p->setDefault(1);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("singleElement");
+    p->setLabels("One Element Per Clip", "One Per Clip", "One Element Per Clip");
+    p->setHint(
+        "Introduce exactly one element on this clip, the one named by Start At. End At "
+        "follows it and is hidden, so stepping through a build is one number per cut instead "
+        "of two kept in step by hand.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("revealEnd");
+    p->setLabels("End At Element", "End At", "End At Element");
+    p->setHint(
+        "The last element this clip introduces. Anything after it has not appeared yet. "
+        "0 means carry on to the end, which is what you want until you start cutting.");
+    p->setRange(0, 10000);
+    p->setDisplayRange(0, 40);
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("isolate");
+    p->setLabels("Isolate", "Isolate", "Isolate Range");
+    p->setHint(
+        "Shows only the elements in the range, hiding the earlier ones instead of leaving "
+        "them settled on screen. For judging one element's animation on its own -- turn it "
+        "off to build a graphic up across cuts, where the point is that the elements from "
+        "earlier clips are still standing there.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  defineToggleGroup(desc, page, "orderOut", "Out Order");
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outOrder");
+    p->setLabels("Out Order", "Out Order", "Out Order");
+    p->appendOption("Forward");
+    p->appendOption("Reverse");
+    p->appendOption("Center Out");
+    p->appendOption("Random");
+    p->appendOption("Manual");
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("outLineOrder");
+    p->setLabels("Out Line Order", "Out Lines", "Out Line Order");
+    p->appendOption("Top to Bottom");
+    p->appendOption("Bottom to Top");
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("outRandomSeed");
+    p->setLabels("Out Random Seed", "Out Seed", "Out Random Seed");
+    p->setRange(0, 9999);
+    p->setDisplayRange(0, 100);
+    p->setDefault(0);
+    addParam(page, p);
   }
 
+  defineToggleGroup(desc, page, "detectMain", "Detection");
+  // ---------------------------------------------------------------- Detect tab
   {
-    OFX::GroupParamDescriptor* g = desc.defineGroupParam("detection");
-    g->setLabels("Detection", "Detection", "Detection");
-    g->setOpen(false);
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("alphaThreshold");
+    p->setLabels("Alpha Threshold", "Alpha", "Alpha Threshold");
+    p->setHint("Alpha above this counts as text. Raise it if a soft shadow is bridging glyphs.");
+    p->setRange(0.0, 1.0);
+    p->setDisplayRange(0.0, 1.0);
+    p->setDefault(0.15);
+    addParam(page, p);
+  }
+  {
+    // Retired in favour of Min Mark Size, and no longer read. Still defined so
+    // a project saved with it loads without complaint; hidden so it cannot be
+    // mistaken for a live control.
+    OFX::IntParamDescriptor* p = desc.defineIntParam("minBlobArea");
+    p->setLabels("Min Blob Area", "Min Area", "Min Blob Area (retired)");
+    p->setHint("Retired. Despeckling is now Min Mark Size, measured against letter size.");
+    p->setRange(1, 10000);
+    p->setDisplayRange(1, 64);
+    p->setDefault(4);
+    p->setIsSecret(true);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("wordGapSensitivity");
+    p->setLabels("Word Gap", "Word Gap", "Word Gap Sensitivity");
+    p->setHint("Lower splits words more eagerly, higher merges them. Adjust if a font mis-splits.");
+    p->setRange(0.05, 10.0);
+    p->setDisplayRange(0.3, 3.0);
+    p->setDefault(1.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("characterGap");
+    p->setLabels("Character Gap", "Char Gap", "Character Gap");
+    p->setHint(
+        "The widest gap between two characters that still keeps them in the same word, as "
+        "a fraction of letter height; anything wider starts a new word. Relative, so it "
+        "survives a change of proxy or timeline resolution -- a pixel value would not. A "
+        "word space is about 0.25 to 0.35 in most typefaces. Overrides Word Gap entirely, "
+        "and never fuses characters, so Character mode and Split Before still work. "
+        "0 leaves word breaks to the measured gaps.");
+    p->setRange(0.0, 4.0);
+    p->setDisplayRange(0.0, 1.2);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("charPadding");
+    p->setLabels("Character Padding", "Char Padding", "Character Padding");
+    p->setHint(
+        "Grows every mark before the characters are found, so strokes that nearly touch "
+        "become one character. For script faces whose hairline joins break a cursive word "
+        "into fragments. Measured as a FRACTION OF LETTER HEIGHT, so it means the same "
+        "thing in proxy as at full resolution -- a pixel value does not, and half "
+        "resolution regroups the whole frame. Note this FUSES what it joins, so pushing it "
+        "far enough to weld whole words also destroys the characters inside them -- use "
+        "Character Gap for word grouping instead.");
+    p->setRange(0.0, 1.0);
+    p->setDisplayRange(0.0, 0.3);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("minMarkArea");
+    p->setLabels("Min Mark Size", "Min Mark", "Minimum Mark Size");
+    p->setHint(
+        "Discards specks smaller than this share of a letter's area, so the same setting "
+        "throws away the same specks at any render resolution -- a pixel count does not, "
+        "and proxy renders lose marks the full-resolution frame keeps. The default matches "
+        "what the old 4-pixel despeckle came to on a title of ordinary size.");
+    p->setRange(0.0, 0.2);
+    p->setDisplayRange(0.0, 0.004);
+    p->setDefault(0.0005);
+    addParam(page, p);
+  }
+  {
+    // Kept and still honoured: a project saved before Character Padding became
+    // relative carries a pixel value, and OFX gives no way to tell that save
+    // from a fresh instance -- an absent parameter restores to its default
+    // either way. The two are added, so an old comp opens unchanged while new
+    // work uses the relative control above.
+    OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
+    p->setLabels("Character Padding (px)", "Char Pad px", "Character Padding, pixels");
+    p->setHint(
+        "The older pixel-based Character Padding, kept so existing projects keep the "
+        "grouping they were saved with. It is ADDED to Character Padding above. Pixels do "
+        "not survive a change of resolution, so leave this at 0 for new work.");
+    p->setRange(0, 128);
+    p->setDisplayRange(0, 40);
+    p->setDefault(0);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("autoSlant");
+    p->setLabels("Auto Italic", "Auto Italic", "Auto Italic Slant");
+    p->setHint(
+        "Measure the italic slant from the image and group letters as if the text were "
+        "upright. Turn off to set the angle by hand.");
+    p->setDefault(true);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("italicSlant");
+    p->setLabels("Italic Slant", "Slant", "Italic Slant");
+    p->setHint(
+        "Degrees the letters lean right. Only used when Auto Italic is off. Letters are "
+        "measured as though standing upright; nothing moves on screen.");
+    p->setRange(-45.0, 45.0);
+    p->setDisplayRange(-30.0, 30.0);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("referenceText");
+    p->setLabels("Reference Text", "Ref Text", "Reference Text");
+    p->setHint(
+        "The words the title actually says. Leave EMPTY for automatic detection -- nothing "
+        "about detection changes while it is. Filled in, it takes over: characters that "
+        "broke into several marks (a quote mark is the usual one) are joined back together "
+        "until the count matches, and words are cut at the spaces you typed instead of by "
+        "measured gaps. Type the text as it appears; line breaks are found from the picture, "
+        "so spaces are all that is needed. Punctuation counts as characters. If the text and "
+        "the picture disagree, a warning appears over the viewer and automatic detection is "
+        "used -- this happens when letters RUN TOGETHER, since an 'ff' ligature or a script "
+        "face is a single mark that cannot be told apart, and no count can undo that.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  // In a group so that Clear Overrides stays here: the Edit page lifts a push
+  // button that is in no group up to the top of the effect.
+  defineToggleGroup(desc, page, "detectOverrides", "Overrides");
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("mergeAt");
+    p->setLabels("Merge At", "Merge At", "Merge At Character");
+    p->setHint(
+        "Character indices to join to whatever precedes them, e.g. \"9, 14\". Show Detection "
+        "prints the index of each unit's first character; merging at that number folds the "
+        "unit into the one before it. Numbers never shift, so corrections can be made one at "
+        "a time.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::StringParamDescriptor* p = desc.defineStringParam("splitBefore");
+    p->setLabels("Split Before", "Split", "Split Before Character");
+    p->setHint(
+        "Character indices that must start a new unit, e.g. \"12, 30\". Set Group Mode to "
+        "Character to read the index of any letter, then switch back.");
+    p->setDefault("");
+    addParam(page, p);
+  }
+  {
+    OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("clearOverrides");
+    p->setLabels("Clear Overrides", "Clear", "Clear Overrides");
+    p->setHint("Empties Merge At and Split Before, returning every unit to automatic grouping.");
+    // A push button holds no value, so there is nothing for it to invalidate --
+    // the parameters it writes carry that.
+    addParamUI(page, p);
+  }
 
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("alphaThreshold");
-      p->setLabels("Alpha Threshold", "Alpha", "Alpha Threshold");
-      p->setHint("Alpha above this counts as text. Raise it if a soft shadow is bridging glyphs.");
-      p->setRange(0.0, 1.0);
-      p->setDisplayRange(0.0, 1.0);
-      p->setDefault(0.15);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      // Retired in favour of Min Mark Size, and no longer read. Still defined so
-      // a project saved with it loads without complaint; hidden so it cannot be
-      // mistaken for a live control.
-      OFX::IntParamDescriptor* p = desc.defineIntParam("minBlobArea");
-      p->setLabels("Min Blob Area", "Min Area", "Min Blob Area (retired)");
-      p->setHint("Retired. Despeckling is now Min Mark Size, measured against letter size.");
-      p->setRange(1, 10000);
-      p->setDisplayRange(1, 64);
-      p->setDefault(4);
-      p->setIsSecret(true);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("wordGapSensitivity");
-      p->setLabels("Word Gap", "Word Gap", "Word Gap Sensitivity");
-      p->setHint("Lower splits words more eagerly, higher merges them. Adjust if a font mis-splits.");
-      p->setRange(0.05, 10.0);
-      p->setDisplayRange(0.3, 3.0);
-      p->setDefault(1.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("characterGap");
-      p->setLabels("Character Gap", "Char Gap", "Character Gap");
-      p->setHint(
-          "The widest gap between two characters that still keeps them in the same word, as "
-          "a fraction of letter height; anything wider starts a new word. Relative, so it "
-          "survives a change of proxy or timeline resolution -- a pixel value would not. A "
-          "word space is about 0.25 to 0.35 in most typefaces. Overrides Word Gap entirely, "
-          "and never fuses characters, so Character mode and Split Before still work. "
-          "0 leaves word breaks to the measured gaps.");
-      p->setRange(0.0, 4.0);
-      p->setDisplayRange(0.0, 1.2);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("charPadding");
-      p->setLabels("Character Padding", "Char Padding", "Character Padding");
-      p->setHint(
-          "Grows every mark before the characters are found, so strokes that nearly touch "
-          "become one character. For script faces whose hairline joins break a cursive word "
-          "into fragments. Measured as a FRACTION OF LETTER HEIGHT, so it means the same "
-          "thing in proxy as at full resolution -- a pixel value does not, and half "
-          "resolution regroups the whole frame. Note this FUSES what it joins, so pushing it "
-          "far enough to weld whole words also destroys the characters inside them -- use "
-          "Character Gap for word grouping instead.");
-      p->setRange(0.0, 1.0);
-      p->setDisplayRange(0.0, 0.3);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("minMarkArea");
-      p->setLabels("Min Mark Size", "Min Mark", "Minimum Mark Size");
-      p->setHint(
-          "Discards specks smaller than this share of a letter's area, so the same setting "
-          "throws away the same specks at any render resolution -- a pixel count does not, "
-          "and proxy renders lose marks the full-resolution frame keeps. The default matches "
-          "what the old 4-pixel despeckle came to on a title of ordinary size.");
-      p->setRange(0.0, 0.2);
-      p->setDisplayRange(0.0, 0.004);
-      p->setDefault(0.0005);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      // Kept and still honoured: a project saved before Character Padding became
-      // relative carries a pixel value, and OFX gives no way to tell that save
-      // from a fresh instance -- an absent parameter restores to its default
-      // either way. The two are added, so an old comp opens unchanged while new
-      // work uses the relative control above.
-      OFX::IntParamDescriptor* p = desc.defineIntParam("bridgeRadius");
-      p->setLabels("Character Padding (px)", "Char Pad px", "Character Padding, pixels");
-      p->setHint(
-          "The older pixel-based Character Padding, kept so existing projects keep the "
-          "grouping they were saved with. It is ADDED to Character Padding above. Pixels do "
-          "not survive a change of resolution, so leave this at 0 for new work.");
-      p->setRange(0, 128);
-      p->setDisplayRange(0, 40);
-      p->setDefault(0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("autoSlant");
-      p->setLabels("Auto Italic", "Auto Italic", "Auto Italic Slant");
-      p->setHint(
-          "Measure the italic slant from the image and group letters as if the text were "
-          "upright. Turn off to set the angle by hand.");
-      p->setDefault(true);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("italicSlant");
-      p->setLabels("Italic Slant", "Slant", "Italic Slant");
-      p->setHint(
-          "Degrees the letters lean right. Only used when Auto Italic is off. Letters are "
-          "measured as though standing upright; nothing moves on screen.");
-      p->setRange(-45.0, 45.0);
-      p->setDisplayRange(-30.0, 30.0);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::StringParamDescriptor* p = desc.defineStringParam("referenceText");
-      p->setLabels("Reference Text", "Ref Text", "Reference Text");
-      p->setHint(
-          "The words the title actually says. Leave EMPTY for automatic detection -- nothing "
-          "about detection changes while it is. Filled in, it takes over: characters that "
-          "broke into several marks (a quote mark is the usual one) are joined back together "
-          "until the count matches, and words are cut at the spaces you typed instead of by "
-          "measured gaps. Type the text as it appears; line breaks are found from the picture, "
-          "so spaces are all that is needed. Punctuation counts as characters. If the text and "
-          "the picture disagree, a warning appears over the viewer and automatic detection is "
-          "used -- this happens when letters RUN TOGETHER, since an 'ff' ligature or a script "
-          "face is a single mark that cannot be told apart, and no count can undo that.");
-      p->setDefault("");
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::StringParamDescriptor* p = desc.defineStringParam("mergeAt");
-      p->setLabels("Merge At", "Merge At", "Merge At Character");
-      p->setHint(
-          "Character indices to join to whatever precedes them, e.g. \"9, 14\". Show Detection "
-          "prints the index of each unit's first character; merging at that number folds the "
-          "unit into the one before it. Numbers never shift, so corrections can be made one at "
-          "a time.");
-      p->setDefault("");
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::StringParamDescriptor* p = desc.defineStringParam("splitBefore");
-      p->setLabels("Split Before", "Split", "Split Before Character");
-      p->setHint(
-          "Character indices that must start a new unit, e.g. \"12, 30\". Set Group Mode to "
-          "Character to read the index of any letter, then switch back.");
-      p->setDefault("");
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam("clearOverrides");
-      p->setLabels("Clear Overrides", "Clear", "Clear Overrides");
-      p->setHint("Empties Merge At and Split Before, returning every unit to automatic grouping.");
-      p->setParent(*g);
-      // A push button holds no value, so there is nothing for it to invalidate --
-      // the parameters it writes carry that.
-      addParamUI(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("tracking");
-      p->setLabels("Tracking Offset", "Tracking", "Tracking Offset");
-      p->setHint(
-          "Moves every letter closer together or further apart, as a fraction of letter "
-          "height. Detection needs the letters separated; open the tracking in your title "
-          "tool until they are, then take the same amount back here and the picture returns "
-          "to the spacing you wanted while the pixels being measured stay easy to measure. "
-          "This is the only cure for letters that RUN TOGETHER, which no setting can undo -- "
-          "one mark cannot be split into two characters. Negative closes up.");
-      p->setRange(-1.0, 1.0);
-      p->setDisplayRange(-0.3, 0.3);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("trackAnchor");
-      p->setLabels("Tracking Anchor", "Track Anchor", "Tracking Anchor");
-      p->setHint(
-          "What stays put as the letters close up, WITHIN EACH LINE -- so a centred title "
-          "stays centred and a left-aligned one keeps its left edge.");
-      p->appendOption("Left");
-      p->appendOption("Centre");
-      p->appendOption("Right");
-      p->setDefault(1);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("lineSpacing");
-      p->setLabels("Line Spacing Offset", "Line Spacing", "Line Spacing Offset");
-      p->setHint(
-          "Moves whole lines closer together or further apart, as a fraction of letter "
-          "height. The vertical counterpart of Tracking Offset, for when opening the leading "
-          "was what made the lines detect cleanly. Negative closes up.");
-      p->setRange(-2.0, 2.0);
-      p->setDisplayRange(-0.5, 0.5);
-      p->setDefault(0.0);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineAnchor");
-      p->setLabels("Line Anchor", "Line Anchor", "Line Spacing Anchor");
-      p->setHint("Which line stays put as the lines close up, across the text block.");
-      p->appendOption("Top");
-      p->appendOption("Middle");
-      p->appendOption("Bottom");
-      p->setDefault(1);
-      p->setParent(*g);
-      addParam(page, p);
-    }
-    {
-      OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("showDiagnostics");
-      p->setLabels("Show Detection", "Show Detection", "Show Detection");
-      p->setHint("Draws a coloured box around each detected unit over the static text.");
-      p->setDefault(false);
-      p->setParent(*g);
-      addParam(page, p);
-    }
+  defineToggleGroup(desc, page, "spacingTracking", "Tracking");
+  // --------------------------------------------------------------- Spacing tab
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("tracking");
+    p->setLabels("Tracking Offset", "Tracking", "Tracking Offset");
+    p->setHint(
+        "Moves every letter closer together or further apart, as a fraction of letter "
+        "height. Detection needs the letters separated; open the tracking in your title "
+        "tool until they are, then take the same amount back here and the picture returns "
+        "to the spacing you wanted while the pixels being measured stay easy to measure. "
+        "This is the only cure for letters that RUN TOGETHER, which no setting can undo -- "
+        "one mark cannot be split into two characters. Negative closes up.");
+    p->setRange(-1.0, 1.0);
+    p->setDisplayRange(-0.3, 0.3);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("trackAnchor");
+    p->setLabels("Tracking Anchor", "Track Anchor", "Tracking Anchor");
+    p->setHint(
+        "What stays put as the letters close up, WITHIN EACH LINE -- so a centred title "
+        "stays centred and a left-aligned one keeps its left edge.");
+    p->appendOption("Left");
+    p->appendOption("Centre");
+    p->appendOption("Right");
+    p->setDefault(1);
+    addParam(page, p);
+  }
+  defineToggleGroup(desc, page, "spacingLines", "Line Spacing");
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("lineSpacing");
+    p->setLabels("Line Spacing Offset", "Line Spacing", "Line Spacing Offset");
+    p->setHint(
+        "Moves whole lines closer together or further apart, as a fraction of letter "
+        "height. The vertical counterpart of Tracking Offset, for when opening the leading "
+        "was what made the lines detect cleanly. Negative closes up.");
+    p->setRange(-2.0, 2.0);
+    p->setDisplayRange(-0.5, 0.5);
+    p->setDefault(0.0);
+    addParam(page, p);
+  }
+  {
+    OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam("lineAnchor");
+    p->setLabels("Line Anchor", "Line Anchor", "Line Spacing Anchor");
+    p->setHint("Which line stays put as the lines close up, across the text block.");
+    p->appendOption("Top");
+    p->appendOption("Middle");
+    p->appendOption("Bottom");
+    p->setDefault(1);
+    addParam(page, p);
+  }
+
+  defineToggleGroup(desc, page, "renderBlur", "Motion Blur");
+  // ---------------------------------------------------------------- Render tab
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("motionBlur");
+    p->setLabels("Motion Blur", "Motion Blur", "Motion Blur");
+    p->setHint(
+        "Supersamples each unit's transform across the open shutter, so "
+        "movement, scaling and rotation all blur.");
+    p->setDefault(false);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("shutterAngle");
+    p->setLabels("Shutter Angle", "Shutter", "Shutter Angle");
+    p->setHint("Degrees of a frame the shutter is open. 180 matches a normal cine shutter.");
+    p->setRange(0.0, 360.0);
+    p->setDisplayRange(0.0, 360.0);
+    p->setDefault(180.0);
+    addParam(page, p);
+  }
+  {
+    OFX::IntParamDescriptor* p = desc.defineIntParam("blurSamples");
+    p->setLabels("Samples", "Samples", "Blur Samples");
+    p->setHint("Taps used for motion blur and start blur. Higher is smoother but slower.");
+    p->setRange(2, 64);
+    p->setDisplayRange(2, 32);
+    p->setDefault(8);
+    addParam(page, p);
+  }
+  {
+    OFX::BooleanParamDescriptor* p = desc.defineBooleanParam("adaptiveSamples");
+    p->setLabels("Adaptive Samples", "Adaptive", "Adaptive Samples");
+    p->setHint(
+        "Spend taps in proportion to how much the frame actually smears, so Samples becomes "
+        "an upper bound rather than a fixed cost. A settled title costs one tap however high "
+        "Samples is set.");
+    p->setDefault(true);
+    addParam(page, p);
+  }
+  {
+    OFX::DoubleParamDescriptor* p = desc.defineDoubleParam("pixelsPerSample");
+    p->setLabels("Sample Density", "Density", "Pixels Per Sample");
+    p->setHint(
+        "Pixels of smear each adaptive tap covers. Lower is smoother and slower. Ignored "
+        "when Adaptive Samples is off.");
+    p->setRange(0.25, 16.0);
+    p->setDisplayRange(0.5, 8.0);
+    p->setDefault(2.0);
+    addParam(page, p);
   }
 }
 

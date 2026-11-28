@@ -61,8 +61,17 @@ target_include_directories(TextAnimator PRIVATE
   ${OFX_ROOT}/include
   ${OFX_ROOT}/Support/include
   ${OFX_ROOT}/Support/Plugins/include
+  # ofxsSupportPrivate.h: the raw suites, for Resolve's button row (button_row.h),
+  # a parameter type the support library has no class for.
+  ${OFX_ROOT}/Support/Library
 )
 set_target_properties(TextAnimator PROPERTIES PREFIX "" SUFFIX ".ofx")
+
+# The Inspector tab faces (scripts/make-tab-faces.py). Copied into the bundle
+# below; listed as link dependencies so that changing only an image still
+# rebuilds the bundle -- otherwise nothing in the build notices it changed.
+file(GLOB RTA_TAB_FACES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/tab-faces/*.png")
+set_property(TARGET TextAnimator APPEND PROPERTY LINK_DEPENDS ${RTA_TAB_FACES})
 
 if(MSVC)
   # Static CRT: an OFX bundle is loaded by a host that will not have our
@@ -177,6 +186,10 @@ endif()
 add_custom_command(TARGET TextAnimator POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory ${BUNDLE}
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:TextAnimator> ${BUNDLE}/TextAnimator.ofx
+  # The tab faces, where button_row.h's TabFacesDir() looks for them. Before the
+  # signing step below: the bundle's signature covers Resources.
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          ${CMAKE_CURRENT_SOURCE_DIR}/packaging/tab-faces ${BUNDLE_ROOT}/Contents/Resources/tab-faces
   COMMENT "Assembling TextAnimator.ofx.bundle"
 )
 if(APPLE)

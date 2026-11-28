@@ -141,21 +141,29 @@ letters.
 
 ### Parameters
 
-| | |
+The Inspector is split into tabs, so only one part of the effect shows at a
+time. On the Edit page they are two rows of buttons; on the Fusion page, Fusion's
+own buttons; anywhere else, one **Section** dropdown. The tab is navigation only:
+it is not saved, not undone and never re-renders. Above the tabs, on every tab:
+the **Timing** status line, **Show Detection** and **Show Timeline**.
+
+| Tab | Groups and controls |
 |---|---|
-| **In Animation / Out Animation** | enable each stage independently; both off leaves the text static |
-| **Animate By** | Character / Word / Line |
-| **Animation** | Fade, or Slide + Fade |
-| **Order** | Forward, Reverse, Center Out, Random |
-| **Line Order** | Top to Bottom / Bottom to Top. Flips which line goes first while words still read left-to-right within each line — which `Order > Reverse` cannot express, since it reverses those too. |
-| **Easing** | Linear, Smoothstep, Cubic Out, Back Out, Custom (see curve editor below) |
-| **Start / Duration / Stagger** | **frames**; Start is measured from the clip's first frame, Stagger is the delay between consecutive units (fractional values allowed) |
-| **Distance Units** | what Slide Distance and Start Blur are measured against: % of Frame Height (default), % of Text Height, or Pixels |
-| **Slide Distance / Angle** | how far a unit travels, in the chosen units; 90° rises from below |
-| **Start Scale / Start Rotation / Start Blur** | the unit's scale, rotation (degrees, about its own centre) and defocus radius at the beginning of its animation, all unwinding to normal as it settles |
-| **Motion Blur** | Motion Blur on/off, Shutter Angle (180° = normal cine shutter), Samples |
-| **Out Animation** (group) | End Offset (frames before the clip end at which it finishes), Link to In, Mirror, Clip Length Override, plus a full independent set used when unlinked |
-| **Detection** | Alpha Threshold, Min Blob Area, Word Gap, Bridge Radius, Show Detection |
+| **In** | **Setup**: In Animation, Animate By (Character / Word / Line / Object), Animation (Fade, Slide + Fade) · **Timing**: Set Start to Playhead, Start / Duration / Stagger (**frames**, from the clip's first frame; fractional stagger allowed), Stagger by Length · **Motion**: Distance Units (% of Frame Height, % of Text Height, Pixels), Slide Distance / Angle (90° rises from below), Start Scale / Rotation / Blur · **Easing**: Easing (Linear, Smoothstep, Cubic Out, Back Out, Custom), Show Curve Editor, Curve X1–Y2 |
+| **Out** | **Setup**: Out Animation, Link to In, Mirror, Out Animate By, Out Animation Type · **Timing**: Set End to Playhead, End Offset (frames before the clip end at which it finishes), Clip Length Override, Out Duration / Stagger · **Motion**: Out Slide Distance / Angle, Out End Scale / Rotation / Blur, Out Easing. All but the first three apply only with Link to In off |
+| **Order** | **Order**: Order (Forward, Reverse, Center Out, Random, Manual), Line Order, Random Seed, Manual Order, Set Order By Clicking · **Links**: Link Elements, Link By Clicking · **Sequence**: Sequence, Sequence By Clicking · **Reveal Range**: Start At / End At Element, One Element Per Clip, Isolate · **Out Order**: the exit's own Order, Line Order and Random Seed |
+| **Detect** | **Detection**: Alpha Threshold, Word Gap, Character Gap, Character Padding, Min Mark Size, Auto Italic, Italic Slant, Reference Text · **Overrides**: Merge At, Split Before, Clear Overrides |
+| **Spacing** | **Tracking**: Offset, Anchor · **Line Spacing**: Offset, Anchor |
+| **Render** | **Motion Blur**: Motion Blur, Shutter Angle (180° = normal cine shutter), Samples, Adaptive Samples, Sample Density |
+| **Presets** | **Preset Files**: Save Preset, Load Preset |
+
+Every section is one of Resolve's collapsible groups. They are on every tab,
+not just In and Out, because of how the Edit page draws groups it has been told
+to hide: see the comment on `kToggleGroups` in `src/plugin.cpp`.
+
+Line Order flips which line goes first while words still read left-to-right
+within each line — which `Order > Reverse` cannot express, since it reverses
+those too.
 
 ### In and out animations
 
@@ -383,6 +391,8 @@ Tune detection here, not in Resolve — the loop is seconds instead of a relaunc
 | `src/plugin.cpp` | OFX glue: params, render dispatch |
 | `src/preset_io*` | preset folder and the native Save/Load dialogs (Win32, AppKit) |
 | `mac/` | the bundle's `Info.plist` template |
+| `src/button_row.h` | Resolve's undocumented button row, used for the Inspector tabs (from Multi Transform) |
+| `packaging/tab-faces/` | the tab buttons' face images, copied into the bundle; `scripts/make-tab-faces.py` draws them |
 | `src/interact/` | viewer overlay: draw-suite wrappers and the curve editor |
 | `tools/segtest.cpp` | standalone harness |
 
